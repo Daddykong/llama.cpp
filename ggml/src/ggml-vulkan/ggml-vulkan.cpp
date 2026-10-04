@@ -6030,6 +6030,13 @@ static bool ggml_vk_get_mul_mat_mat_f16acc(ggml_backend_vk_context * ctx, ggml_t
     if (src0_type == GGML_TYPE_F32 || src0_type == GGML_TYPE_BF16) return false;
     if (src1_type == GGML_TYPE_Q8_1) return false;
     if (src0_type == GGML_TYPE_F16) {
+        // GGML_VK_KQ_F16_ACC=1: accumulate f16 x f32 matmuls in fp16 even when GGML_PREC_F32 is requested
+        // (in llama.cpp that is the K*Q attention matmul of the non-FA path). The fp32-accumulate coopmat
+        // kernel spills registers on Intel Xe2 and runs at about half speed. Changes numerics: check quality.
+        static const bool kq_f16_acc = getenv("GGML_VK_KQ_F16_ACC") != nullptr;
+        if (kq_f16_acc) {
+            prec = GGML_PREC_DEFAULT;
+        }
         return prec == GGML_PREC_DEFAULT && ctx->device->fp16 && !(ctx->device->coopmat_support && !ctx->device->coopmat_acc_f16_support);
     }
     // quant types
