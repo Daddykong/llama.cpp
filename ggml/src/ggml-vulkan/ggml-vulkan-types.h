@@ -1273,6 +1273,11 @@ struct ggml_backend_vk_context {
 
     // Track which nodes have been used since the last sync, and whether they were written to
     std::vector<const ggml_tensor *> unsynced_nodes_written;
+    // GDN state fusion (per graph): skip flags, and for each GDN node the gather/copy node it absorbs (-1 if none)
+    std::vector<uint8_t> gdn_node_skip;
+    std::vector<int32_t> gdn_fuse_gather;
+    std::vector<int32_t> gdn_fuse_cpy;
+    uint64_t gdn_plan_fp = 0;
     std::vector<const ggml_tensor *> unsynced_nodes_read;
     // Track which prealloc buffers have pending reads that need to be synchronized.
     // These are checked before writing to the buffer (and call ggml_vk_sync_buffers if set),
