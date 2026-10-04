@@ -741,6 +741,9 @@ void process_shaders() {
 #if defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
                 string_to_spv("flash_attn_f32_f16", "flash_attn_cm1.comp",
                     merge_maps(fa_base_dict, {{"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}, {"COOPMAT", "1"}}), fp16, true, false, f16acc);
+                // M=8 variant for devices that only expose 8x16x16 coopmats (Intel Xe2)
+                string_to_spv("flash_attn_f32_f16", "flash_attn_cm1.comp",
+                    merge_maps(fa_base_dict, {{"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}, {"COOPMAT", "1"}, {"CM1_M8", "1"}}), fp16, true, false, f16acc, "_m8");
 #endif
             }
 

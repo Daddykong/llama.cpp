@@ -1298,6 +1298,10 @@ static vk_fa_tuning_params get_fa_tuning_params_coopmat1(const vk_device& device
     result.block_cols = coopmat_block_cols * num_subgroups;
     result.row_split = num_subgroups;
     result.subgroup_size = device->subgroup_size;
+    // Intel coopmats run with 16-wide subgroups
+    if (device->vendor_id == VK_VENDOR_ID_INTEL && device->subgroup_size_control && device->subgroup_min_size <= 16 && device->subgroup_max_size >= 16) {
+        result.subgroup_size = 16;
+    }
     result.workgroup_size = num_subgroups * result.subgroup_size;
 
     const uint32_t D_lsb = D ^ (D & (D-1));  // extract lowest set bit
@@ -1353,8 +1357,11 @@ vk_fa_tuning_params get_fa_tuning_params(const vk_device& device, uint32_t hsk, 
     }
 
     if (path == FA_COOPMAT1) {
-        bool shape_ok = (f32acc && device->coopmat_support_16x16x16_f32acc) ||
-                        (!f32acc && device->coopmat_support_16x16x16_f16acc);
+        // the 8x16x16 (CM1_M8) shader variant is only built for f16 K/V; bf16 needs 16x16x16.
+        // GGML_VK_DISABLE_FA_CM1_M8=1 keeps such devices on the scalar path.
+        const bool m8_ok = k_type != GGML_TYPE_BF16 && !getenv("GGML_VK_DISABLE_FA_CM1_M8");
+        bool shape_ok = (f32acc && (device->coopmat_support_16x16x16_f32acc || (m8_ok && device->coopmat_support_8x16x16_f32acc))) ||
+                        (!f32acc && (device->coopmat_support_16x16x16_f16acc || (m8_ok && device->coopmat_support_8x16x16_f16acc)));
         const vk_fa_tuning_params params = get_fa_tuning_params_coopmat1(device, hsk, hsv, n_rows, n_kv, k_type, v_type, f32acc);
         bool shmem_ok = ggml_vk_flash_attn_coopmat_shmem_support(device, params, hsk, hsv, f32acc, k_type, v_type);
 
@@ -2115,9 +2122,15 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 continue;
 #endif
             } else {
-                if (f32acc) { spv_data = flash_attn_f32_f16_cm1_data;        spv_size = flash_attn_f32_f16_cm1_len; }
-                else        { spv_data = flash_attn_f32_f16_f16acc_cm1_data; spv_size = flash_attn_f32_f16_f16acc_cm1_len; }
-                name = aligned ? "flash_attn_f32_f16_aligned_cm1" : "flash_attn_f32_f16_cm1";
+                const bool use_m8 = f32acc ? !device->coopmat_support_16x16x16_f32acc : !device->coopmat_support_16x16x16_f16acc;
+                if (use_m8) {
+                    if (f32acc) { spv_data = flash_attn_f32_f16_cm1_m8_data;        spv_size = flash_attn_f32_f16_cm1_m8_len; }
+                    else        { spv_data = flash_attn_f32_f16_f16acc_cm1_m8_data; spv_size = flash_attn_f32_f16_f16acc_cm1_m8_len; }
+                } else {
+                    if (f32acc) { spv_data = flash_attn_f32_f16_cm1_data;        spv_size = flash_attn_f32_f16_cm1_len; }
+                    else        { spv_data = flash_attn_f32_f16_f16acc_cm1_data; spv_size = flash_attn_f32_f16_f16acc_cm1_len; }
+                }
+                name = aligned ? (use_m8 ? "flash_attn_f32_f16_aligned_cm1_m8" : "flash_attn_f32_f16_aligned_cm1") : (use_m8 ? "flash_attn_f32_f16_cm1_m8" : "flash_attn_f32_f16_cm1");
             }
             ggml_vk_create_pipeline(device, fa.second, name, spv_size, spv_data, "main", 8,
                                     sizeof(vk_flash_attn_push_constants), {Br, 1, 1},
@@ -4744,6 +4757,9 @@ vk_device ggml_vk_get_device(size_t idx) {
                         if (prop.MSize == 16 && prop.NSize == 16 && prop.KSize == 16) {
                             device->coopmat_support_16x16x16_f32acc = true;
                         }
+                        if (prop.MSize == 8 && prop.NSize == 16 && prop.KSize == 16) {
+                            device->coopmat_support_8x16x16_f32acc = true;
+                        }
                     } else if ((vk::ComponentTypeKHR)prop.CType == vk::ComponentTypeKHR::eFloat16 &&
                                (vk::ComponentTypeKHR)prop.ResultType == vk::ComponentTypeKHR::eFloat16) {
                         // coopmat sizes not set yet
@@ -4758,6 +4774,9 @@ vk_device ggml_vk_get_device(size_t idx) {
                         }
                         if (prop.MSize == 16 && prop.NSize == 16 && prop.KSize == 16) {
                             device->coopmat_support_16x16x16_f16acc = true;
+                        }
+                        if (prop.MSize == 8 && prop.NSize == 16 && prop.KSize == 16) {
+                            device->coopmat_support_8x16x16_f16acc = true;
                         }
                     }
                 } else if ((vk::ComponentTypeKHR)prop.AType      == vk::ComponentTypeKHR::eSint8 &&
@@ -8152,7 +8171,7 @@ bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, const vk_
     // BF16 PVMat accumulator is f32 (no bf16 accumulator support), so pvsh is vec4 (16 bytes)
     const uint32_t pvsh_elem_size = (k_type == GGML_TYPE_BF16) ? 16u : f16vec4;
     const uint32_t osh_stride = params.row_split * MatBr / 4;
-    const uint32_t pvsh = MatBc * osh_stride * pvsh_elem_size;
+    const uint32_t pvsh = std::max(MatBc, Br) * osh_stride * pvsh_elem_size;
 
     const uint32_t slope = Br * acctype;
 
