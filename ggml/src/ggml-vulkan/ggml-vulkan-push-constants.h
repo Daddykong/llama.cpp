@@ -701,6 +701,9 @@ struct vk_op_gated_delta_net_push_constants {
     uint32_t neq1, rq3;
     float scale;
     uint32_t K;
+    uint32_t fuse;      // bit 0: state read through gather index (binding 7), bit 1: final state written to binding 8
+    uint32_t idx_off;   // element offset of the gather index inside binding 7
+    uint32_t sout_slot_stride; // elements between snapshot slots in binding 8
 };
 
 struct vk_op_ssm_scan_push_constants {
