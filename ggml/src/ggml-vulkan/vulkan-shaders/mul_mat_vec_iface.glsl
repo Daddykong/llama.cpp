@@ -19,6 +19,13 @@ layout (binding = 0) readonly buffer A_PACKED32 {A_TYPE_PACKED32 data_a_packed32
 layout (binding = 0) readonly buffer A_PACKED64 {A_TYPE_PACKED64 data_a_packed64[];};
 #endif
 
+#if defined(DATA_A_Q4_0R)
+// Row-reordered Q4_0: each row holds all 16-byte quant blocks, then all fp16 scales
+layout (binding = 0) readonly buffer A_R64 {uvec2 data_a_r64[];};
+layout (binding = 0) readonly buffer A_R128 {uvec4 data_a_r128[];};
+layout (binding = 0) readonly buffer A_R16 {float16_t data_a_r16[];};
+#endif
+
 layout (binding = 1) readonly buffer B {B_TYPE data_b[];};
 #ifdef B_TYPEV2
 layout (binding = 1) readonly buffer BV2 {B_TYPEV2 data_b_v2[];};

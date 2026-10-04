@@ -1,0 +1,51 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+
+// In-place row reorder of Q4_0 weights for the row-reordered (Q4_0R) matvec/matmul shaders.
+// One workgroup per row: the row of nbpr 18-byte blocks becomes nbpr 16-byte quant blocks
+// followed by nbpr fp16 scales. Requires nbpr % 4 == 0 and nbpr * 18 <= 4 * REORDER_MAX_WORDS.
+
+#define REORDER_MAX_WORDS 4096
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) buffer A {uint data_a[];};
+
+layout (push_constant) uniform parameter
+{
+    uint nbpr;
+    uint nrows;
+    uint row0;
+} p;
+
+shared uint sh[REORDER_MAX_WORDS];
+
+uint get16(uint i) {
+    return (sh[i >> 1] >> ((i & 1u) * 16u)) & 0xFFFFu;
+}
+
+void main() {
+    const uint row = p.row0 + gl_WorkGroupID.x;
+    if (row >= p.nrows) {
+        return;
+    }
+    const uint tid = gl_LocalInvocationID.x;
+    const uint nw = (p.nbpr * 9u) / 2u;
+    const uint base = row * nw;
+
+    for (uint i = tid; i < nw; i += 256u) {
+        sh[i] = data_a[base + i];
+    }
+    barrier();
+
+    // quant words: block b, word k holds bytes 4k..4k+3 = u16 indices b*9+1+2k, b*9+2+2k
+    for (uint w = tid; w < p.nbpr * 4u; w += 256u) {
+        const uint i0 = (w >> 2u) * 9u + 1u + 2u * (w & 3u);
+        data_a[base + w] = get16(i0) | (get16(i0 + 1u) << 16u);
+    }
+    // scale words: blocks 2t and 2t+1
+    for (uint t = tid; t < p.nbpr / 2u; t += 256u) {
+        data_a[base + p.nbpr * 4u + t] = get16(2u * t * 9u) | (get16((2u * t + 1u) * 9u) << 16u);
+    }
+}
