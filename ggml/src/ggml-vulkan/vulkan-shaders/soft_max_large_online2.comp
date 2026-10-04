@@ -1,0 +1,94 @@
+#version 450
+
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+
+// Pass 2 of the two-pass online softmax. Every workgroup combines the per-workgroup
+// (m_i, s_i) of its row into the global max M and sum S = sum(s_i * exp(m_i - M)), then
+// recomputes its chunk from src and writes exp(v - M) / S once.
+
+#include "soft_max_large_common.glsl"
+
+
+// workgroup reductions via subgroup ops (shared-memory trees are barrier-heavy on Intel)
+FLOAT_TYPE wg_max(FLOAT_TYPE v) {
+    v = subgroupMax(v);
+    barrier();
+    if (gl_SubgroupInvocationID == 0) {
+        vals[gl_SubgroupID] = v;
+    }
+    barrier();
+    v = vals[0];
+    for (uint i = 1; i < gl_NumSubgroups; ++i) {
+        v = max(v, vals[i]);
+    }
+    return v;
+}
+
+FLOAT_TYPE wg_sum(FLOAT_TYPE v) {
+    v = subgroupAdd(v);
+    barrier();
+    if (gl_SubgroupInvocationID == 0) {
+        vals[gl_SubgroupID] = v;
+    }
+    barrier();
+    v = vals[0];
+    for (uint i = 1; i < gl_NumSubgroups; ++i) {
+        v += vals[i];
+    }
+    return v;
+}
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint rowx = gl_WorkGroupID.y;
+    const uint wg_start = gl_WorkGroupID.x * BLOCK_SIZE * num_iters;
+
+    const uint32_t i03 = rowx / (p.ne01 * p.ne02);
+    const uint32_t i02 = (rowx - i03 * p.ne01 * p.ne02) / p.ne01;
+    const uint32_t i01 = rowx % p.ne01;
+
+    uint rowy_start = 0;
+    if (p.KY > 0) {
+        rowy_start = i01 * p.nb11 + (i02 % p.ne12) * p.nb12 + (i03 % p.ne13) * p.nb13;
+    }
+
+    if (rowx >= p.nrows_x) {
+        return;
+    }
+
+    const float slope = get_slope(rowx);
+    const FLOAT_TYPE NEG_INF = uintBitsToFloat(0xFF800000);
+
+    // global max over the per-workgroup maxima (and the sink)
+    FLOAT_TYPE max_val = p.has_sinks == 0 ? NEG_INF : FLOAT_TYPE(data_c[i02]);
+    for (uint i = tid; i < gl_NumWorkGroups.x; i += BLOCK_SIZE) {
+        max_val = max(max_val, data_m[rowx * gl_NumWorkGroups.x + i]);
+    }
+    max_val = wg_max(max_val);
+
+    // global sum, each partial rescaled to the global max
+    FLOAT_TYPE sum = FLOAT_TYPE(0);
+    for (uint i = tid; i < gl_NumWorkGroups.x; i += BLOCK_SIZE) {
+        const FLOAT_TYPE mi = data_m[rowx * gl_NumWorkGroups.x + i];
+        if (mi > NEG_INF) {
+            sum += data_s[rowx * gl_NumWorkGroups.x + i] * exp(mi - max_val);
+        }
+    }
+    sum = wg_sum(sum);
+
+    if (p.has_sinks != 0) {
+        sum += FLOAT_TYPE(exp(FLOAT_TYPE(data_c[i02]) - max_val));
+    }
+
+    const FLOAT_TYPE rcpdivisor = FLOAT_TYPE(1.0) / sum;
+
+    [[unroll]] for (uint idx = 0; idx < num_iters; ++idx) {
+        const uint col = wg_start + idx * BLOCK_SIZE + tid;
+        if (col < p.KX) {
+            FLOAT_TYPE b = p.KY > 0 ? FLOAT_TYPE(data_b[rowy_start + col]) : FLOAT_TYPE(0);
+            const FLOAT_TYPE v = FLOAT_TYPE(data_a[rowx * p.KX + col]) * p.scale + slope * b;
+            data_d[rowx * p.KX + col] = D_TYPE(exp(v - max_val) * rcpdivisor);
+        }
+    }
+}

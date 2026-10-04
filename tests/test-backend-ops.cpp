@@ -10699,6 +10699,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         exponent <<= 1;
     }
 #endif
+    // rows longer than 16384 take the multi-workgroup softmax path
+    for (int64_t ne0 : {16385, 33280, 40001}) {
+        for (bool sinks : {false, true}) {
+            for (float max_bias : {0.0f, 8.0f}) {
+                for (ggml_type m_prec : {GGML_TYPE_F32, GGML_TYPE_F16}) {
+                    test_cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {ne0, 7, 2, 1}, true, sinks, m_prec, {1, 1}, 0.0625f, max_bias));
+                }
+            }
+            test_cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {ne0, 5, 1, 1}, false, sinks, GGML_TYPE_F32, {1, 1}, 0.1f, 0.0f));
+        }
+    }
     for (bool mask : {false, true}) {
         for (bool sinks : {false, true}) {
             for (float max_bias : {0.0f, 8.0f}) {
