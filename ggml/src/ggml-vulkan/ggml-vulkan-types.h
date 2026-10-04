@@ -876,6 +876,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_rms_norm_f32;
     vk_pipeline pipeline_rms_norm_small_f32;
     vk_pipeline pipeline_rms_norm_q8_f32;
+    vk_pipeline pipeline_act_mul_q8_f32;
     vk_pipeline pipeline_rms_norm_mul_q8_f32;
     vk_pipeline pipeline_rms_norm_mul_small_f32;
     vk_pipeline pipeline_rms_norm_mul_f32;
