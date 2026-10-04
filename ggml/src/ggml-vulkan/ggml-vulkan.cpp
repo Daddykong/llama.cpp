@@ -3294,6 +3294,9 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_rms_norm_f32, "rms_norm_f32", rms_norm_f32_len, rms_norm_f32_data, "main", 4, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 0}, 1, true);
     ggml_vk_create_pipeline(device, device->pipeline_rms_norm_mul_f32, "rms_norm_mul_f32", rms_norm_f32_len, rms_norm_f32_data, "main", 4, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 1}, 1, true);
     if (device->subgroup_arithmetic && device->subgroup_clustered && device->integer_dot_product && getenv("GGML_VK_DISABLE_RMS_Q8") == nullptr) {
+        if (getenv("GGML_VK_DISABLE_ACT_Q8") == nullptr) {
+            ggml_vk_create_pipeline(device, device->pipeline_act_mul_q8_f32, "act_mul_q8_f32", act_mul_q8_f32_len, act_mul_q8_f32_data, "main", 4, 4 * sizeof(uint32_t), {128, 1, 1}, {}, 1, true, true);
+        }
         ggml_vk_create_pipeline(device, device->pipeline_rms_norm_q8_f32, "rms_norm_q8_f32", rms_norm_q8_f32_len, rms_norm_q8_f32_data, "main", 4, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 0}, 1, true, true);
         ggml_vk_create_pipeline(device, device->pipeline_rms_norm_mul_q8_f32, "rms_norm_mul_q8_f32", rms_norm_q8_f32_len, rms_norm_q8_f32_data, "main", 4, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 1}, 1, true, true);
     }
@@ -10099,6 +10102,47 @@ int ggml_vk_unary_mul_op_index(ggml_unary_op op) {
     }
 }
 
+// silu(a) * b for a few tokens, also leaving the q8_1_x4 copy of the result in prealloc_y for the next
+// integer-dot matvec (which then skips its quantize dispatch and barrier). Returns false if not applicable.
+static bool ggml_vk_act_mul_q8(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * a, const ggml_tensor * b, ggml_tensor * dst) {
+    if (!ctx->device->pipeline_act_mul_q8_f32) {
+        return false;
+    }
+    const int64_t ne = ggml_nelements(dst);
+    if (a->type != GGML_TYPE_F32 || b->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
+        !ggml_is_contiguous(a) || !ggml_is_contiguous(b) || !ggml_is_contiguous(dst) ||
+        !ggml_are_same_shape(a, dst) || !ggml_are_same_shape(b, dst) || ne % 128 != 0 || ggml_nrows(dst) > 8) {
+        return false;
+    }
+    const uint64_t q8_sz = ggml_vk_align_size(ne, 128) * ggml_type_size(GGML_TYPE_Q8_1) / ggml_blck_size(GGML_TYPE_Q8_1);
+    if (ctx->prealloc_y == nullptr || ctx->prealloc_y->size < q8_sz) {
+        return false;
+    }
+    if (ctx->prealloc_y_need_sync) {
+        ggml_vk_sync_buffers(ctx, subctx);
+    }
+    vk_pipeline pipeline = ctx->device->pipeline_act_mul_q8_f32;
+    const std::array<uint32_t, 4> pc = {
+        (uint32_t)ne,
+        get_misalign_bytes(ctx, a) / (uint32_t)sizeof(float),
+        get_misalign_bytes(ctx, b) / (uint32_t)sizeof(float),
+        get_misalign_bytes(ctx, dst) / (uint32_t)sizeof(float),
+    };
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        {
+            ggml_vk_tensor_subbuffer(ctx, a, true),
+            ggml_vk_tensor_subbuffer(ctx, b, true),
+            ggml_vk_tensor_subbuffer(ctx, dst, true),
+            ggml_vk_subbuffer(ctx, ctx->prealloc_y, 0),
+        }, pc, { (uint32_t)CEIL_DIV(ne, 4), 1, 1 });
+    ctx->prealloc_y_last_pipeline_used = ctx->device->pipeline_quantize_q8_1_x4.get();
+    ctx->prealloc_y_last_tensor_used = dst;
+    ctx->prealloc_y_last_k_padded = false;
+    ctx->prealloc_y_need_sync = true;
+    return true;
+}
+
 void ggml_vk_unary_mul(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
     const ggml_tensor * unary = cgraph->nodes[node_idx];
     ggml_tensor * mul = cgraph->nodes[node_idx + 1];
@@ -10117,6 +10161,9 @@ void ggml_vk_unary_mul(ggml_backend_vk_context * ctx, vk_context& subctx, const 
     const int oi = ggml_vk_unary_mul_op_index(ggml_get_unary_op(unary));
     if (oi < 0) {
         GGML_ABORT("fatal error");
+    }
+    if (ggml_get_unary_op(unary) == GGML_UNARY_OP_SILU && !op_on_b && norepeat && ggml_vk_act_mul_q8(ctx, subctx, src0, src1, mul)) {
+        return;
     }
     vk_pipeline pipeline = ctx->device->pipeline_unary_mul[oi][f16][norepeat][op_on_b];
 
@@ -11139,6 +11186,9 @@ void ggml_vk_glu(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_t
     }
 
     const uint32_t mode = split ? 2 : (swapped ? 1 : 0);
+    if (split && ggml_get_glu_op(dst) == GGML_GLU_OP_SWIGLU && ggml_vk_act_mul_q8(ctx, subctx, src0, src1, dst)) {
+        return;
+    }
     const uint32_t src0_type_size = ggml_type_size(src0->type);
     const uint32_t src1_type_size = split ? ggml_type_size(src1->type) : src0_type_size;
     const uint32_t dst_type_size  = ggml_type_size(dst->type);

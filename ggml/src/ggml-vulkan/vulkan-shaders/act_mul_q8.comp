@@ -1,0 +1,54 @@
+#version 450
+
+// silu(a) * b (swiglu split mode, or fused silu+mul) that also writes the q8_1_x4 copy of its output for the next
+// integer-dot matvec, so that matvec skips its quantize dispatch and barrier. Each thread owns 4
+// consecutive outputs; 8 consecutive lanes form one 32-value q8_1 block. Intel/Xe2 (B65) tuning.
+
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_clustered : require
+
+#include "types.glsl"
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer A {float data_a[];};
+layout (binding = 1) readonly buffer B {float data_b[];};
+layout (binding = 2) writeonly buffer D {float data_d[];};
+layout (binding = 3) writeonly buffer Q {block_q8_1_x4 data_q[];};
+
+layout (push_constant) uniform parameter
+{
+    uint ne;        // total outputs (multiple of 128)
+    uint a_off;     // element offsets of the three f32 tensors
+    uint b_off;
+    uint d_off;
+} p;
+
+void main() {
+    const uint i0 = gl_GlobalInvocationID.x * 4;
+    vec4 v = vec4(0.0f);
+    if (i0 < p.ne) {
+        [[unroll]] for (uint k = 0; k < 4; ++k) {
+            const float a = data_a[p.a_off + i0 + k];
+            const float b = data_b[p.b_off + i0 + k];
+            v[k] = a / (1.0f + exp(-a)) * b;
+            data_d[p.d_off + i0 + k] = v[k];
+        }
+    }
+    const vec4 av = abs(v);
+    const float amax = subgroupClusteredMax(max(max(av.x, av.y), max(av.z, av.w)), 8);
+    const float d = amax / 127.0;
+    const float d_inv = d != 0.0 ? 1.0 / d : 0.0;
+    const vec4 q = round(v * d_inv);
+    const float qsum = subgroupClusteredAdd(q.x + q.y + q.z + q.w, 8);
+    if (i0 < p.ne) {
+        const uint ib = i0 / 32;
+        const uint iqs = (i0 % 32) / 4;
+        data_q[ib / 4].qs[(ib % 4) * 8 + iqs] = pack32(i8vec4(q));
+        if (iqs == 0) {
+            data_q[ib / 4].ds[ib % 4] = f16vec2(vec2(d, qsum * d));
+        }
+    }
+}
