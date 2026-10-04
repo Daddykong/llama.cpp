@@ -6604,6 +6604,11 @@ static bool ggml_vk_should_use_mmvq(const vk_device& device, uint32_t m, uint32_
             if (src0_type == GGML_TYPE_Q2_0 || src0_type == GGML_TYPE_Q2_K || src0_type == GGML_TYPE_Q3_K || src0_type == GGML_TYPE_Q6_K) {
                 return true;
             }
+            // B65 (BMG-G31, Mesa 26.2): Q4_0 batch-1 MMVQ reads ~430-476 GB/s vs ~250 GB/s for the
+            // fp16 dequant path (the "A770 Linux" exclusion below is Xe-HPG-specific).
+            if (src0_type == GGML_TYPE_Q4_0 && k >= 2048) {
+                return true;
+            }
         }
 
         if (device->driver_id == vk::DriverId::eIntelProprietaryWindows) {
