@@ -10054,6 +10054,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // in-place tests
     test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, {64, 5, 4, 3}, false, 1e-6f, true));
 
+    // long single-token rows (multi-workgroup rms_norm paths), plain and with a broadcast 1D weight
+    for (int64_t n1 : { 1, 3, 8 }) {
+        for (int64_t n0 : { 1024, 5120, 8192 }) {
+            test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, {n0, n1, 1, 1}, false, 1e-6f));
+            test_cases.emplace_back(new test_rms_norm_mul_rope({n0, n1, 1, 1}, 1e-6f, false, false, true, GGML_ROPE_TYPE_NORMAL, true, false));
+        }
+    }
+
     for (ggml_type set_rows_type : { GGML_TYPE_F32, GGML_TYPE_F16 }) {
         test_cases.emplace_back(new test_rms_norm_mul_rope({ 256, 1, 1, 1 }, 1e-6f, false, true, false, GGML_ROPE_TYPE_NORMAL, false, false, set_rows_type));
         test_cases.emplace_back(new test_rms_norm_mul_rope({ 128, 4, 3, 1 }, 1e-6f, false, true, false, GGML_ROPE_TYPE_NORMAL, false, false, set_rows_type));

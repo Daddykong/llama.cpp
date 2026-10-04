@@ -1,0 +1,87 @@
+#version 450
+
+// rms_norm (+ optional multiply) for long rows, spread over several workgroups, that also writes the
+// q8_1_x4 copy of its output that the next integer-dot matvec needs (so the separate quantize dispatch
+// and its barrier are skipped). Each workgroup re-reduces the whole row (L2-resident) with fully
+// unrolled vec4 loads, then owns one 1024-element slice. Intel/Xe2 (B65) tuning.
+// Host guarantees: ne00 % 128 == 0, ne00 <= 8192, a/b/d offsets 16-byte aligned, no broadcast of b.
+
+#include "generic_binary_head.glsl"
+#include "types.glsl"
+
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_clustered : require
+
+#define BLOCK_SIZE 256
+#define SLICE (BLOCK_SIZE * 4)
+#define MAX_ITERS 8
+
+layout (constant_id = 1) const bool do_multiply = false;
+
+layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer A4 {vec4 data_a4[];};
+layout (binding = 1) readonly buffer B4 {vec4 data_b4[];};
+layout (binding = 2) writeonly buffer D4 {vec4 data_d4[];};
+layout (binding = 3) writeonly buffer Q {block_q8_1_x4 data_q[];};
+
+shared float partial[BLOCK_SIZE];
+
+void main() {
+    const uint ncols4 = p.ne00 / 4;
+    const uint row    = gl_WorkGroupID.y;
+    const uint tid    = gl_LocalInvocationID.x;
+
+    const uint a4 = (row*p.nb01 + get_aoffset()) / 4;
+    const uint b4 = (src1_idx(0, row, 0, 0) + get_boffset()) / 4;
+    const uint d4 = (row*p.ne00 + get_doffset()) / 4;
+
+    // all loads issued before any use
+    vec4 xs[MAX_ITERS];
+    [[unroll]] for (uint k = 0; k < MAX_ITERS; ++k) {
+        const uint i = tid + k * BLOCK_SIZE;
+        xs[k] = i < ncols4 ? data_a4[a4 + i] : vec4(0.0f);
+    }
+    float sum = 0.0f;
+    [[unroll]] for (uint k = 0; k < MAX_ITERS; ++k) {
+        sum += dot(xs[k], xs[k]);
+    }
+    sum = subgroupAdd(sum);
+    if (subgroupElect()) {
+        partial[gl_SubgroupID] = sum;
+    }
+    barrier();
+    sum = 0.0f;
+    for (uint s = 0; s < gl_NumSubgroups; ++s) {
+        sum += partial[s];
+    }
+    const float scale = inversesqrt(sum / float(p.ne00) + p.param1);
+
+    const uint i4 = gl_WorkGroupID.x * BLOCK_SIZE + tid;   // this thread's vec4 within the row
+    vec4 v = vec4(0.0f);
+    if (i4 < ncols4) {
+        v = scale * data_a4[a4 + i4];
+        if (do_multiply) {
+            v *= data_b4[b4 + i4];
+        }
+        data_d4[d4 + i4] = v;
+    }
+
+    // q8_1 x4: 8 consecutive lanes (one vec4 each) form one 32-value block, same math as quantize_q8_1.comp
+    const vec4 av = abs(v);
+    const float amax = subgroupClusteredMax(max(max(av.x, av.y), max(av.z, av.w)), 8);
+    const float d = amax / 127.0;
+    const float d_inv = d != 0.0 ? 1.0 / d : 0.0;
+    const vec4 q = round(v * d_inv);
+    const float qsum = subgroupClusteredAdd(q.x + q.y + q.z + q.w, 8);
+    if (i4 < ncols4) {
+        const uint gidx = row * p.ne00 + i4 * 4;   // ne00 % 128 == 0, so rows start on an x4 block
+        const uint ib = gidx / 32;
+        const uint iqs = (gidx % 32) / 4;
+        data_q[ib / 4].qs[(ib % 4) * 8 + iqs] = pack32(i8vec4(q));
+        if (iqs == 0) {
+            data_q[ib / 4].ds[ib % 4] = f16vec2(vec2(d, qsum * d));
+        }
+    }
+}

@@ -3293,6 +3293,14 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
     ggml_vk_create_pipeline(device, device->pipeline_rms_norm_f32, "rms_norm_f32", rms_norm_f32_len, rms_norm_f32_data, "main", 4, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 0}, 1, true);
     ggml_vk_create_pipeline(device, device->pipeline_rms_norm_mul_f32, "rms_norm_mul_f32", rms_norm_f32_len, rms_norm_f32_data, "main", 4, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 1}, 1, true);
+    if (device->subgroup_arithmetic && device->subgroup_clustered && device->integer_dot_product && getenv("GGML_VK_DISABLE_RMS_Q8") == nullptr) {
+        ggml_vk_create_pipeline(device, device->pipeline_rms_norm_q8_f32, "rms_norm_q8_f32", rms_norm_q8_f32_len, rms_norm_q8_f32_data, "main", 4, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 0}, 1, true, true);
+        ggml_vk_create_pipeline(device, device->pipeline_rms_norm_mul_q8_f32, "rms_norm_mul_q8_f32", rms_norm_q8_f32_len, rms_norm_q8_f32_data, "main", 4, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 1}, 1, true, true);
+    }
+    if (device->subgroup_arithmetic && getenv("GGML_VK_DISABLE_RMS_SMALL") == nullptr) {
+        ggml_vk_create_pipeline(device, device->pipeline_rms_norm_small_f32, "rms_norm_small_f32", rms_norm_small_f32_len, rms_norm_small_f32_data, "main", 4, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 0}, 1, true);
+        ggml_vk_create_pipeline(device, device->pipeline_rms_norm_mul_small_f32, "rms_norm_mul_small_f32", rms_norm_small_f32_len, rms_norm_small_f32_data, "main", 4, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 1}, 1, true);
+    }
     ggml_vk_create_pipeline(device, device->pipeline_rms_norm_mul_add_f32, "rms_norm_mul_add_f32", rms_norm_mul_add_f32_len, rms_norm_mul_add_f32_data, "main", 5, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 1, 0}, 1, true);
     ggml_vk_create_pipeline(device, device->pipeline_rms_norm_mul_add_mul_f32, "rms_norm_mul_add_mul_f32", rms_norm_mul_add_f32_len, rms_norm_mul_add_f32_data, "main", 5, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 1, 1}, 1, true);
     ggml_vk_create_pipeline(device, device->pipeline_rms_norm_mul_add_partials_f32, "rms_norm_mul_add_partials_f32", rms_norm_mul_add_partials_f32_len, rms_norm_mul_add_partials_f32_data, "main", 6, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 1, 0}, 1, true);
@@ -8951,6 +8959,9 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
             if (ctx->do_add_rms_partials) {
                 return ctx->fused_rms_norm_mode == RMS_NORM_MUL ? ctx->device->pipeline_rms_norm_mul_partials_f32 : ctx->device->pipeline_rms_norm_partials_f32;
             }
+            if (src0->ne[0] <= 512 && ctx->device->pipeline_rms_norm_small_f32) {
+                return ctx->fused_rms_norm_mode == RMS_NORM_MUL ? ctx->device->pipeline_rms_norm_mul_small_f32 : ctx->device->pipeline_rms_norm_small_f32;
+            }
             return ctx->fused_rms_norm_mode == RMS_NORM_MUL ? ctx->device->pipeline_rms_norm_mul_f32 : ctx->device->pipeline_rms_norm_f32;
         }
         return nullptr;
@@ -11044,7 +11055,42 @@ void ggml_vk_rms_norm(ggml_backend_vk_context * ctx, vk_context& subctx, const s
             }, pc, elements);
     } else {
         GGML_ASSERT(ctx->fused_rms_norm_mode == RMS_NORM_MUL || ctx->fused_rms_norm_mode == RMS_NORM_COUNT);
-        ggml_vk_op_f32<vk_op_binary_push_constants>(ctx, subctx, src0, src1, nullptr, nullptr, dst, GGML_OP_RMS_NORM, std::move(bin));
+        // long rows of a few tokens: multi-workgroup norm that also leaves the q8_1 copy for the next matvec
+        const uint64_t q8_ne = (uint64_t)src0->ne[0] * src0->ne[1];
+        const uint64_t q8_sz = ggml_vk_align_size(q8_ne, 128) * ggml_type_size(GGML_TYPE_Q8_1) / ggml_blck_size(GGML_TYPE_Q8_1);
+        if (ctx->device->pipeline_rms_norm_q8_f32 && !ctx->do_add_rms_partials &&
+            src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
+            src0->ne[0] >= 1024 && src0->ne[0] <= 8192 && src0->ne[0] % 128 == 0 && src0->ne[1] <= 8 && src0->ne[2] == 1 && src0->ne[3] == 1 &&
+            ggml_is_contiguous(dst) && src0->nb[0] == sizeof(float) && src0->nb[1] % 16 == 0 &&
+            src1->type == GGML_TYPE_F32 && src1->nb[0] == sizeof(float) && (src1 == src0 || src1->ne[0] == src0->ne[0]) &&
+            get_misalign_bytes(ctx, src0) % 16 == 0 && get_misalign_bytes(ctx, src1) % 16 == 0 && get_misalign_bytes(ctx, dst) % 16 == 0 &&
+            ctx->prealloc_y != nullptr && ctx->prealloc_y->size >= q8_sz) {
+            vk_pipeline pipeline = ctx->fused_rms_norm_mode == RMS_NORM_MUL ? ctx->device->pipeline_rms_norm_mul_q8_f32 : ctx->device->pipeline_rms_norm_q8_f32;
+            if (ctx->prealloc_y_need_sync) {
+                ggml_vk_sync_buffers(ctx, subctx);
+            }
+            init_pushconst_tensor_offsets(ctx, bin, src0, src1, nullptr, nullptr, dst);
+            ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+            ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+                {
+                    ggml_vk_tensor_subbuffer(ctx, src0, true),
+                    ggml_vk_tensor_subbuffer(ctx, src1, true),
+                    ggml_vk_tensor_subbuffer(ctx, dst, true),
+                    ggml_vk_subbuffer(ctx, ctx->prealloc_y, 0),
+                }, bin, { (uint32_t)CEIL_DIV(src0->ne[0], 1024), (uint32_t)src0->ne[1], 1 });
+            static const bool noskip = getenv("GGML_VK_RMS_Q8_NOSKIP") != nullptr;  // test: write q8 but let the matvec requantize
+            if (!noskip) {
+                ctx->prealloc_y_last_pipeline_used = ctx->device->pipeline_quantize_q8_1_x4.get();
+                ctx->prealloc_y_last_tensor_used = dst;
+                ctx->prealloc_y_last_k_padded = false;
+            } else {
+                ctx->prealloc_y_last_pipeline_used = nullptr;
+                ctx->prealloc_y_last_tensor_used = nullptr;
+            }
+            ctx->prealloc_y_need_sync = true;   // written: a later writer of prealloc_y in the same wave must wait
+        } else {
+            ggml_vk_op_f32<vk_op_binary_push_constants>(ctx, subctx, src0, src1, nullptr, nullptr, dst, GGML_OP_RMS_NORM, std::move(bin));
+        }
     }
 
     ggml_vk_rms_norm_finish(ctx, src0);

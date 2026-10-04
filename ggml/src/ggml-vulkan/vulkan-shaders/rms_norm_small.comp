@@ -1,0 +1,60 @@
+#version 450
+
+// rms_norm (+ optional multiply) for short rows (ne00 <= 512): one small workgroup per row with a
+// subgroup reduction, instead of 512 threads and a 9-step shared-memory tree. Intel/Xe2 (B65) tuning.
+
+#include "generic_binary_head.glsl"
+#include "types.glsl"
+
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+
+#define BLOCK_SIZE 32
+
+layout (constant_id = 1) const bool do_multiply = false;
+
+layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+shared FLOAT_TYPE partial[BLOCK_SIZE];
+
+void main() {
+    const uint ncols     = p.ne00;
+    const uint nrows     = gl_NumWorkGroups.x;
+    const uint nchannels = gl_NumWorkGroups.y;
+
+    const uint row       = gl_WorkGroupID.x;
+    const uint channel   = gl_WorkGroupID.y;
+    const uint samp      = gl_WorkGroupID.z;
+    const uint tid       = gl_LocalInvocationID.x;
+
+    const uint a_offset = samp*p.nb03 + channel*p.nb02 + row*p.nb01 + get_aoffset();
+    const uint b_offset = src1_idx(0, row, channel, samp) + get_boffset();
+    const uint d_offset = ((samp*nchannels + channel)*nrows + row)*ncols + get_doffset();
+
+    FLOAT_TYPE sum = FLOAT_TYPE(0.0f);
+    for (uint col = tid; col < ncols; col += BLOCK_SIZE) {
+        const FLOAT_TYPE xi = FLOAT_TYPE(data_a[a_offset + col]);
+        sum += xi * xi;
+    }
+    sum = subgroupAdd(sum);
+    if (gl_NumSubgroups > 1) {
+        if (subgroupElect()) {
+            partial[gl_SubgroupID] = sum;
+        }
+        barrier();
+        sum = FLOAT_TYPE(0.0f);
+        for (uint s = 0; s < gl_NumSubgroups; ++s) {
+            sum += partial[s];
+        }
+    }
+
+    const FLOAT_TYPE scale = inversesqrt(sum / FLOAT_TYPE(ncols) + FLOAT_TYPE(p.param1));
+
+    for (uint col = tid; col < ncols; col += BLOCK_SIZE) {
+        FLOAT_TYPE value = scale * FLOAT_TYPE(data_a[a_offset + col]);
+        if (do_multiply) {
+            value *= FLOAT_TYPE(data_b[b_offset + (ncols > p.ne10 ? fastmod(col, p.ne10) : col)]);
+        }
+        data_d[d_offset + col] = D_TYPE(value);
+    }
+}
