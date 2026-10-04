@@ -29,6 +29,10 @@ layout (binding = 0) readonly buffer A_U128 {uvec4 data_a_u128[];};
 layout (binding = 0) readonly buffer A_R64 {uvec2 data_a_r64[];};
 layout (binding = 0) readonly buffer A_R128 {uvec4 data_a_r128[];};
 layout (binding = 0) readonly buffer A_R16 {float16_t data_a_r16[];};
+#if defined(Q4_0R_K32)
+// q8_1_x4 blocks are 144 bytes (9 x 16): ds[4] then qs[32]
+layout (binding = 1) readonly buffer B_R128 {ivec4 data_b_r128[];};
+#endif
 #endif
 
 layout (binding = 1) readonly buffer B {B_TYPE data_b[];};

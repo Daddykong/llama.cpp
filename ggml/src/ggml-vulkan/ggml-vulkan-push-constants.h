@@ -39,6 +39,25 @@ struct vk_mat_vec_p021_push_constants {
     uint32_t b_offset;
     uint32_t d_offset;
     uint32_t fusion_flags;
+    uint32_t ntok;
+    uint32_t stride_y_chan;
+    uint32_t stride_y_tok;
+    uint32_t stride_d_chan;
+    uint32_t stride_d_tok;
+};
+
+struct vk_mat_vec_gqa_push_constants {
+    uint32_t ncols;
+    uint32_t nrows;
+    uint32_t a_row_stride;
+    uint32_t a_chan_stride;
+    uint32_t b_chan_stride;
+    uint32_t b_tok_stride;
+    uint32_t d_chan_stride;
+    uint32_t d_tok_stride;
+    uint32_t a_offset;
+    uint32_t b_offset;
+    uint32_t d_offset;
 };
 
 struct vk_mat_vec_nc_push_constants {
@@ -55,6 +74,10 @@ struct vk_mat_vec_nc_push_constants {
     uint32_t nb13;
     uint32_t nb23;
     uint32_t fusion_flags;
+    uint32_t ntok;
+    uint32_t stride_y_tok;
+    uint32_t stride_d_chan;
+    uint32_t stride_d_tok;
 };
 
 struct vk_mat_mat_id_push_constants {
@@ -917,6 +940,15 @@ template <> inline void init_pushconst_tensor_offsets(ggml_backend_vk_context * 
     p.d_offset = d_offset;
 
     GGML_UNUSED(src0);
+    GGML_UNUSED(src2);
+    GGML_UNUSED(src3);
+}
+
+template <> inline void init_pushconst_tensor_offsets(ggml_backend_vk_context * ctx, vk_mat_vec_gqa_push_constants &p, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * src2, const ggml_tensor * src3, ggml_tensor * dst) {
+    p.a_offset = get_misalign_bytes(ctx, src0) / ggml_type_size(src0->type);
+    p.b_offset = get_misalign_bytes(ctx, src1) / ggml_type_size(src1->type);
+    p.d_offset = get_misalign_bytes(ctx, dst) / ggml_type_size(dst->type);
+
     GGML_UNUSED(src2);
     GGML_UNUSED(src3);
 }

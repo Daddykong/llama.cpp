@@ -1,0 +1,99 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+
+// dst[i, t, h*GQA + c] = sum_k A[k, i, h] * B[k, t, h*GQA + c]
+// for a long k (e.g. V x softmax(KQ) in decode attention: k = KV positions, i = head dim).
+// A workgroup takes NROWS rows of one channel; its invocations walk k together (coalesced loads
+// of A and B), each B load is reused for all NROWS rows, and the partial sums are reduced with
+// subgroup adds and then across subgroups in shared memory.
+
+#define BLOCK_SIZE 256
+
+layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+#include "mul_mat_vec_iface.glsl"
+
+layout(constant_id = 0) const uint GQA = 1;    // B channels per A channel, 1..8
+layout(constant_id = 1) const uint NTOK = 1;   // columns of B, 1..4
+layout(constant_id = 2) const uint NROWS = 1;  // rows of A per workgroup
+
+layout (push_constant) uniform parameter
+{
+    uint ncols;          // k, multiple of 4
+    uint nrows;          // rows of A per channel
+    uint a_row_stride;   // in elements, multiples of 4
+    uint a_chan_stride;
+    uint b_chan_stride;
+    uint b_tok_stride;
+    uint d_chan_stride;
+    uint d_tok_stride;
+    uint a_offset;
+    uint b_offset;
+    uint d_offset;
+} p;
+
+// NROWS * GQA * NTOK <= 128 partial sums per subgroup
+shared float red[BLOCK_SIZE / 8][128];
+
+void main() {
+    const uint tid  = gl_LocalInvocationID.x;
+    const uint row0 = gl_WorkGroupID.x * NROWS;
+    const uint h    = gl_WorkGroupID.y;
+
+    float acc[NROWS * NTOK * GQA];
+    [[unroll]] for (uint i = 0; i < NROWS * NTOK * GQA; ++i) {
+        acc[i] = 0.0;
+    }
+
+    uint a_base[NROWS];
+    [[unroll]] for (uint r = 0; r < NROWS; ++r) {
+        // rows past the end re-read the last row; their results are not written
+        a_base[r] = (p.a_offset + h * p.a_chan_stride + min(row0 + r, p.nrows - 1) * p.a_row_stride) / 4;
+    }
+    const uint b_base = (p.b_offset + h * GQA * p.b_chan_stride) / 4;
+    const uint b_cs   = p.b_chan_stride / 4;
+    const uint b_ts   = p.b_tok_stride / 4;
+    const uint n4     = p.ncols / 4;
+
+    for (uint k4 = tid; k4 < n4; k4 += BLOCK_SIZE) {
+        vec4 av[NROWS];
+        [[unroll]] for (uint r = 0; r < NROWS; ++r) {
+            av[r] = vec4(data_a_v4[a_base[r] + k4]);
+        }
+        [[unroll]] for (uint t = 0; t < NTOK; ++t) {
+            [[unroll]] for (uint c = 0; c < GQA; ++c) {
+                const vec4 bv = data_b_v4[b_base + c * b_cs + t * b_ts + k4];
+                [[unroll]] for (uint r = 0; r < NROWS; ++r) {
+                    acc[(r * NTOK + t) * GQA + c] += dot(av[r], bv);
+                }
+            }
+        }
+    }
+
+    [[unroll]] for (uint i = 0; i < NROWS * NTOK * GQA; ++i) {
+        acc[i] = subgroupAdd(acc[i]);
+    }
+    if (gl_SubgroupInvocationID == 0) {
+        [[unroll]] for (uint i = 0; i < NROWS * NTOK * GQA; ++i) {
+            red[gl_SubgroupID][i] = acc[i];
+        }
+    }
+    barrier();
+
+    for (uint i = tid; i < NROWS * NTOK * GQA; i += BLOCK_SIZE) {
+        float s = 0.0;
+        for (uint j = 0; j < gl_NumSubgroups; ++j) {
+            s += red[j][i];
+        }
+        const uint r = i / (NTOK * GQA);
+        const uint t = (i / GQA) % NTOK;
+        const uint c = i % GQA;
+        if (row0 + r < p.nrows) {
+            data_d[p.d_offset + (h * GQA + c) * p.d_chan_stride + t * p.d_tok_stride + row0 + r] = s;
+        }
+    }
+}

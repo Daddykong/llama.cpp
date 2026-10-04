@@ -10365,6 +10365,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // attention-shaped f16 matvecs with a few tokens (speculative-decoding verify batches): GQA broadcast,
+    // permuted K x Q and non-contiguous V x KQ
+    for (int n = 1; n <= 5; ++n) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 256, n, 256, {4, 1}, {6, 1}, {0, 2, 1, 3}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 256, n, 256, {4, 1}, {6, 1}, {0, 1, 2, 3}, 512));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 129, n,  72, {2, 1}, {3, 1}, {0, 2, 1, 3}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 129, n,  72, {2, 1}, {3, 1}, {0, 1, 2, 3}, 80));
+    }
+
     // BF16 is absent from base_types: add the 3 standard non-contig permutations explicitly
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, 16,  1, 256, {2, 3}, {1, 1}, {0, 2, 1, 3}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, 16,  1, 256, {2, 3}, {1, 1}, {0, 1, 3, 2}));
@@ -11621,6 +11630,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
 
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 16416, 1, 128, {8,  1}, {4, 1}, {0, 2, 1, 3}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 128, 1, 16416, {8,  1}, {4, 1}, {0, 1, 2, 3}, 2*16416));
+
+    // attention with a few tokens (speculative-decoding verify), 32K context, 4 KV heads x 6 (GQA)
+    for (int n : {1, 2, 3, 4}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 32768, n, 256, {4, 1}, {6, 1}, {0, 2, 1, 3}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 256, n, 32768, {4, 1}, {6, 1}, {0, 1, 2, 3}, 2*32768));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 256, n, 32768, {4, 1}, {6, 1}));
+    }
 
     // FWHT tests
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 128, 1, 128));
