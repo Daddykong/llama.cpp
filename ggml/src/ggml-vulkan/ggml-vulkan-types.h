@@ -828,6 +828,11 @@ struct vk_device_struct {
 
     vk_pipeline pipeline_mul_mat_vec_p021_f16_f32[p021_max_gqa_ratio];
     vk_pipeline pipeline_mul_mat_vec_nc_f16_f32;
+    // f16 x f32 matvecs for decode attention: [GQA - 1][tokens - 1]
+    vk_pipeline pipeline_mul_mat_vec_gqa_rows_f16_f32[8][4];
+    vk_pipeline pipeline_mul_mat_vec_gqa_split_f16_f32[8][4];
+    uint32_t mul_mat_vec_gqa_split_rows[8][4];
+    bool mul_mat_vec_gqa;
     vk_pipeline pipeline_get_rows[GGML_TYPE_COUNT];
     vk_pipeline pipeline_get_rows_f32[GGML_TYPE_COUNT];
     vk_pipeline pipeline_get_rows_back_f32;

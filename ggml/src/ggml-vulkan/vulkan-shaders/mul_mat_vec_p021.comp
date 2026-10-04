@@ -25,10 +25,18 @@ layout (push_constant) uniform parameter
     uint b_offset;
     uint d_offset;
     uint fusion_flags;
+    uint ntok;
+    uint stride_y_chan;
+    uint stride_y_tok;
+    uint stride_d_chan;
+    uint stride_d_tok;
 } p;
 
+// up to MAX_TOK tokens (e.g. a speculative-decoding verify batch) share each read of x
+#define MAX_TOK 4
+
 #if !USE_SUBGROUP_ADD
-shared FLOAT_TYPE tmp[8][BLOCK_SIZE];
+shared FLOAT_TYPE tmp[MAX_TOK * 8][BLOCK_SIZE];
 #endif
 
 void main() {
@@ -53,13 +61,14 @@ void main() {
     const uint nrows_dst = p.nrows_x;
     const uint row_dst = row_x;
 
-    FLOAT_TYPE temp[8];
-    [[unroll]] for (uint i = 0; i < 8; ++i) {
+    FLOAT_TYPE temp[MAX_TOK * 8];
+    [[unroll]] for (uint i = 0; i < MAX_TOK * 8; ++i) {
         temp[i] = FLOAT_TYPE(0.0f);
     }
 
     // Detect alignment for vector loads
-    bool is_aligned = (p.ncols_x % 4) == 0 && (p.nchannels_x % 4) == 0 && (nrows_y % 4) == 0;
+    bool is_aligned = (p.ncols_x % 4) == 0 && (p.nchannels_x % 4) == 0 && (nrows_y % 4) == 0 &&
+                      (p.stride_y_chan % 4) == 0 && (p.stride_y_tok % 4) == 0;
 
     for (uint col_x0 = 0; col_x0 < p.ncols_x; col_x0 += BLOCK_SIZE) {
 
@@ -73,12 +82,16 @@ void main() {
             const uint ix = row_x*p.nchannels_x*p.ncols_x + channel_x*p.ncols_x + col_x;
             const vec4 av4 = vec4(data_a_v4[ix / 4]);
 
-            [[unroll]] for (uint c = 0; c < gqa_ratio; ++c) {
-                // y is not transposed but permuted
-                const uint iy = (channel + c)*nrows_y + row_y;
+            [[unroll]] for (uint t = 0; t < MAX_TOK; ++t) {
+                if (t < p.ntok) {
+                    [[unroll]] for (uint c = 0; c < gqa_ratio; ++c) {
+                        // y is not transposed but permuted
+                        const uint iy = (channel + c)*p.stride_y_chan + t*p.stride_y_tok + row_y;
 
-                vec4 bv4 = data_b_v4[iy / 4];
-                temp[c] += dot(av4, bv4);
+                        vec4 bv4 = data_b_v4[iy / 4];
+                        temp[t*8 + c] += dot(av4, bv4);
+                    }
+                }
             }
 
             col_x0 += 3*BLOCK_SIZE;
@@ -95,62 +108,82 @@ void main() {
 
             const uint row_y = col_x;
 
-            [[unroll]] for (uint c = 0; c < gqa_ratio; ++c) {
-                // y is not transposed but permuted
-                const uint iy = (channel + c)*nrows_y + row_y;
+            [[unroll]] for (uint t = 0; t < MAX_TOK; ++t) {
+                if (t < p.ntok) {
+                    [[unroll]] for (uint c = 0; c < gqa_ratio; ++c) {
+                        // y is not transposed but permuted
+                        const uint iy = (channel + c)*p.stride_y_chan + t*p.stride_y_tok + row_y;
 
-                temp[c] = fma(xi, FLOAT_TYPE(data_b[iy]), temp[c]);
+                        temp[t*8 + c] = fma(xi, FLOAT_TYPE(data_b[iy]), temp[t*8 + c]);
+                    }
+                }
             }
         }
     }
 
 #if USE_SUBGROUP_ADD
     // reduce vec4 at a time
-    vec4 t = vec4(temp[0], temp[1], temp[2], temp[3]);
-    t = subgroupAdd(t);
-    temp[0] = t[0];
-    temp[1] = t[1];
-    temp[2] = t[2];
-    temp[3] = t[3];
-    if (gqa_ratio > 4) {
-        t = vec4(temp[4], temp[5], temp[6], temp[7]);
-        t = subgroupAdd(t);
-        temp[4] = t[0];
-        temp[5] = t[1];
-        temp[6] = t[2];
-        temp[7] = t[3];
+    [[unroll]] for (uint t = 0; t < MAX_TOK; ++t) {
+        if (t < p.ntok) {
+            vec4 v = vec4(temp[t*8 + 0], temp[t*8 + 1], temp[t*8 + 2], temp[t*8 + 3]);
+            v = subgroupAdd(v);
+            temp[t*8 + 0] = v[0];
+            temp[t*8 + 1] = v[1];
+            temp[t*8 + 2] = v[2];
+            temp[t*8 + 3] = v[3];
+            if (gqa_ratio > 4) {
+                v = vec4(temp[t*8 + 4], temp[t*8 + 5], temp[t*8 + 6], temp[t*8 + 7]);
+                v = subgroupAdd(v);
+                temp[t*8 + 4] = v[0];
+                temp[t*8 + 5] = v[1];
+                temp[t*8 + 6] = v[2];
+                temp[t*8 + 7] = v[3];
+            }
+        }
     }
 #else
-    [[unroll]] for (uint c = 0; c < gqa_ratio; ++c) {
-        tmp[c][tid] = temp[c];
+    [[unroll]] for (uint t = 0; t < MAX_TOK; ++t) {
+        [[unroll]] for (uint c = 0; c < gqa_ratio; ++c) {
+            tmp[t*8 + c][tid] = temp[t*8 + c];
+        }
     }
     // sum up partial sums and write back result
     barrier();
     [[unroll]] for (int s = BLOCK_SIZE / 2; s > 0; s >>= 1) {
         if (tid < s) {
-            [[unroll]] for (uint c = 0; c < gqa_ratio; ++c) {
-                temp[c] += tmp[c][tid + s];
-                tmp[c][tid] = temp[c];
+            [[unroll]] for (uint t = 0; t < MAX_TOK; ++t) {
+                if (t < p.ntok) {
+                    [[unroll]] for (uint c = 0; c < gqa_ratio; ++c) {
+                        temp[t*8 + c] += tmp[t*8 + c][tid + s];
+                        tmp[t*8 + c][tid] = temp[t*8 + c];
+                    }
+                }
             }
         }
         barrier();
     }
-    [[unroll]] for (uint c = 0; c < gqa_ratio; ++c) {
-        temp[c] = tmp[c][tid];
+    [[unroll]] for (uint t = 0; t < MAX_TOK; ++t) {
+        [[unroll]] for (uint c = 0; c < gqa_ratio; ++c) {
+            temp[t*8 + c] = tmp[t*8 + c][tid];
+        }
     }
 #endif
 
     if (tid == 0) {
-        [[unroll]] for (uint c = 0; c < gqa_ratio; ++c) {
-            // dst is not transposed and not permuted
-            const uint idst = (channel + c)*nrows_dst + row_dst;
-            if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_BIAS0) != 0) {
-                temp[c] += FLOAT_TYPE(data_fuse0[idst]);
+        [[unroll]] for (uint t = 0; t < MAX_TOK; ++t) {
+            if (t < p.ntok) {
+                [[unroll]] for (uint c = 0; c < gqa_ratio; ++c) {
+                    // dst is not transposed and not permuted
+                    const uint idst = (channel + c)*p.stride_d_chan + t*p.stride_d_tok + row_dst;
+                    if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_BIAS0) != 0) {
+                        temp[t*8 + c] += FLOAT_TYPE(data_fuse0[idst]);
+                    }
+                    if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_BIAS1) != 0) {
+                        temp[t*8 + c] += FLOAT_TYPE(data_fuse1[idst]);
+                    }
+                    data_d[idst] = temp[t*8 + c];
+                }
             }
-            if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_BIAS1) != 0) {
-                temp[c] += FLOAT_TYPE(data_fuse1[idst]);
-            }
-            data_d[idst] = temp[c];
         }
     }
 }

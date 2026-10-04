@@ -42,9 +42,14 @@ void iter(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const
         cache_b_ds = vec2(data_b[b_block_idx_outer].ds[b_block_idx_inner]);
 
 #if defined(DATA_A_Q4_0R) && defined(Q4_0R_K32)
-        // Each thread takes a whole block (16 quant bytes, one 16-byte load)
-        [[unroll]] for (uint k = 0; k < 8; ++k) {
-            cache_b_qs[k] = data_b[b_block_idx_outer].qs[b_block_idx_inner * 8 + k];
+        // Each thread takes a whole block (16 quant bytes, one 16-byte load); the matching 32 q8_1
+        // values are two 16-byte loads
+        {
+            const uint bv = b_block_idx_outer * 9 + 1 + b_block_idx_inner * 2;
+            const ivec4 b0 = data_b_r128[bv];
+            const ivec4 b1 = data_b_r128[bv + 1];
+            cache_b_qs[0] = b0.x; cache_b_qs[1] = b0.y; cache_b_qs[2] = b0.z; cache_b_qs[3] = b0.w;
+            cache_b_qs[4] = b1.x; cache_b_qs[5] = b1.y; cache_b_qs[6] = b1.z; cache_b_qs[7] = b1.w;
         }
 #elif defined(DATA_A_Q4_0R)
         // Each thread takes half a block (8 quant bytes = 16 values): low nibbles pair with

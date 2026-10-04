@@ -25,9 +25,16 @@ layout (push_constant) uniform parameter
     uint nb13;
     uint nb23;
     uint fusion_flags;
+    uint ntok;
+    uint stride_y_tok;
+    uint stride_d_chan;
+    uint stride_d_tok;
 } p;
 
-shared FLOAT_TYPE tmp[BLOCK_SIZE];
+// up to MAX_TOK tokens (e.g. a speculative-decoding verify batch) share each read of x
+#define MAX_TOK 4
+
+shared FLOAT_TYPE tmp[MAX_TOK][BLOCK_SIZE];
 
 void main() {
     const uint tid       = gl_LocalInvocationID.x;
@@ -41,12 +48,16 @@ void main() {
     const uint nrows_dst = p.nrows_x;
     const uint row_dst   = row_x;
 
-    const uint idst = i3*p.nb23 + channel*nrows_dst + row_dst;
+    const uint idst = i3*p.nb23 + channel*p.stride_d_chan + row_dst;
 
-    FLOAT_TYPE temp = 0.0f;
+    FLOAT_TYPE temp[MAX_TOK];
+    [[unroll]] for (uint t = 0; t < MAX_TOK; ++t) {
+        temp[t] = FLOAT_TYPE(0.0f);
+    }
 
     // Detect alignment for vector loads
-    bool is_aligned = (p.ncols_x % 4) == 0 && (p.row_stride_x % 4) == 0 && (p.channel_stride_x % 4) == 0;
+    bool is_aligned = (p.ncols_x % 4) == 0 && (p.row_stride_x % 4) == 0 && (p.channel_stride_x % 4) == 0 &&
+                      (p.channel_stride_y % 4) == 0 && (p.stride_y_tok % 4) == 0;
 
     for (uint col_x0 = 0; col_x0 < p.ncols_x;) {
 
@@ -62,9 +73,11 @@ void main() {
                 const uint iy = i3*p.nb13 + channel_y*p.channel_stride_y + row_y;
 
                 const vec4 av4 = vec4(data_a_v4[ix / 4]);
-                const vec4 bv4 = vec4(data_b_v4[iy / 4]);
-
-                temp += dot(av4, bv4);
+                [[unroll]] for (uint t = 0; t < MAX_TOK; ++t) {
+                    if (t < p.ntok) {
+                        temp[t] += dot(av4, vec4(data_b_v4[(iy + t*p.stride_y_tok) / 4]));
+                    }
+                }
 
                 col_x0 += 4*BLOCK_SIZE;
             }
@@ -78,9 +91,11 @@ void main() {
             const uint iy = i3*p.nb13 + channel_y*p.channel_stride_y + row_y;
 
             const vec4 av4 = vec4(data_a_v4[ix / 4]);
-            const vec4 bv4 = vec4(data_b_v4[iy / 4]);
-
-            temp += dot(av4, bv4);
+            [[unroll]] for (uint t = 0; t < MAX_TOK; ++t) {
+                if (t < p.ntok) {
+                    temp[t] += dot(av4, vec4(data_b_v4[(iy + t*p.stride_y_tok) / 4]));
+                }
+            }
 
             col_x0 += 4*BLOCK_SIZE;
         } else {
@@ -96,29 +111,45 @@ void main() {
 
             const FLOAT_TYPE xi = FLOAT_TYPE(data_a[ix]);
 
-            temp = fma(xi, FLOAT_TYPE(data_b[iy]), temp);
+            [[unroll]] for (uint t = 0; t < MAX_TOK; ++t) {
+                if (t < p.ntok) {
+                    temp[t] = fma(xi, FLOAT_TYPE(data_b[iy + t*p.stride_y_tok]), temp[t]);
+                }
+            }
             col_x0 += BLOCK_SIZE;
         }
     }
 
-    tmp[tid] = temp;
+    [[unroll]] for (uint t = 0; t < MAX_TOK; ++t) {
+        tmp[t][tid] = temp[t];
+    }
 
     // sum up partial sums and write back result
     barrier();
     [[unroll]] for (int s = BLOCK_SIZE / 2; s > 0; s >>= 1) {
         if (tid < s) {
-            tmp[tid] += tmp[tid + s];
+            [[unroll]] for (uint t = 0; t < MAX_TOK; ++t) {
+                if (t < p.ntok) {
+                    tmp[t][tid] += tmp[t][tid + s];
+                }
+            }
         }
         barrier();
     }
 
     if (tid == 0) {
-        if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_BIAS0) != 0) {
-            tmp[0] += FLOAT_TYPE(data_fuse0[idst]);
+        [[unroll]] for (uint t = 0; t < MAX_TOK; ++t) {
+            if (t < p.ntok) {
+                const uint idst_t = idst + t*p.stride_d_tok;
+                FLOAT_TYPE r = tmp[t][0];
+                if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_BIAS0) != 0) {
+                    r += FLOAT_TYPE(data_fuse0[idst_t]);
+                }
+                if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_BIAS1) != 0) {
+                    r += FLOAT_TYPE(data_fuse1[idst_t]);
+                }
+                data_d[idst_t] = r;
+            }
         }
-        if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_BIAS1) != 0) {
-            tmp[0] += FLOAT_TYPE(data_fuse1[idst]);
-        }
-        data_d[idst] = tmp[0];
     }
 }
