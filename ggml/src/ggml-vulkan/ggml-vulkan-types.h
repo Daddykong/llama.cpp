@@ -381,6 +381,8 @@ struct vk_queue {
 };
 
 static constexpr uint32_t mul_mat_vec_max_cols = 8;
+// Vulkan-internal pseudo type for row-reordered Q4_0 weights (reuses the removed GGML_TYPE_Q4_2 slot)
+static constexpr ggml_type GGML_TYPE_Q4_0R_VK = (ggml_type)4;
 
 static constexpr uint32_t p021_max_gqa_ratio = 8;
 
@@ -740,6 +742,9 @@ struct vk_device_struct {
     bool integer_dot_product;
     // 0: default, 1: force mmvq, -1: disable mmvq
     int32_t mmvq_mode;
+    // GGML_VK_Q4_0_REPACK: 0 off, 1 reorder Q4_0 weight tensors on first MUL_MAT, 2 any buffer (tests)
+    int32_t q4_0_repack;
+    vk_pipeline pipeline_reorder_q4_0;
 
     bool subgroup_size_control;
     uint32_t subgroup_min_size;
@@ -1322,6 +1327,8 @@ struct ggml_backend_vk_buffer_context {
     vk_device_ref device;
     vk_buffer dev_buffer;
     std::string name;
+    // tensor offsets (vk_tensor_offset) of Q4_0 tensors already row-reordered in place
+    std::set<uint64_t> q4_0r_offsets;
 
     ggml_backend_vk_buffer_context(vk_device_ref device, vk_buffer&& dev_buffer, std::string& name) :
         device(device),

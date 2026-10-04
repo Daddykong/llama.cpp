@@ -56,6 +56,7 @@ uint mm_load_vec_a() {
     switch (MmTypeA) {
     case GGML_TYPE_Q1_0:
     case GGML_TYPE_Q4_0:
+    case GGML_TYPE_Q4_0R:
     case GGML_TYPE_Q4_1:
     case GGML_TYPE_Q5_1:
         return 8u;
@@ -113,6 +114,9 @@ layout (binding = 0) readonly buffer BUF_Q6_K_P16   { block_q6_K_packed16 data[]
 // Packed32 aliases
 layout (binding = 0) readonly buffer BUF_Q4_1_P32   { block_q4_1_packed32 data[];   } a_q4_1_p32;
 layout (binding = 0) readonly buffer BUF_Q5_1_P32   { block_q5_1_packed32 data[];   } a_q5_1_p32;
+// Row-reordered Q4_0: each row holds all 16-byte quant blocks, then all fp16 scales
+layout (binding = 0) readonly buffer BUF_Q4_0R_U32  { uint data[];       } a_q4_0r_u32;
+layout (binding = 0) readonly buffer BUF_Q4_0R_F16  { float16_t data[];  } a_q4_0r_f16;
 layout (binding = 0) readonly buffer BUF_Q2_K_P32   { block_q2_K_packed32 data[];   } a_q2_k_p32;
 layout (binding = 0) readonly buffer BUF_Q4_K_P32   { block_q4_K_packed32 data[];   } a_q4_k_p32;
 layout (binding = 0) readonly buffer BUF_Q5_K_P32   { block_q5_K_packed32 data[];   } a_q5_k_p32;

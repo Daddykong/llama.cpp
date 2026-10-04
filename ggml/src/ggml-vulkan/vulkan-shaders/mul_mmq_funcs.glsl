@@ -44,7 +44,17 @@ ACC_TYPE mmq_dot_product(const uint ib_a) {
 // 2-byte loads for Q4_0 blocks (18 bytes)
 // 4-byte loads for Q4_1 blocks (20 bytes)
 void block_a_to_shmem(const uint buf_ib, const uint ib, const uint iqs) {
-#ifdef DATA_A_Q4_0
+#if defined(DATA_A_Q4_0R)
+    const uint nbpr = p.stride_a / QUANT_K;
+    const uint jb = ib % nbpr;
+    const uint rsb = ib - jb;
+    // quant word: byte rsb*18 + jb*16 + iqs*4; nbpr is even so rsb*9/2 is exact
+    buf_a[buf_ib].qs[iqs] = data_a_r32[(rsb * 9) / 2 + jb * 4 + iqs];
+
+    if (iqs == 0) {
+        buf_a[buf_ib].dm = FLOAT_TYPE(data_a_r16[rsb * 9 + nbpr * 8 + jb]);
+    }
+#elif defined(DATA_A_Q4_0)
     buf_a[buf_ib].qs[iqs] = pack32(u16vec2(data_a_packed16[ib].qs[iqs * 2],
                                            data_a_packed16[ib].qs[iqs * 2 + 1]));
 

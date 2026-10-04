@@ -362,6 +362,26 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
         store_a(col, k_pair + 1, FLOAT_TYPEV2(v0.zw));
         store_a(col, k_pair + 8, FLOAT_TYPEV2(v1.xy));
         store_a(col, k_pair + 9, FLOAT_TYPEV2(v1.zw));
+    } else if (MmTypeA == GGML_TYPE_Q4_0R) {
+        const uint idx = pos_a + col * p.stride_a / mm_load_vec_a() + row;
+        const uint k_pair = row * mm_load_vec_a() / 4;
+
+        const uint ib = idx / 4;
+        const uint iqs = idx & 0x03;
+        const uint nbpr = p.stride_a / 32;
+        // block index within the row from the absolute K position (avoids a division by nbpr)
+        const uint jb = (block + row * mm_load_vec_a()) / 32;
+        const uint rsb = ib - jb;
+
+        const float d = float(a_q4_0r_f16.data[rsb * 9 + nbpr * 8 + jb]);
+        const uint vui = a_q4_0r_u32.data[(rsb * 9) / 2 + jb * 4 + iqs];
+        const vec4 v0 = (vec4(unpack8(vui & 0x0F0F0F0F)) - 8.0f) * d;
+        const vec4 v1 = (vec4(unpack8((vui >> 4) & 0x0F0F0F0F)) - 8.0f) * d;
+
+        store_a(col, k_pair, FLOAT_TYPEV2(v0.xy));
+        store_a(col, k_pair + 1, FLOAT_TYPEV2(v0.zw));
+        store_a(col, k_pair + 8, FLOAT_TYPEV2(v1.xy));
+        store_a(col, k_pair + 9, FLOAT_TYPEV2(v1.zw));
     } else if (MmTypeA == GGML_TYPE_Q4_1) {
         const uint idx = pos_a + col * p.stride_a / mm_load_vec_a() + row;
         const uint k_pair = row * mm_load_vec_a() / 4;
