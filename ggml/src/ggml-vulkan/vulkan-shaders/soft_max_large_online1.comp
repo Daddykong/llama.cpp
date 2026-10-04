@@ -1,0 +1,92 @@
+#version 450
+
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+
+// Two-pass "online" softmax for very long rows (ncols > 16384).
+// Pass 1: each workgroup reads its chunk of the row once and writes its local max m_i and
+// local sum s_i = sum(exp(v - m_i)). Replaces large1 + large2 (which read the row twice and
+// wrote exp() to dst only to read it back in large3).
+
+#include "soft_max_large_common.glsl"
+
+
+// workgroup reductions via subgroup ops (shared-memory trees are barrier-heavy on Intel)
+FLOAT_TYPE wg_max(FLOAT_TYPE v) {
+    v = subgroupMax(v);
+    barrier();
+    if (gl_SubgroupInvocationID == 0) {
+        vals[gl_SubgroupID] = v;
+    }
+    barrier();
+    v = vals[0];
+    for (uint i = 1; i < gl_NumSubgroups; ++i) {
+        v = max(v, vals[i]);
+    }
+    return v;
+}
+
+FLOAT_TYPE wg_sum(FLOAT_TYPE v) {
+    v = subgroupAdd(v);
+    barrier();
+    if (gl_SubgroupInvocationID == 0) {
+        vals[gl_SubgroupID] = v;
+    }
+    barrier();
+    v = vals[0];
+    for (uint i = 1; i < gl_NumSubgroups; ++i) {
+        v += vals[i];
+    }
+    return v;
+}
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint rowx = gl_WorkGroupID.y;
+    const uint wg_start = gl_WorkGroupID.x * BLOCK_SIZE * num_iters;
+
+    const uint32_t i03 = rowx / (p.ne01 * p.ne02);
+    const uint32_t i02 = (rowx - i03 * p.ne01 * p.ne02) / p.ne01;
+    const uint32_t i01 = rowx % p.ne01;
+
+    uint rowy_start = 0;
+    if (p.KY > 0) {
+        rowy_start = i01 * p.nb11 + (i02 % p.ne12) * p.nb12 + (i03 % p.ne13) * p.nb13;
+    }
+
+    if (rowx >= p.nrows_x) {
+        return;
+    }
+
+    const float slope = get_slope(rowx);
+    const FLOAT_TYPE NEG_INF = uintBitsToFloat(0xFF800000);
+
+    FLOAT_TYPE v[num_iters];
+    FLOAT_TYPE max_val = NEG_INF;
+
+    [[unroll]] for (uint idx = 0; idx < num_iters; ++idx) {
+        const uint col = wg_start + idx * BLOCK_SIZE + tid;
+        v[idx] = NEG_INF;
+        if (col < p.KX) {
+            FLOAT_TYPE b = p.KY > 0 ? FLOAT_TYPE(data_b[rowy_start + col]) : FLOAT_TYPE(0);
+            v[idx] = FLOAT_TYPE(data_a[rowx * p.KX + col]) * p.scale + slope * b;
+            max_val = max(max_val, v[idx]);
+        }
+    }
+
+    max_val = wg_max(max_val);
+
+    FLOAT_TYPE sum = FLOAT_TYPE(0);
+    if (max_val > NEG_INF) {
+        [[unroll]] for (uint idx = 0; idx < num_iters; ++idx) {
+            sum += exp(v[idx] - max_val);
+        }
+    }
+
+    sum = wg_sum(sum);
+
+    if (tid == 0) {
+        data_m[rowx * gl_NumWorkGroups.x + gl_WorkGroupID.x] = max_val;
+        data_s[rowx * gl_NumWorkGroups.x + gl_WorkGroupID.x] = sum;
+    }
+}

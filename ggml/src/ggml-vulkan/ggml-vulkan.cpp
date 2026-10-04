@@ -3543,6 +3543,11 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_soft_max_large1_f32_f16, "soft_max_large1_f32_f16", soft_max_large1_f32_f16_len, soft_max_large1_f32_f16_data, "main", 6, sizeof(vk_op_soft_max_push_constants), {1, 1, 1}, { 128, 4 }, 1, true);
     ggml_vk_create_pipeline(device, device->pipeline_soft_max_large2_f32_f16, "soft_max_large2_f32_f16", soft_max_large2_f32_f16_len, soft_max_large2_f32_f16_data, "main", 6, sizeof(vk_op_soft_max_push_constants), {1, 1, 1}, { 128, 4 }, 1, true);
     ggml_vk_create_pipeline(device, device->pipeline_soft_max_large3_f32_f16, "soft_max_large3_f32_f16", soft_max_large3_f32_f16_len, soft_max_large3_f32_f16_data, "main", 6, sizeof(vk_op_soft_max_push_constants), {1, 1, 1}, { 128, 4 }, 1, true);
+    // two-pass online softmax for rows > 16384: 128 threads x 32 elements per workgroup
+    ggml_vk_create_pipeline(device, device->pipeline_soft_max_large_online1_f32,     "soft_max_large_online1_f32",     soft_max_large_online1_f32_len,     soft_max_large_online1_f32_data,     "main", 6, sizeof(vk_op_soft_max_push_constants), {1, 1, 1}, { 128, 32 }, 1, true);
+    ggml_vk_create_pipeline(device, device->pipeline_soft_max_large_online2_f32,     "soft_max_large_online2_f32",     soft_max_large_online2_f32_len,     soft_max_large_online2_f32_data,     "main", 6, sizeof(vk_op_soft_max_push_constants), {1, 1, 1}, { 128, 32 }, 1, true);
+    ggml_vk_create_pipeline(device, device->pipeline_soft_max_large_online1_f32_f16, "soft_max_large_online1_f32_f16", soft_max_large_online1_f32_f16_len, soft_max_large_online1_f32_f16_data, "main", 6, sizeof(vk_op_soft_max_push_constants), {1, 1, 1}, { 128, 32 }, 1, true);
+    ggml_vk_create_pipeline(device, device->pipeline_soft_max_large_online2_f32_f16, "soft_max_large_online2_f32_f16", soft_max_large_online2_f32_f16_len, soft_max_large_online2_f32_f16_data, "main", 6, sizeof(vk_op_soft_max_push_constants), {1, 1, 1}, { 128, 32 }, 1, true);
 
     ggml_vk_create_pipeline(device, device->pipeline_rope_norm_f32, "rope_norm_f32", rope_norm_f32_len, rope_norm_f32_data, "main", 5, sizeof(vk_op_rope_push_constants), {1, 512, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_rope_neox_f32, "rope_neox_f32", rope_neox_f32_len, rope_neox_f32_data, "main", 5, sizeof(vk_op_rope_push_constants), {1, 512, 1}, {}, 1);
@@ -11269,7 +11274,9 @@ void ggml_vk_soft_max(ggml_backend_vk_context * ctx, vk_context& subctx, const g
         vk_subbuffer buf_c = src2 ? ggml_vk_tensor_subbuffer(ctx, src2) : buf_a;
         vk_subbuffer buf_d = ggml_vk_tensor_subbuffer(ctx, dst);
 
-        uint32_t elems_per_wg = 128 * 4;
+        // the online path (default) uses 32 elements per thread; GGML_VK_SOFT_MAX_3PASS=1 restores the old 3-pass path
+        static const bool sm_3pass = getenv("GGML_VK_SOFT_MAX_3PASS") != nullptr;
+        uint32_t elems_per_wg = 128 * (sm_3pass ? 4 : 32);
         uint32_t num_wgs = CEIL_DIV(ncols, elems_per_wg);
         size_t tmp_size = num_wgs * nrows_x * sizeof(float);
 
@@ -11289,6 +11296,21 @@ void ggml_vk_soft_max(ggml_backend_vk_context * ctx, vk_context& subctx, const g
         vk_subbuffer buf_y = { ctx->prealloc_y, 0, tmp_size };
 
         std::array<uint32_t, 3> elements = { num_wgs, nrows_x, 1 };
+
+        if (!sm_3pass) {
+            // pass 1: per-workgroup max and sum(exp(x - max)); pass 2: combine and write exp(x - M) / S once
+            const bool f16m = src1 && src1->type == GGML_TYPE_F16;
+            vk_pipeline po1 = f16m ? ctx->device->pipeline_soft_max_large_online1_f32_f16 : ctx->device->pipeline_soft_max_large_online1_f32;
+            vk_pipeline po2 = f16m ? ctx->device->pipeline_soft_max_large_online2_f32_f16 : ctx->device->pipeline_soft_max_large_online2_f32;
+            ggml_pipeline_request_descriptor_sets(ctx, po1, 1);
+            ggml_pipeline_request_descriptor_sets(ctx, po2, 1);
+            ggml_vk_dispatch_pipeline(ctx, subctx, po1, { buf_a, buf_b, buf_c, buf_d, buf_x, buf_y }, pc, elements);
+            ggml_vk_sync_buffers(ctx, subctx);
+            ggml_vk_dispatch_pipeline(ctx, subctx, po2, { buf_a, buf_b, buf_c, buf_d, buf_x, buf_y }, pc, elements);
+            ctx->prealloc_x_need_sync = true;
+            ctx->prealloc_y_need_sync = true;
+            return;
+        }
 
         vk_pipeline pipeline1 = src1 && src1->type == GGML_TYPE_F16 ? ctx->device->pipeline_soft_max_large1_f32_f16 : ctx->device->pipeline_soft_max_large1_f32;
         vk_pipeline pipeline2 = src1 && src1->type == GGML_TYPE_F16 ? ctx->device->pipeline_soft_max_large2_f32_f16 : ctx->device->pipeline_soft_max_large2_f32;
