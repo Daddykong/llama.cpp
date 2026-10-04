@@ -14609,16 +14609,19 @@ static void ggml_vk_plan_gdn_state_fusion(ggml_backend_vk_context * ctx, const g
                 ++n_state_users;
                 // source: [D, n_seqs(=1), n_written] starting at the state part, slots state_elems apart
                 const int64_t n_written = std::min<int64_t>(v->ne[2], K);
-                const bool src_ok = vw->view_offs == s_off_bytes && vw->type == GGML_TYPE_F32 && vw->ne[0] == state_elems &&
-                                    vw->nb[0] == sizeof(float) && vw->ne[1] == 1 && vw->ne[3] == 1 &&
-                                    (K == 1 ? vw->ne[2] == 1 : (vw->ne[2] == n_written && (n_written == 1 || vw->nb[2] == (size_t)state_elems * sizeof(float))));
+                const bool src_ok = vw->view_offs == s_off_bytes && vw->type == GGML_TYPE_F32 && (
+                                    (K == 1 && ggml_is_contiguous(vw) && ggml_nelements(vw) == state_elems) ||
+                                    (vw->ne[0] == state_elems && vw->nb[0] == sizeof(float) && vw->ne[1] == 1 && vw->ne[3] == 1 &&
+                                     (K == 1 ? vw->ne[2] == 1 : (vw->ne[2] == n_written && (n_written == 1 || vw->nb[2] == (size_t)state_elems * sizeof(float))))));
                 if (!src_ok) { ci = -2; break; }
                 users_of(vw, users2);
                 if (users2.size() != 1) { ci = -2; break; }
                 const ggml_tensor * c = cgraph->nodes[users2[0]];
                 const ggml_tensor * d = c->op == GGML_OP_CPY ? c->src[1] : nullptr;
-                if (!d || c->src[0] != vw || d->type != GGML_TYPE_F32 || d->ne[0] != state_elems || d->nb[0] != sizeof(float) ||
-                    d->ne[1] != 1 || d->ne[2] != vw->ne[2] || d->ne[3] != 1 || (d->ne[2] > 1 && d->nb[2] % sizeof(float) != 0) ||
+                const bool d_ok = d && (K == 1 ? (ggml_is_contiguous(d) && ggml_nelements(d) == state_elems) :
+                                  (d->ne[0] == state_elems && d->nb[0] == sizeof(float) && d->ne[1] == 1 && d->ne[2] == vw->ne[2] && d->ne[3] == 1 &&
+                                   (d->ne[2] == 1 || d->nb[2] % sizeof(float) == 0)));
+                if (!d || !d_ok || c->src[0] != vw || d->type != GGML_TYPE_F32 ||
                     ggml_vk_tensor_buffer_offset(ctx, d) % ctx->device->properties.limits.minStorageBufferOffsetAlignment != 0) { ci = -2; break; }
                 ci = users2[0];
             }
