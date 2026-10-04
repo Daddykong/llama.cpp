@@ -310,6 +310,11 @@ FLOAT_TYPE mmvq_dot_product(const uint ib_a, const uint iqs) {
 }
 #endif
 
+#if defined(DATA_A_Q4_K)
+layout (binding = 0) readonly buffer A_K128_MMVQ {block_q4_K_packed128 data_a_k128[];};
+#elif defined(DATA_A_Q5_K)
+layout (binding = 0) readonly buffer A_K128_MMVQ {block_q5_K_packed128 data_a_k128[];};
+#endif
 #if defined(DATA_A_Q4_K) || defined(DATA_A_Q5_K)
 // 4-byte loads for Q4_K blocks (144 bytes) and Q5_K blocks (176 bytes)
 i32vec4 repack4(uint ib, uint iqs) {
@@ -320,24 +325,17 @@ i32vec4 repack4(uint ib, uint iqs) {
     const uint qs_shift = ((iqs_k % 16) / 8) * 4;
 
 #if defined(DATA_A_Q4_K)
-    const uint32_t vals0 = (data_a_packed32[ib_k].qs[qs_idx    ] >> qs_shift) & 0x0F0F0F0F;
-    const uint32_t vals1 = (data_a_packed32[ib_k].qs[qs_idx + 1] >> qs_shift) & 0x0F0F0F0F;
-    const uint32_t vals2 = (data_a_packed32[ib_k].qs[qs_idx + 2] >> qs_shift) & 0x0F0F0F0F;
-    const uint32_t vals3 = (data_a_packed32[ib_k].qs[qs_idx + 3] >> qs_shift) & 0x0F0F0F0F;
-
-    return i32vec4(vals0, vals1, vals2, vals3);
+    // B65 tuning: blocks are 144 bytes (16-byte aligned) and qs_idx is a multiple of 4 -> one 16-byte load
+    const uvec4 v = data_a_k128[ib_k].q4k[1 + qs_idx / 4];
+    return i32vec4((v >> qs_shift) & 0x0F0F0F0Fu);
 #else // defined(DATA_A_Q5_K)
     const uint qh_idx = iqs;
     const uint qh_shift = iqs_k / 8;
 
-    return i32vec4(((data_a_packed32[ib_k].qs[qs_idx    ] >> qs_shift) & 0x0F0F0F0F) |
-                  (((data_a_packed32[ib_k].qh[qh_idx    ] >> qh_shift) & 0x01010101) << 4),
-                   ((data_a_packed32[ib_k].qs[qs_idx + 1] >> qs_shift) & 0x0F0F0F0F) |
-                  (((data_a_packed32[ib_k].qh[qh_idx + 1] >> qh_shift) & 0x01010101) << 4),
-                   ((data_a_packed32[ib_k].qs[qs_idx + 2] >> qs_shift) & 0x0F0F0F0F) |
-                  (((data_a_packed32[ib_k].qh[qh_idx + 2] >> qh_shift) & 0x01010101) << 4),
-                   ((data_a_packed32[ib_k].qs[qs_idx + 3] >> qs_shift) & 0x0F0F0F0F) |
-                  (((data_a_packed32[ib_k].qh[qh_idx + 3] >> qh_shift) & 0x01010101) << 4));
+    // B65 tuning: blocks are 176 bytes (16-byte aligned), qh at +16, qs at +48 -> two 16-byte loads
+    const uvec4 q = data_a_k128[ib_k].q5k[3 + qs_idx / 4];
+    const uvec4 h = data_a_k128[ib_k].q5k[1 + qh_idx / 4];
+    return i32vec4(((q >> qs_shift) & 0x0F0F0F0Fu) | (((h >> qh_shift) & 0x01010101u) << 4));
 #endif
 }
 
