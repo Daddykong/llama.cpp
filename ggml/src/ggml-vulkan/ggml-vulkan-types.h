@@ -384,6 +384,9 @@ struct vk_queue {
 static constexpr uint32_t mul_mat_vec_max_cols = 8;
 // Vulkan-internal pseudo type for row-reordered Q4_0 weights (reuses the removed GGML_TYPE_Q4_2 slot)
 static constexpr ggml_type GGML_TYPE_Q4_0R_VK = (ggml_type)4;
+// ... and for row-reordered Q5_K / Q8_0 weights (unused type slots 5 and 31)
+static constexpr ggml_type GGML_TYPE_Q5_KR_VK = (ggml_type)5;
+static constexpr ggml_type GGML_TYPE_Q8_0R_VK = (ggml_type)31;
 
 static constexpr uint32_t p021_max_gqa_ratio = 8;
 
@@ -746,6 +749,11 @@ struct vk_device_struct {
     // GGML_VK_Q4_0_REPACK: 0 off, 1 reorder Q4_0 weight tensors on first MUL_MAT, 2 any buffer (tests)
     int32_t q4_0_repack;
     vk_pipeline pipeline_reorder_q4_0;
+    // GGML_VK_Q5_K_REPACK / GGML_VK_Q8_0_REPACK: same for Q5_K and Q8_0 weights
+    int32_t q5_k_repack;
+    int32_t q8_0_repack;
+    vk_pipeline pipeline_reorder_q5_k;
+    vk_pipeline pipeline_reorder_q8_0;
 
     bool subgroup_size_control;
     uint32_t subgroup_min_size;

@@ -12,7 +12,7 @@
 
 layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 
-#if defined(DATA_A_Q4_0R) && defined(Q4_0R_K32)
+#if (defined(DATA_A_Q4_0R) && defined(Q4_0R_K32)) || defined(DATA_A_Q5_KR) || defined(DATA_A_Q8_0R)
 #define K_PER_ITER 32
 #elif defined(DATA_A_Q4_0R)
 #define K_PER_ITER 16
@@ -33,6 +33,19 @@ vec2 cache_b_ds;
 
 #include "mul_mat_vecq_funcs.glsl"
 
+#if defined(DATA_A_Q5_KR)
+// scale and min of sub-block j (0..7) from the 12 packed bytes in hdr.yzw, branch-free
+void r5_scale_min(const uvec4 hdr, const uint j, out float sc, out float m) {
+    const uint sh = 8 * (j & 3);
+    const uint y = hdr.y >> sh;
+    const uint z = hdr.z >> sh;
+    const uint w = (hdr.w >> sh) & 0xFF;
+    const bool lo = j < 4;
+    sc = float(lo ? (y & 63) : ((w & 15) | (((y >> 6) & 3) << 4)));
+    m  = float(lo ? (z & 63) : ((w >> 4) | (((z >> 6) & 3) << 4)));
+}
+#endif
+
 void iter(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const uint num_rows, const uint col, const uint b_qs_idx) {
     [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
         // Preload data_b block
@@ -41,7 +54,7 @@ void iter(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const
         const uint b_block_idx_inner = b_block_idx % 4;
         cache_b_ds = vec2(data_b[b_block_idx_outer].ds[b_block_idx_inner]);
 
-#if defined(DATA_A_Q4_0R) && defined(Q4_0R_K32)
+#if defined(A_REORDERED_K32)
         // Each thread takes a whole block (16 quant bytes, one 16-byte load); the matching 32 q8_1
         // values are two 16-byte loads
         {
@@ -88,7 +101,53 @@ void iter(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const
 #endif
 #endif
 
-#if defined(DATA_A_Q4_0R)
+#if defined(DATA_A_Q5_KR)
+        // one 32-value sub-block per thread: 16 quant bytes, its 32 high bits, the superblock header
+        const uint nb = p.ncols / QUANT_K;
+        const uint js = col / 32;
+        const uint jb = js / 8;
+        uint rsb = first_row * nb + a_offset / (QUANT_K / QUANT_K_Q8_1);
+        [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+            const uvec4 q = data_a_r128[rsb * 11 + js];
+            const uint qh = data_a_r32[rsb * 44 + nb * 32 + js];
+            const uvec4 hdr = data_a_r128[rsb * 11 + nb * 10 + jb];
+            rsb += nb;
+
+            int32_t q_sum = 0;
+            [[unroll]] for (uint w = 0; w < 4; ++w) {
+                q_sum += dotPacked4x8EXT(int32_t(( q[w]       & 0x0F0F0F0F) | (((qh >> w)       & 0x01010101) << 4)), cache_b_qs[w]);
+                q_sum += dotPacked4x8EXT(int32_t(((q[w] >> 4) & 0x0F0F0F0F) | (((qh >> (w + 4)) & 0x01010101) << 4)), cache_b_qs[w + 4]);
+            }
+            const vec2 dm = unpackHalf2x16(hdr.x);
+            float sc, mn;
+            r5_scale_min(hdr, js % 8, sc, mn);
+            temp[j][n] += FLOAT_TYPE(dm.x * sc * (float(q_sum) * cache_b_ds.x) - dm.y * mn * cache_b_ds.y);
+        }
+#elif defined(DATA_A_Q8_0R)
+        // one 32-value block per thread: two 16-byte loads and the fp16 scale
+        const uint nbpr = p.ncols / QUANT_K;
+        const uint jb = col / QUANT_K;
+        // nbpr % 8 == 0, so a row starts 16-byte aligned: rsb*34/16 = rsb*17/8 is exact
+        uint rsb = first_row * nbpr + a_offset;
+        [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+            const uint q4i = (rsb * 17) / 8 + 2 * jb;
+            const uvec4 q0 = data_a_r128[q4i];
+            const uvec4 q1 = data_a_r128[q4i + 1];
+            const float da = float(data_a_r16[rsb * 17 + nbpr * 16 + jb]);
+            rsb += nbpr;
+
+            int32_t q_sum = dotPacked4x8EXT(int32_t(q0.x), cache_b_qs[0]);
+            q_sum += dotPacked4x8EXT(int32_t(q0.y), cache_b_qs[1]);
+            q_sum += dotPacked4x8EXT(int32_t(q0.z), cache_b_qs[2]);
+            q_sum += dotPacked4x8EXT(int32_t(q0.w), cache_b_qs[3]);
+            q_sum += dotPacked4x8EXT(int32_t(q1.x), cache_b_qs[4]);
+            q_sum += dotPacked4x8EXT(int32_t(q1.y), cache_b_qs[5]);
+            q_sum += dotPacked4x8EXT(int32_t(q1.z), cache_b_qs[6]);
+            q_sum += dotPacked4x8EXT(int32_t(q1.w), cache_b_qs[7]);
+
+            temp[j][n] += FLOAT_TYPE(da * (float(q_sum) * cache_b_ds.x));
+        }
+#elif defined(DATA_A_Q4_0R)
         const uint nbpr = p.ncols / QUANT_K;
         const uint jb = col / QUANT_K;
         // rsb = first block of the row = R*nbpr; nbpr % 4 == 0 so rsb*9/4 is exact
@@ -187,7 +246,7 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
     reduce_result(temp, d_offset, first_row, num_rows, tid);
 }
 
-#if (defined(DATA_A_Q5_K) || defined(DATA_A_Q4_K)) && !defined(MUL_MAT_ID)
+#if (defined(DATA_A_Q5_K) || defined(DATA_A_Q4_K)) && !defined(MUL_MAT_ID) && !defined(DATA_A_Q5_KR)
 // Wide K-quant path (KQ_WIDE != 0): 8 threads per superblock. Each thread owns 16 quant
 // bytes (32 values: 16 low nibbles of sub-block 2g, 16 high nibbles of sub-block 2g+1),
 // reads them, the 16-byte header and (Q5_K) its 16 bytes of high bits with 16-byte loads,
@@ -282,7 +341,7 @@ void compute_outputs_kqwide(const uint32_t first_row, const uint32_t num_rows) {
 #endif
 
 void compute_any(const uint32_t first_row, const uint32_t num_rows) {
-#if (defined(DATA_A_Q5_K) || defined(DATA_A_Q4_K)) && !defined(MUL_MAT_ID)
+#if (defined(DATA_A_Q5_K) || defined(DATA_A_Q4_K)) && !defined(MUL_MAT_ID) && !defined(DATA_A_Q5_KR)
     if (KQ_WIDE != 0) {
         compute_outputs_kqwide(first_row, num_rows);
         return;

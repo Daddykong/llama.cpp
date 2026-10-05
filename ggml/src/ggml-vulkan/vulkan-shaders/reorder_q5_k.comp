@@ -1,0 +1,87 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+
+// In-place row reorder of Q5_K weights for the row-reordered (Q5_KR) matvec/matmul shaders.
+// One workgroup per row of nb 176-byte superblocks. The row becomes three regions:
+//   quants : nb*8 sub-blocks x 16 bytes; byte b of sub-block s holds value b in the low nibble and
+//            value b+16 in the high nibble (the Q4_0 nibble order), 4 low bits only
+//   high   : nb*8 words; word s holds the 5th bit of the 32 values of sub-block s, value 4w+b
+//            (w, b < 4) at bit 8b+w and value 16+4w+b at bit 8b+4+w, so that
+//            ((h >> w) & 0x01010101) << 4 completes quant word w's low nibbles
+//   header : nb x 16 bytes, the original d, dmin and 12 scale bytes
+// Lossless (a permutation of bits). Requires nb * 44 <= REORDER_MAX_WORDS.
+
+#define REORDER_MAX_WORDS 4096
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) buffer A {uint data_a[];};
+
+layout (push_constant) uniform parameter
+{
+    uint nb;
+    uint nrows;
+    uint row0;
+} p;
+
+shared uint sh[REORDER_MAX_WORDS];
+
+uint getb(uint i) {
+    return (sh[i >> 2] >> ((i & 3u) * 8u)) & 0xFFu;
+}
+
+// 4-bit quant of value v (0..31) of sub-block s of superblock sb
+uint q4(uint sb, uint s, uint v) {
+    return (getb(sb * 176u + 48u + 32u * (s >> 1) + v) >> (4u * (s & 1u))) & 0xFu;
+}
+
+// 5th bit of value v of sub-block s of superblock sb
+uint q1(uint sb, uint s, uint v) {
+    return (getb(sb * 176u + 16u + v) >> s) & 1u;
+}
+
+void main() {
+    const uint row = p.row0 + gl_WorkGroupID.x;
+    if (row >= p.nrows) {
+        return;
+    }
+    const uint tid = gl_LocalInvocationID.x;
+    const uint nw = p.nb * 44u;
+    const uint base = row * nw;
+
+    for (uint i = tid; i < nw; i += 256u) {
+        sh[i] = data_a[base + i];
+    }
+    barrier();
+
+    // quant words: sub-block js = sb*8+s, word w holds bytes 4w..4w+3
+    for (uint i = tid; i < p.nb * 32u; i += 256u) {
+        const uint js = i >> 2u;
+        const uint w = i & 3u;
+        const uint sb = js >> 3u;
+        const uint s = js & 7u;
+        uint word = 0u;
+        [[unroll]] for (uint b = 0u; b < 4u; ++b) {
+            const uint v = 4u * w + b;
+            word |= (q4(sb, s, v) | (q4(sb, s, v + 16u) << 4u)) << (8u * b);
+        }
+        data_a[base + i] = word;
+    }
+    // high-bit words
+    for (uint js = tid; js < p.nb * 8u; js += 256u) {
+        const uint sb = js >> 3u;
+        const uint s = js & 7u;
+        uint word = 0u;
+        [[unroll]] for (uint v = 0u; v < 16u; ++v) {
+            const uint pos = 8u * (v & 3u) + (v >> 2u);
+            word |= q1(sb, s, v) << pos;
+            word |= q1(sb, s, v + 16u) << (pos + 4u);
+        }
+        data_a[base + p.nb * 32u + js] = word;
+    }
+    // headers
+    for (uint i = tid; i < p.nb * 4u; i += 256u) {
+        data_a[base + p.nb * 40u + i] = sh[(i >> 2u) * 44u + (i & 3u)];
+    }
+}

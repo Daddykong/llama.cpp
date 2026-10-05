@@ -451,6 +451,22 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
 
         store_a(col, k_pair, FLOAT_TYPEV2(v.xy));
         store_a(col, k_pair + 1, FLOAT_TYPEV2(v.zw));
+    } else if (MmTypeA == GGML_TYPE_Q8_0R) {
+        // row-reordered Q8_0: per row nbpr 32-byte quant blocks, then nbpr fp16 scales
+        const uint idx = pos_a + col * p.stride_a / mm_load_vec_a() + row;
+        const uint k_pair = row * mm_load_vec_a() / 2;
+
+        const uint ib = idx / 8;
+        const uint iqs = idx & 0x07;
+        const uint nbpr = p.stride_a / 32;
+        const uint jb = (block + row * mm_load_vec_a()) / 32;
+        const uint rsb = ib - jb;
+
+        const float d = float(a_q4_0r_f16.data[rsb * 17 + nbpr * 16 + jb]);
+        const vec4 v = vec4(unpack8(int32_t(a_q4_0r_u32.data[(rsb * 17) / 2 + jb * 8 + iqs]))) * d;
+
+        store_a(col, k_pair, FLOAT_TYPEV2(v.xy));
+        store_a(col, k_pair + 1, FLOAT_TYPEV2(v.zw));
     } else if (MmTypeA == GGML_TYPE_Q1_0) {
         const uint idx = pos_a + col * p.stride_a / mm_load_vec_a() + row;
         const uint k_pair = row * mm_load_vec_a() / 2;
@@ -592,6 +608,47 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
 
         const uint qs = (a_q5_k_p32.data[ib].qs[qsi / 4] >> (b * 4)) & 0x0F0F0F0F;
         const uint qh = ((a_q5_k_p32.data[ib].qh[qhi / 4] >> (iqs / 16)) & 0x01010101) << 4;
+        const vec4 q = vec4(unpack8(qs | qh));
+
+        store_a(col, k_pair, FLOAT_TYPEV2(fma(d, q.x, m), fma(d, q.y, m)));
+        store_a(col, k_pair + 1, FLOAT_TYPEV2(fma(d, q.z, m), fma(d, q.w, m)));
+    } else if (MmTypeA == GGML_TYPE_Q5_KR) {
+        // row-reordered Q5_K (reorder_q5_k.comp): per row nb*8 16-byte quant sub-blocks, nb*8 high-bit
+        // words, nb 16-byte headers
+        const uint idx = pos_a + col * p.stride_a / mm_load_vec_a() + row;
+        const uint k_pair = row * mm_load_vec_a() / 2;
+
+        const uint ib = idx / 64;                  // 4 values per idx
+        const uint j = idx % 64;                   // values 4j..4j+3 of the superblock
+        const uint nb = p.stride_a / 256;
+        const uint jb = (block + row * mm_load_vec_a()) / 256;
+        const uint base = (ib - jb) * 44;          // first word of the row
+        const uint is = j / 8;                     // sub-block 0..7
+        const uint hsel = (j / 4) & 1;             // values 16..31 of the sub-block sit in the high nibbles
+        const uint w = j & 3;                      // quant word within the sub-block
+
+        const uint hdr0 = a_q4_0r_u32.data[base + nb * 40 + jb * 4];
+        const uvec3 scales = uvec3(a_q4_0r_u32.data[base + nb * 40 + jb * 4 + 1],
+                                   a_q4_0r_u32.data[base + nb * 40 + jb * 4 + 2],
+                                   a_q4_0r_u32.data[base + nb * 40 + jb * 4 + 3]);
+        const vec2 loadd = unpackHalf2x16(hdr0);
+        const uint scalesoffs = (is & 3) * 8;
+
+        const uint scidx0 = (is < 4) ? 0 : 2;
+        const uint scidxshift0 = scalesoffs;
+        const uint scidxshift1 = (is < 4) ? scalesoffs : scalesoffs + 2;
+        const uint mbidx0 = (is < 4) ? 1 : 2;
+        const uint mbidxshift0 = (is < 4) ? scalesoffs : scalesoffs + 4;
+        const uint mbidxshift1 = (is < 4) ? scalesoffs : scalesoffs + 2;
+
+        const uint8_t sc    = uint8_t(((scales[scidx0] >> scidxshift0) & 0xF) | ((scales[0] >> scidxshift1) & 0x30));
+        const uint8_t mbyte = uint8_t(((scales[mbidx0] >> mbidxshift0) & 0xF) | ((scales[1] >> mbidxshift1) & 0x30));
+
+        const float d = loadd.x * sc;
+        const float m = -loadd.y * mbyte;
+
+        const uint qs = (a_q4_0r_u32.data[base + (jb * 8 + is) * 4 + w] >> (4 * hsel)) & 0x0F0F0F0F;
+        const uint qh = ((a_q4_0r_u32.data[base + nb * 32 + jb * 8 + is] >> (w + 4 * hsel)) & 0x01010101) << 4;
         const vec4 q = vec4(unpack8(qs | qh));
 
         store_a(col, k_pair, FLOAT_TYPEV2(fma(d, q.x, m), fma(d, q.y, m)));
