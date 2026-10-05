@@ -182,6 +182,110 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
     reduce_result(temp, d_offset, first_row, num_rows, tid);
 }
 
+#if (defined(DATA_A_Q5_K) || defined(DATA_A_Q4_K)) && !defined(MUL_MAT_ID)
+// Wide K-quant path (KQ_WIDE != 0): 8 threads per superblock. Each thread owns 16 quant
+// bytes (32 values: 16 low nibbles of sub-block 2g, 16 high nibbles of sub-block 2g+1),
+// reads them, the 16-byte header and (Q5_K) its 16 bytes of high bits with 16-byte loads,
+// builds int8 quads with a few bit ops and uses dotPacked4x8 against the q8_1 activations.
+layout (constant_id = 3) const uint KQ_WIDE = 0;
+layout (binding = 1) readonly buffer BI4 {ivec4 data_b_i4[];};
+#if defined(DATA_A_Q5_K)
+#define KQ_U128_PER_BLOCK 11
+#else
+#define KQ_U128_PER_BLOCK 9
+#endif
+
+// scale and min of sub-block j (0..7) from the 12 packed bytes in hdr.yzw, branch-free
+void kq_scale_min(const uvec4 hdr, const uint j, out float sc, out float m) {
+    const uint sh = 8 * (j & 3);
+    const uint y = hdr.y >> sh;
+    const uint z = hdr.z >> sh;
+    const uint w = (hdr.w >> sh) & 0xFF;
+    const bool lo = j < 4;
+    sc = float(lo ? (y & 63) : ((w & 15) | (((y >> 6) & 3) << 4)));
+    m  = float(lo ? (z & 63) : ((w >> 4) | (((z >> 6) & 3) << 4)));
+}
+
+int kq_dot4(const ivec4 a, const ivec4 b) {
+    return dotPacked4x8EXT(a.x, b.x) + dotPacked4x8EXT(a.y, b.y) + dotPacked4x8EXT(a.z, b.z) + dotPacked4x8EXT(a.w, b.w);
+}
+
+void compute_outputs_kqwide(const uint32_t first_row, const uint32_t num_rows) {
+    const uint tid = gl_LocalInvocationID.x;
+    get_offsets(a_offset, b_offset, d_offset);   // a_offset in superblocks, b_offset in values
+
+    const uint nb   = p.ncols / QUANT_K;
+    const uint lane = tid % 8;
+    const uint ix   = tid / 8;
+    const uint it_size = gl_WorkGroupSize.x / 8;
+    const uint g = lane >> 1;
+    const uint h = lane & 1;
+
+    FLOAT_TYPE temp[NUM_COLS][NUM_ROWS];
+    [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+            temp[j][n] = FLOAT_TYPE(0.0f);
+        }
+    }
+
+    for (uint i = ix; i < nb; i += it_size) {
+        ivec4 bl[NUM_COLS];
+        ivec4 bh[NUM_COLS];
+        float dbl[NUM_COLS];
+        float dbh[NUM_COLS];
+        float ysl[NUM_COLS];
+        float ysh[NUM_COLS];
+        [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+            const uint q8l = (j*p.batch_stride_b + b_offset + i*QUANT_K + 64*g) / 32;
+            const uint q8h = q8l + 1;
+            bl[j]  = data_b_i4[(q8l / 4) * 9 + 1 + (q8l % 4) * 2 + h];
+            bh[j]  = data_b_i4[(q8h / 4) * 9 + 1 + (q8h % 4) * 2 + h];
+            dbl[j] = float(data_b[q8l / 4].ds[q8l % 4].x);
+            dbh[j] = float(data_b[q8h / 4].ds[q8h % 4].x);
+            ysl[j] = dbl[j] * float(kq_dot4(ivec4(0x01010101), bl[j]));
+            ysh[j] = dbh[j] * float(kq_dot4(ivec4(0x01010101), bh[j]));
+        }
+
+        [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+            const uint ib = (a_offset + (first_row + n) * nb + i) * KQ_U128_PER_BLOCK;
+            const uvec4 hdr = data_a_u128[ib];
+#if defined(DATA_A_Q5_K)
+            const uvec4 qh4 = data_a_u128[ib + 1 + h];
+            const uvec4 qs4 = data_a_u128[ib + 3 + 2*g + h];
+            const ivec4 lo = ivec4((qs4 & 0x0F0F0F0F)        | (((qh4 >> (2*g))     & 0x01010101) << 4));
+            const ivec4 hi = ivec4(((qs4 >> 4) & 0x0F0F0F0F) | (((qh4 >> (2*g + 1)) & 0x01010101) << 4));
+#else
+            const uvec4 qs4 = data_a_u128[ib + 1 + 2*g + h];
+            const ivec4 lo = ivec4(qs4 & 0x0F0F0F0F);
+            const ivec4 hi = ivec4((qs4 >> 4) & 0x0F0F0F0F);
+#endif
+            const vec2 dm = unpackHalf2x16(hdr.x);
+            float sc_l, m_l, sc_h, m_h;
+            kq_scale_min(hdr, 2*g,     sc_l, m_l);
+            kq_scale_min(hdr, 2*g + 1, sc_h, m_h);
+
+            [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+                const float sl = dbl[j] * float(kq_dot4(lo, bl[j]));
+                const float sh = dbh[j] * float(kq_dot4(hi, bh[j]));
+                temp[j][n] += FLOAT_TYPE(dm.x * (sc_l * sl + sc_h * sh) - dm.y * (m_l * ysl[j] + m_h * ysh[j]));
+            }
+        }
+    }
+
+    reduce_result(temp, d_offset, first_row, num_rows, tid);
+}
+#endif
+
+void compute_any(const uint32_t first_row, const uint32_t num_rows) {
+#if (defined(DATA_A_Q5_K) || defined(DATA_A_Q4_K)) && !defined(MUL_MAT_ID)
+    if (KQ_WIDE != 0) {
+        compute_outputs_kqwide(first_row, num_rows);
+        return;
+    }
+#endif
+    compute_outputs(first_row, num_rows);
+}
+
 void main() {
     const uint first_row = NUM_ROWS * (gl_WorkGroupID.x + gl_NumWorkGroups.x * gl_WorkGroupID.z);
 
@@ -191,11 +295,11 @@ void main() {
 
     // do NUM_ROWS at a time, unless there aren't enough remaining rows
     if (first_row + NUM_ROWS <= p.stride_d) {
-        compute_outputs(first_row, NUM_ROWS);
+        compute_any(first_row, NUM_ROWS);
     } else {
         if (first_row >= p.stride_d) {
             return;
         }
-        compute_outputs(first_row, p.stride_d - first_row);
+        compute_any(first_row, p.stride_d - first_row);
     }
 }

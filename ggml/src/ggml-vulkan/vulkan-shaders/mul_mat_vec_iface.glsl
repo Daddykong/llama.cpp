@@ -19,6 +19,11 @@ layout (binding = 0) readonly buffer A_PACKED32 {A_TYPE_PACKED32 data_a_packed32
 layout (binding = 0) readonly buffer A_PACKED64 {A_TYPE_PACKED64 data_a_packed64[];};
 #endif
 
+#if defined(DATA_A_Q4_K) || defined(DATA_A_Q5_K) || defined(DATA_A_Q6_K)
+// 16-byte view of the K-quant blocks (all are a multiple of 16 bytes) for the wide matvec path
+layout (binding = 0) readonly buffer A_U128 {uvec4 data_a_u128[];};
+#endif
+
 #if defined(DATA_A_Q4_0R)
 // Row-reordered Q4_0: each row holds all 16-byte quant blocks, then all fp16 scales
 layout (binding = 0) readonly buffer A_R64 {uvec2 data_a_r64[];};
