@@ -3032,6 +3032,13 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             if (device->integer_dot_product) {
                 const uint32_t subgroup_size_int = (device->vendor_id == VK_VENDOR_ID_INTEL && device->subgroup_size_control) ? device->subgroup_min_size : device->subgroup_size;
                 const uint32_t wg_size_subgroup_int = (w == DMMV_WG_SIZE_SUBGROUP) ? subgroup_size_int : (subgroup_size_int * 4);
+                // Intel Xe2: single-column Q4_0R / Q4_1 matvecs keep more weight loads in flight at SIMD32
+                // (Arc Pro B65 decode: -0.9 ms/token). Multi-column (MTP verify) stays at SIMD16: SIMD32
+                // makes those up to 1.7x slower.
+                const bool xe2_sg32 = device->vendor_id == VK_VENDOR_ID_INTEL && device->architecture == INTEL_XE2 &&
+                                      device->subgroup_size_control && device->subgroup_min_size <= 32 && device->subgroup_max_size >= 32;
+                const uint32_t subgroup_size_leg = (xe2_sg32 && i == 0) ? 32u : subgroup_size_int;
+                const uint32_t wg_size_subgroup_leg = (w == DMMV_WG_SIZE_SUBGROUP) ? subgroup_size_leg : (subgroup_size_leg * 4);
 
                 ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q2_0][i], "mul_mat_vec_q2_0_q8_1_f32", arr_dmmv_q2_0_q8_1_f32_len[reduc], arr_dmmv_q2_0_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_int_n(2*rm_kq_int, i), 1, 1}, {wg_size_subgroup_int, rm_int_n(2*rm_kq_int, i), i+1}, 1, true, use_subgroups, subgroup_size_int);
                 ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q4_0][i], "mul_mat_vec_q4_0_q8_1_f32", arr_dmmv_q4_0_q8_1_f32_len[reduc], arr_dmmv_q4_0_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_int_n(1*rm_stdq_int, i), 1, 1}, {wg_size_subgroup_int, rm_int_n(1*rm_stdq_int, i), i+1}, 1, true, use_subgroups, subgroup_size_int);
@@ -3045,9 +3052,9 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                     // measured on Arc Pro B65: one 16-byte load per block and one row per workgroup is fastest
                     const bool k32 = getenv("GGML_VK_Q4_0R_K16") == nullptr;
                     const uint32_t rows = getenv("GGML_VK_Q4_0R_ROWS") ? (uint32_t)atoi(getenv("GGML_VK_Q4_0R_ROWS")) : 1u;
-                    ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q4_0R_VK][i], "mul_mat_vec_q4_0r_q8_1_f32", k32 ? q4_0r_k32_len[reduc] : q4_0r_len[reduc], k32 ? q4_0r_k32_data[reduc] : q4_0r_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rows, 1, 1}, {wg_size_subgroup_int, rows, i+1}, 1, true, use_subgroups, subgroup_size_int);
+                    ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q4_0R_VK][i], "mul_mat_vec_q4_0r_q8_1_f32", k32 ? q4_0r_k32_len[reduc] : q4_0r_len[reduc], k32 ? q4_0r_k32_data[reduc] : q4_0r_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rows, 1, 1}, {wg_size_subgroup_leg, rows, i+1}, 1, true, use_subgroups, subgroup_size_leg);
                 }
-                ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q4_1][i], "mul_mat_vec_q4_1_q8_1_f32", arr_dmmv_q4_1_q8_1_f32_len[reduc], arr_dmmv_q4_1_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_int_n(1*rm_stdq_int, i), 1, 1}, {wg_size_subgroup_int, rm_int_n(1*rm_stdq_int, i), i+1}, 1, true, use_subgroups, subgroup_size_int);
+                ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q4_1][i], "mul_mat_vec_q4_1_q8_1_f32", arr_dmmv_q4_1_q8_1_f32_len[reduc], arr_dmmv_q4_1_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_int_n(1*rm_stdq_int, i), 1, 1}, {wg_size_subgroup_leg, rm_int_n(1*rm_stdq_int, i), i+1}, 1, true, use_subgroups, subgroup_size_leg);
                 ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q5_0][i], "mul_mat_vec_q5_0_q8_1_f32", arr_dmmv_q5_0_q8_1_f32_len[reduc], arr_dmmv_q5_0_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_int_n(1*rm_stdq_int, i), 1, 1}, {wg_size_subgroup_int, rm_int_n(1*rm_stdq_int, i), i+1}, 1, true, use_subgroups, subgroup_size_int);
                 ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q5_1][i], "mul_mat_vec_q5_1_q8_1_f32", arr_dmmv_q5_1_q8_1_f32_len[reduc], arr_dmmv_q5_1_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_int_n(1*rm_stdq_int, i), 1, 1}, {wg_size_subgroup_int, rm_int_n(1*rm_stdq_int, i), i+1}, 1, true, use_subgroups, subgroup_size_int);
                 ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q8_0][i], "mul_mat_vec_q8_0_q8_1_f32", arr_dmmv_q8_0_q8_1_f32_len[reduc], arr_dmmv_q8_0_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_int_n(1*rm_stdq_int, i), 1, 1}, {wg_size_subgroup_int, rm_int_n(1*rm_stdq_int, i), i+1}, 1, true, use_subgroups, subgroup_size_int);
@@ -5691,6 +5698,10 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec(ggml_backend_vk_context * 
     if (b_type == GGML_TYPE_Q8_1) {
         if (ctx->device->vendor_id == VK_VENDOR_ID_INTEL) {
             dmmv_wg = DMMV_WG_SIZE_SUBGROUP;
+        }
+        // Xe2: long rows (k >= 16384, e.g. ffn_down) are faster with 4 subgroups per row
+        if (a_type == GGML_TYPE_Q4_0R_VK && num_cols == 1 && k >= 16384 && ctx->device->architecture == INTEL_XE2) {
+            dmmv_wg = DMMV_WG_SIZE_LARGE;
         }
         if (a_type == GGML_TYPE_Q4_0R_VK && getenv("GGML_VK_Q4_0R_WG_LARGE")) {
             dmmv_wg = DMMV_WG_SIZE_LARGE;  // B65 tuning knob (experiment)
