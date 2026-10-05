@@ -3044,10 +3044,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                     // B65 tuning knobs (experiment): 16-byte loads, rows per workgroup
                     // measured on Arc Pro B65: one 16-byte load per block and one row per workgroup is fastest
                     const bool k32 = getenv("GGML_VK_Q4_0R_K16") == nullptr;
-                    uint32_t rows = getenv("GGML_VK_Q4_0R_ROWS") ? (uint32_t)atoi(getenv("GGML_VK_Q4_0R_ROWS")) : 1u;
-                    if (i > 0 && getenv("GGML_VK_Q4_0R_ROWS_N")) {
-                        rows = (uint32_t)atoi(getenv("GGML_VK_Q4_0R_ROWS_N"));
-                    }
+                    const uint32_t rows = getenv("GGML_VK_Q4_0R_ROWS") ? (uint32_t)atoi(getenv("GGML_VK_Q4_0R_ROWS")) : 1u;
                     ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q4_0R_VK][i], "mul_mat_vec_q4_0r_q8_1_f32", k32 ? q4_0r_k32_len[reduc] : q4_0r_len[reduc], k32 ? q4_0r_k32_data[reduc] : q4_0r_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rows, 1, 1}, {wg_size_subgroup_int, rows, i+1}, 1, true, use_subgroups, subgroup_size_int);
                 }
                 ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q4_1][i], "mul_mat_vec_q4_1_q8_1_f32", arr_dmmv_q4_1_q8_1_f32_len[reduc], arr_dmmv_q4_1_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_int_n(1*rm_stdq_int, i), 1, 1}, {wg_size_subgroup_int, rm_int_n(1*rm_stdq_int, i), i+1}, 1, true, use_subgroups, subgroup_size_int);
