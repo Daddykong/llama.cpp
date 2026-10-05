@@ -1051,6 +1051,7 @@ struct vk_device_struct {
     bool disable_host_visible_vidmem;
     bool allow_sysmem_fallback;
     bool disable_graph_optimize;
+    bool disable_matvec_hoist;
 
     std::unique_ptr<vk_memory_logger> memory_logger;
 

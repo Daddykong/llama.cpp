@@ -4114,6 +4114,7 @@ vk_device ggml_vk_get_device(size_t idx) {
 
         const char* GGML_VK_DISABLE_GRAPH_OPTIMIZE = getenv("GGML_VK_DISABLE_GRAPH_OPTIMIZE");
         device->disable_graph_optimize = GGML_VK_DISABLE_GRAPH_OPTIMIZE != nullptr;
+        device->disable_matvec_hoist = getenv("GGML_VK_DISABLE_MATVEC_HOIST") != nullptr;
 
         bool fp16_storage = false;
         bool fp16_compute = false;
@@ -15440,7 +15441,7 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
         // that we support (e.g. RMS_NORM + MUL).
         // This first pass only grabs "real" (non-view nodes). Second pass grabs view nodes.
         // The goal is to not interleave real and view nodes in a way that breaks fusion.
-        const int NUM_TO_CHECK = 20;
+        const int NUM_TO_CHECK = 40;
         for (int j = first_unused+1; j < std::min(first_unused + NUM_TO_CHECK, graph->n_nodes); ++j) {
             if (used[j]) {
                 continue;
@@ -15614,6 +15615,43 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                 }
             }
         }
+        // Pull later MUL_MATs on weights that read the same activation as a MUL_MAT already in this set
+        // into the set, so they run between the same pair of barriers. ggml orders nodes depth-first from
+        // the outputs, so projections of one input (e.g. qwen35's GDN qkv / z / beta / alpha) often sit
+        // next to their consumers, far beyond NUM_TO_CHECK.
+        if (!ctx->device->disable_matvec_hoist) {
+            const int HOIST_DIST = 200;
+            std::vector<const ggml_tensor *> mm_src1;
+            for (int c : current_set) {
+                if (graph->nodes[c]->op == GGML_OP_MUL_MAT) {
+                    mm_src1.push_back(graph->nodes[c]->src[1]);
+                }
+            }
+            for (int j = first_unused + 1; !mm_src1.empty() && j < std::min(first_unused + HOIST_DIST, graph->n_nodes); ++j) {
+                const ggml_tensor * n = graph->nodes[j];
+                if (used[j] || n->op != GGML_OP_MUL_MAT || n->src[0]->op != GGML_OP_NONE ||
+                    std::find(current_set.begin(), current_set.end(), j) != current_set.end() ||
+                    std::find(mm_src1.begin(), mm_src1.end(), n->src[1]) == mm_src1.end()) {
+                    continue;
+                }
+                // keep MUL_MAT + ADD fusions intact
+                if (j + 1 < graph->n_nodes && graph->nodes[j + 1]->op == GGML_OP_ADD &&
+                    (graph->nodes[j + 1]->src[0] == n || graph->nodes[j + 1]->src[1] == n)) {
+                    continue;
+                }
+                bool ok = true;
+                for (int c = first_unused; c < j; ++c) {
+                    if (!used[c] && is_src_of(n, graph->nodes[c])) {
+                        ok = false;
+                        break;
+                    }
+                }
+                if (ok) {
+                    current_set.push_back(j);
+                }
+            }
+        }
+
         // Second pass grabs view nodes.
         // Skip this if it would break a fusion optimization (don't split up add->rms_norm or add->add).
         if (graph->nodes[current_set.back()]->op != GGML_OP_ADD) {
