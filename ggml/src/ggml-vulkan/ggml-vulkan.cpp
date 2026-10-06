@@ -3335,6 +3335,9 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 ggml_vk_create_pipeline2(device, device->pipeline_mul_mat_vec_gqa_split2_f16_f32[g][t], "mul_mat_vec_gqa_split2_f16_f32" + sfx, mul_mat_vec_gqa_split2_f16_f32_len, mul_mat_vec_gqa_split2_f16_f32_data, "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_gqa_push_constants), {1, 1, 1}, {g + 1, t + 1, r2}, 1, false, true, 32);
                 device->mul_mat_vec_gqa_split2_rows[g][t] = r2 * 8;
             }
+            if (device->subgroup_clustered) {   // b65 rows2 (8 lanes per row)
+                ggml_vk_create_pipeline2(device, device->pipeline_mul_mat_vec_gqa_rows2_f16_f32[g][t], "mul_mat_vec_gqa_rows2_f16_f32" + sfx, mul_mat_vec_gqa_rows2_f16_f32_len, mul_mat_vec_gqa_rows2_f16_f32_data, "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_gqa_push_constants), {1, 1, 1}, {g + 1, t + 1}, 1);
+            }
         }
     }
 
@@ -7218,9 +7221,11 @@ static void ggml_vk_mul_mat_vec_gqa_f16_f32(ggml_backend_vk_context * ctx, vk_co
     // short k (K x Q): one invocation per row; long k (V x KQ): rows x k-slices per workgroup
     const bool split = k > 1024;
     static const bool split2 = getenv("GGML_VK_GQA_SPLIT2") != nullptr && atoi(getenv("GGML_VK_GQA_SPLIT2")) != 0;  // b65
+    const bool rows2 = ctx->device->subgroup_clustered && getenv("GGML_VK_GQA_ROWS2") != nullptr && atoi(getenv("GGML_VK_GQA_ROWS2")) != 0;  // b65
     vk_pipeline pipeline = split ? (split2 ? ctx->device->pipeline_mul_mat_vec_gqa_split2_f16_f32[gqa - 1][ntok - 1]
                                            : ctx->device->pipeline_mul_mat_vec_gqa_split_f16_f32[gqa - 1][ntok - 1])
-                                 : ctx->device->pipeline_mul_mat_vec_gqa_rows_f16_f32[gqa - 1][ntok - 1];
+                                 : (rows2 ? ctx->device->pipeline_mul_mat_vec_gqa_rows2_f16_f32[gqa - 1][ntok - 1]
+                                          : ctx->device->pipeline_mul_mat_vec_gqa_rows_f16_f32[gqa - 1][ntok - 1]);
     if (ggml_nbytes(src0) > ctx->device->properties.limits.maxStorageBufferRange) {
         pipeline = ggml_vk_get_64b_indexing_pipeline(ctx, pipeline);
     }
@@ -7240,7 +7245,7 @@ static void ggml_vk_mul_mat_vec_gqa_f16_f32(ggml_backend_vk_context * ctx, vk_co
     init_pushconst_tensor_offsets(ctx, pc, src0, src1, nullptr, nullptr, dst);
 
     const uint32_t groups_x = split ? CEIL_DIV(rows, split2 ? ctx->device->mul_mat_vec_gqa_split2_rows[gqa - 1][ntok - 1]
-                                                            : ctx->device->mul_mat_vec_gqa_split_rows[gqa - 1][ntok - 1]) : CEIL_DIV(rows, 64u);
+                                                            : ctx->device->mul_mat_vec_gqa_split_rows[gqa - 1][ntok - 1]) : CEIL_DIV(rows, rows2 ? 8u : 64u);
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { d_Qx, d_Qy, d_D, d_D, d_D }, pc, { groups_x, (uint32_t)src0->ne[2], 1 });
 }
 
