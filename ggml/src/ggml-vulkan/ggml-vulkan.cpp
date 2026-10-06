@@ -3812,12 +3812,13 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             const bool use_subgroup_ops = use_clustered_reduce || use_subgroup_reduce;
             size_t gdn_len;
             const void * gdn_data;
+            static const bool gdn_pf = getenv("GGML_VK_GDN_PREFETCH") != nullptr && atoi(getenv("GGML_VK_GDN_PREFETCH")) != 0;  // b65
             if (use_clustered_reduce) {
-                gdn_len = gated_delta_net_f32_len;
-                gdn_data = (const void *)gated_delta_net_f32_data;
+                gdn_len = gdn_pf ? gated_delta_net_pf_f32_len : gated_delta_net_f32_len;
+                gdn_data = gdn_pf ? (const void *)gated_delta_net_pf_f32_data : (const void *)gated_delta_net_f32_data;
             } else if (use_subgroup_reduce) {
-                gdn_len = gated_delta_net_f32_nocluster_len;
-                gdn_data = (const void *)gated_delta_net_f32_nocluster_data;
+                gdn_len = gdn_pf ? gated_delta_net_pf_f32_nocluster_len : gated_delta_net_f32_nocluster_len;
+                gdn_data = gdn_pf ? (const void *)gated_delta_net_pf_f32_nocluster_data : (const void *)gated_delta_net_f32_nocluster_data;
             } else {
                 gdn_len = gated_delta_net_f32_shmem_len;
                 gdn_data = (const void *)gated_delta_net_f32_shmem_data;
