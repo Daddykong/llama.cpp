@@ -6813,6 +6813,74 @@ struct test_argsort : public test_case {
 };
 
 // GGML_OP_TOP_K
+// b65 Quest: GGML_OP_KV_BLOCK_MINMAX
+struct test_kv_block_minmax : public test_case {
+    const int64_t E, NB, T; const int B;
+    std::string vars() override { return VARS_TO_STR4(E, NB, T, B); }
+    test_kv_block_minmax(int64_t E = 1024, int64_t NB = 64, int64_t T = 3, int B = 32) : E(E), NB(NB), T(T), B(B) {}
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * kmm = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2*E, NB); ggml_set_name(kmm, "kmm");
+        ggml_tensor * k   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, E, T);    ggml_set_name(k, "k");
+        ggml_tensor * idx = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, T);       ggml_set_name(idx, "idx");
+        ggml_tensor * out = ggml_kv_block_minmax(ctx, kmm, k, idx, nullptr, B);
+        ggml_set_name(out, "out");
+        return out;
+    }
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I64) {
+                std::vector<int64_t> v(t->ne[0]);
+                for (int64_t i = 0; i < t->ne[0]; ++i) v[i] = (i * 37 + 5) % (NB * B);
+                ggml_backend_tensor_set(t, v.data(), 0, v.size() * sizeof(int64_t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
+// b65 Quest: GGML_OP_KV_QUEST_MASK (compares the blocked pattern and the kept values)
+struct test_kv_quest_mask : public test_case {
+    const int64_t D, NH, NHKV, T, NKV; const int B, budget, sink, recent;
+    std::string vars() override { return VARS_TO_STR9(D, NH, NHKV, T, NKV, B, budget, sink, recent); }
+    test_kv_quest_mask(int64_t D = 256, int64_t NH = 24, int64_t NHKV = 4, int64_t T = 3, int64_t NKV = 4096,
+                       int B = 32, int budget = 1024, int sink = 64, int recent = 2)
+        : D(D), NH(NH), NHKV(NHKV), T(T), NKV(NKV), B(B), budget(budget), sink(sink), recent(recent) {}
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * q    = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, NH, T);                      ggml_set_name(q, "q");
+        ggml_tensor * kmm  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2*D*NHKV, (NKV + B - 1) / B);   ggml_set_name(kmm, "kmm");
+        ggml_tensor * mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, NKV, GGML_PAD(T, 4));           ggml_set_name(mask, "mask");
+        ggml_tensor * out = ggml_kv_quest_mask(ctx, q, kmm, mask, (int) NHKV, B, budget, sink, recent);
+        ggml_set_name(out, "out");
+        return out;
+    }
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (std::string(t->name) == "mask") {
+                std::vector<float> m(t->ne[0] * t->ne[1]);
+                for (int64_t r = 0; r < t->ne[1]; ++r) {
+                    const int64_t pos = NKV - 1 - (T - 1) + std::min<int64_t>(r, T - 1) - 37;   // causal, last rows padding
+                    for (int64_t j = 0; j < t->ne[0]; ++j) m[r * t->ne[0] + j] = j <= pos ? 0.0f : -INFINITY;
+                }
+                ggml_backend_tensor_set(t, m.data(), 0, m.size() * sizeof(float));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+    double max_nmse_err() override { return 0.0; }
+    double err(const float * a, const float * b, size_t n) override {
+        size_t bad = 0;
+        for (size_t i = 0; i < n; ++i) {
+            const bool ia = std::isinf(a[i]), ib = std::isinf(b[i]);
+            if (ia != ib || (!ia && a[i] != b[i])) bad++;
+        }
+        // GPU and CPU sum the bounds in different orders, so a near-tie at the selection threshold may flip one block;
+        // tolerate up to 0.2% differing entries
+        return bad * 500 > n ? (double) bad : 0.0;
+    }
+};
+
 // b65: GGML_OP_MUL_MAT_SPARSE_T
 struct test_mul_mat_sparse_t : public test_case {
     const ggml_type type_a;
@@ -9274,6 +9342,15 @@ static const ggml_type other_types[] = {
 // Test cases for evaluation: should try to cover edge cases while using small input sizes to keep the runtime low
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval();
 static void add_b65_sparse_t_cases(std::vector<std::unique_ptr<test_case>> & test_cases) {
+    for (int64_t T : {1, 3, 4}) {
+        test_cases.emplace_back(new test_kv_block_minmax(1024, 64, T, 32));
+        for (int64_t nkv : {1024, 4096, 32768}) {
+            for (int budget : {512, 1024, 2048}) {
+                test_cases.emplace_back(new test_kv_quest_mask(256, 24, 4, T, nkv, 32, budget, 64, 2));
+            }
+        }
+    }
+    test_cases.emplace_back(new test_kv_block_minmax(1024, 1024, 512, 32));
     for (ggml_type t : {GGML_TYPE_Q4_0, GGML_TYPE_Q4_1}) {
         for (int64_t n_tok : {1, 3}) {
             for (int nc : {1, 4, 7}) {

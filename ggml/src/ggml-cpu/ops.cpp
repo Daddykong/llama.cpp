@@ -8811,6 +8811,81 @@ void ggml_compute_forward_mul_mat_sparse_t(
     }
 }
 
+// b65 Quest: grow-only per-block key min/max (single thread; tiny)
+void ggml_compute_forward_kv_block_minmax(const ggml_compute_params * params, ggml_tensor * dst) {
+    if (params->ith != 0) return;
+    const ggml_tensor * kmm = dst->src[0];
+    const ggml_tensor * k   = dst->src[1];
+    const ggml_tensor * idx = dst->src[2];
+    const int B = ggml_get_op_params_i32(dst, 0);
+    const int64_t E = k->ne[0], T = k->ne[1];
+    for (int64_t t = 0; t < T; ++t) {
+        const int64_t cell = ((const int64_t *) idx->data)[t];
+        const int64_t b = cell / B;
+        float * mn = (float *) ((char *) kmm->data + b * kmm->nb[1]);
+        float * mx = mn + E;
+        const float * kr = (const float *) ((const char *) k->data + t * k->nb[1]);
+        for (int64_t d = 0; d < E; ++d) { mn[d] = std::min(mn[d], kr[d]); mx[d] = std::max(mx[d], kr[d]); }
+    }
+}
+
+// b65 Quest: per-(token, KV head) block bounds -> selected-block mask for that head's query heads
+void ggml_compute_forward_kv_quest_mask(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * q    = dst->src[0];
+    const ggml_tensor * kmm  = dst->src[1];
+    const ggml_tensor * mask = dst->src[2];
+    const int NHKV = ggml_get_op_params_i32(dst, 0), B = ggml_get_op_params_i32(dst, 1);
+    const int budget = ggml_get_op_params_i32(dst, 2), sink = ggml_get_op_params_i32(dst, 3), recent = ggml_get_op_params_i32(dst, 4);
+    const int64_t D = q->ne[0], NH = q->ne[1], T = q->ne[2], NKV = mask->ne[0], MT = mask->ne[1];
+    const int64_t G = NH / NHKV, E = D * NHKV;
+    const int64_t NB = (NKV + B - 1) / B;
+    std::vector<float> bound(NB);
+    std::vector<int> order;
+    std::vector<char> sel(NB);
+    for (int64_t job = params->ith; job < MT * NHKV; job += params->nth) {
+        const int64_t t = job / NHKV, g = job % NHKV;
+        const float * mrow = (const float *) ((const char *) mask->data + t * mask->nb[1]);
+        if (t >= T) {
+            for (int64_t h = g * G; h < (g + 1) * G; ++h) {
+                float * out = (float *) ((char *) dst->data + t * dst->nb[1] + h * dst->nb[2]);
+                memcpy(out, mrow, NKV * sizeof(float));
+            }
+            continue;
+        }
+        int64_t last = -1;
+        for (int64_t j = NKV - 1; j >= 0; --j) if (mrow[j] > -INFINITY) { last = j; break; }
+        const int64_t nb_live = last < 0 ? 0 : last / B + 1;
+        for (int64_t b = 0; b < nb_live; ++b) {
+            const float * mn = (const float *) ((const char *) kmm->data + b * kmm->nb[1]) + g * D;
+            const float * mx = mn + E;
+            float best = -INFINITY;
+            for (int64_t h = g * G; h < (g + 1) * G; ++h) {
+                const float * qr = (const float *) ((const char *) q->data + h * q->nb[1] + t * q->nb[2]);
+                float s = 0.0f;
+                for (int64_t d = 0; d < D; ++d) s += std::max(qr[d] * mn[d], qr[d] * mx[d]);
+                best = std::max(best, s);
+            }
+            bound[b] = best;
+        }
+        int64_t used = 0;
+        std::fill(sel.begin(), sel.end(), 0);
+        for (int64_t b = 0; b < nb_live; ++b) {
+            if (b * B < sink || b >= nb_live - recent) { sel[b] = 1; used += B; }
+        }
+        order.clear();
+        for (int64_t b = 0; b < nb_live; ++b) if (!sel[b]) order.push_back((int) b);
+        std::sort(order.begin(), order.end(), [&](int a, int c) { return bound[a] > bound[c] || (bound[a] == bound[c] && a < c); });
+        for (int b : order) { if (used + B > budget) break; sel[b] = 1; used += B; }
+        for (int64_t h = g * G; h < (g + 1) * G; ++h) {
+            float * out = (float *) ((char *) dst->data + t * dst->nb[1] + h * dst->nb[2]);
+            for (int64_t j = 0; j < NKV; ++j) {
+                const int64_t b = j / B;
+                out[j] = (b < nb_live && !sel[b]) ? -INFINITY : mrow[j];
+            }
+        }
+    }
+}
+
 static void ggml_compute_forward_top_k_f32(
     const ggml_compute_params * params,
     ggml_tensor * dst) {

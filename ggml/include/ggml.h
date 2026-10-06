@@ -601,6 +601,8 @@ extern "C" {
 
         GGML_OP_GLU,
         GGML_OP_MUL_MAT_SPARSE_T,
+        GGML_OP_KV_BLOCK_MINMAX,
+        GGML_OP_KV_QUEST_MASK,
 
         GGML_OP_COUNT,
     };
@@ -2473,6 +2475,26 @@ extern "C" {
             struct ggml_tensor  * b,
             float                 thr,
             int                   n_chunks);
+
+    // b65: Quest-style KV block selection (see ggml.c)
+    GGML_API struct ggml_tensor * ggml_kv_block_minmax(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * kmm,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * idx,
+            struct ggml_tensor  * after,
+            int                   block);
+
+    GGML_API struct ggml_tensor * ggml_kv_quest_mask(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * kmm,
+            struct ggml_tensor  * mask,
+            int                   n_head_kv,
+            int                   block,
+            int                   budget,
+            int                   sink,
+            int                   recent);
 
     GGML_API struct ggml_tensor * ggml_top_k(
             struct ggml_context * ctx,

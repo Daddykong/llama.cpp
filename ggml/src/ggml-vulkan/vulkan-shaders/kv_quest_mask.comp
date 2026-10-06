@@ -1,0 +1,113 @@
+#version 450
+// b65 Quest: one workgroup per (token t, KV head g). Block bound = max over g's query heads of sum_d max(q*min, q*max);
+// keep sink blocks + the last RECENT live blocks + the best other blocks up to BUDGET tokens (threshold found by
+// bisection on the bound values); write the mask for g's query heads (selected -> mask value, others -> -inf).
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#define WG 256
+#define NB_MAX 4096
+#define QMAX 2048   // G * D floats
+layout(local_size_x = WG, local_size_y = 1, local_size_z = 1) in;
+layout(binding = 0) readonly buffer Q { float data_q[]; };
+layout(binding = 1) readonly buffer KMM { float data_kmm[]; };
+layout(binding = 2) readonly buffer M { float data_m[]; };
+layout(binding = 3) writeonly buffer D { float data_d[]; };
+layout(push_constant) uniform PC {
+    uint D; uint NH; uint T; uint NKV; uint MT; uint NHKV; uint B; uint budget; uint sink; uint recent;
+    uint q_head; uint q_tok; uint kmm_row; uint m_row; uint d_row; uint d_head;
+    uint q_off; uint kmm_off; uint m_off; uint d_off;
+} p;
+shared float s_q[QMAX];
+shared float s_bound[NB_MAX];
+shared uint s_sel[NB_MAX / 32];
+shared int s_red[WG / 8];
+shared uint s_cnt;
+const float NEG_INF = uintBitsToFloat(0xFF800000u);
+
+int wg_max_i(int v) {
+    v = subgroupMax(v);
+    barrier();
+    if (gl_SubgroupInvocationID == 0) s_red[gl_SubgroupID] = v;
+    barrier();
+    v = s_red[0];
+    for (uint i = 1; i < gl_NumSubgroups; ++i) v = max(v, s_red[i]);
+    barrier();
+    return v;
+}
+uint ord(float f) { const uint u = floatBitsToUint(f); return (u & 0x80000000u) != 0u ? ~u : (u | 0x80000000u); }
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint t = gl_WorkGroupID.x / p.NHKV;
+    const uint g = gl_WorkGroupID.x % p.NHKV;
+    const uint G = p.NH / p.NHKV;
+    const uint mrow = p.m_off + t * p.m_row;
+    if (t >= p.T) {
+        for (uint h = g * G; h < (g + 1) * G; ++h)
+            for (uint j = tid; j < p.NKV; j += WG) data_d[p.d_off + t * p.d_row + h * p.d_head + j] = data_m[mrow + j];
+        return;
+    }
+    // last live position
+    int last = -1;
+    for (uint j = tid; j < p.NKV; j += WG) if (data_m[mrow + j] > -1e30) last = max(last, int(j));
+    last = wg_max_i(last);
+    const uint nb = last < 0 ? 0u : uint(last) / p.B + 1u;
+    // queries of this group
+    for (uint i = tid; i < G * p.D; i += WG) {
+        const uint h = g * G + i / p.D, d = i % p.D;
+        s_q[i] = data_q[p.q_off + t * p.q_tok + h * p.q_head + d];
+    }
+    for (uint i = tid; i < NB_MAX / 32; i += WG) s_sel[i] = 0u;
+    if (tid == 0) s_cnt = 0u;
+    barrier();
+    const uint E = p.D * p.NHKV;
+    for (uint b = tid; b < nb; b += WG) {
+        const uint mn = p.kmm_off + b * p.kmm_row + g * p.D;
+        const uint mx = mn + E;
+        float best = NEG_INF;
+        for (uint hh = 0; hh < G; ++hh) {
+            float s = 0.0;
+            for (uint d = 0; d < p.D; ++d) {
+                const float qv = s_q[hh * p.D + d];
+                s += max(qv * data_kmm[mn + d], qv * data_kmm[mx + d]);
+            }
+            best = max(best, s);
+        }
+        const bool forced = (b * p.B < p.sink) || (b + p.recent >= nb);
+        s_bound[b] = forced ? uintBitsToFloat(0x7F800000u) : best;   // forced blocks: +inf, always selected
+    }
+    barrier();
+    // number of free blocks we may add
+    uint n_forced = 0u;
+    for (uint b = 0; b < nb; ++b) if (isinf(s_bound[b]) && s_bound[b] > 0.0) n_forced++;
+    const uint kmax_blocks = p.budget / p.B;
+    const uint k_free = kmax_blocks > n_forced ? kmax_blocks - n_forced : 0u;
+    // bisection on the ordered bit pattern: largest threshold thr with count(bound >= thr) >= k_free selects ~k_free
+    uint lo = 0u, hi = 0xFFFFFFFFu;
+    if (k_free == 0u) { lo = ord(uintBitsToFloat(0x7F800000u)); }
+    else {
+        for (int it = 0; it < 32; ++it) {
+            const uint mid = lo + ((hi - lo) >> 1) + 1u;
+            if (tid == 0) s_cnt = 0u;
+            barrier();
+            uint c = 0u;
+            for (uint b = tid; b < nb; b += WG) if (ord(s_bound[b]) >= mid) c++;
+            atomicAdd(s_cnt, c);
+            barrier();
+            const uint total = s_cnt;
+            barrier();
+            if (total >= k_free + n_forced) lo = mid; else hi = mid - 1u;
+            if (lo >= hi) break;
+        }
+    }
+    for (uint b = tid; b < nb; b += WG) if (ord(s_bound[b]) >= lo) atomicOr(s_sel[b / 32], 1u << (b % 32));
+    barrier();
+    for (uint h = g * G; h < (g + 1) * G; ++h) {
+        for (uint j = tid; j < p.NKV; j += WG) {
+            const uint b = j / p.B;
+            const bool keep = b >= nb || (s_sel[b / 32] & (1u << (b % 32))) != 0u;
+            data_d[p.d_off + t * p.d_row + h * p.d_head + j] = keep ? data_m[mrow + j] : NEG_INF;
+        }
+    }
+}

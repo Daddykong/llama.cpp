@@ -1100,9 +1100,11 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
 
     "GLU",
     "MUL_MAT_SPARSE_T",
+    "KV_BLOCK_MINMAX",
+    "KV_QUEST_MASK",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1216,9 +1218,11 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
 
     "glu(x)",
     "sparse_t(x,y)",
+    "kv_minmax(k)",
+    "kv_quest(q)",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5499,6 +5503,52 @@ struct ggml_tensor * ggml_mul_mat_sparse_t(
     result->op     = GGML_OP_MUL_MAT_SPARSE_T;
     result->src[0] = a;
     result->src[1] = b;
+    return result;
+}
+
+// b65 Quest-style KV block selection
+
+struct ggml_tensor * ggml_kv_block_minmax(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * kmm,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * idx,
+        struct ggml_tensor  * after,
+        int                   block) {
+    GGML_ASSERT(kmm->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F32 && idx->type == GGML_TYPE_I64);
+    GGML_ASSERT(kmm->ne[0] == 2*k->ne[0] && idx->ne[0] == k->ne[1] && block > 0);
+    struct ggml_tensor * result = ggml_view_tensor(ctx, kmm);
+    ggml_set_op_params_i32(result, 0, block);
+    result->op     = GGML_OP_KV_BLOCK_MINMAX;
+    result->src[0] = kmm;
+    result->src[1] = k;
+    result->src[2] = idx;
+    result->src[3] = after;
+    return result;
+}
+
+struct ggml_tensor * ggml_kv_quest_mask(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * kmm,
+        struct ggml_tensor  * mask,
+        int                   n_head_kv,
+        int                   block,
+        int                   budget,
+        int                   sink,
+        int                   recent) {
+    GGML_ASSERT(q->type == GGML_TYPE_F32 && kmm->type == GGML_TYPE_F32 && mask->type == GGML_TYPE_F32);
+    GGML_ASSERT(kmm->ne[0] == 2*q->ne[0]*n_head_kv && q->ne[1] % n_head_kv == 0 && mask->ne[1] >= q->ne[2]);
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, mask->ne[0], mask->ne[1], q->ne[1]);
+    ggml_set_op_params_i32(result, 0, n_head_kv);
+    ggml_set_op_params_i32(result, 1, block);
+    ggml_set_op_params_i32(result, 2, budget);
+    ggml_set_op_params_i32(result, 3, sink);
+    ggml_set_op_params_i32(result, 4, recent);
+    result->op     = GGML_OP_KV_QUEST_MASK;
+    result->src[0] = q;
+    result->src[1] = kmm;
+    result->src[2] = mask;
     return result;
 }
 

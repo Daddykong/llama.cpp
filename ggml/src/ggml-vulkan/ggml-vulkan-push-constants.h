@@ -738,6 +738,15 @@ struct vk_op_ssm_scan_push_constants {
     uint32_t n_seq, K;
 };
 
+struct vk_op_kv_minmax_push_constants {   // b65 Quest
+    uint32_t E; uint32_t T; uint32_t B; uint32_t kmm_row; uint32_t k_row; uint32_t kmm_off; uint32_t k_off; uint32_t idx_off;
+};
+struct vk_op_kv_quest_push_constants {    // b65 Quest
+    uint32_t D; uint32_t NH; uint32_t T; uint32_t NKV; uint32_t MT; uint32_t NHKV; uint32_t B; uint32_t budget; uint32_t sink; uint32_t recent;
+    uint32_t q_head; uint32_t q_tok; uint32_t kmm_row; uint32_t m_row; uint32_t d_row; uint32_t d_head;
+    uint32_t q_off; uint32_t kmm_off; uint32_t m_off; uint32_t d_off;
+};
+
 struct vk_op_sparse_t_push_constants {   // b65
     uint32_t bpr; uint32_t n_in; uint32_t n_chunks; uint32_t n_tok;
     uint32_t b_stride; uint32_t d_stride_c; uint32_t d_stride_t; float thr;

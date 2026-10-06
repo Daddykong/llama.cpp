@@ -1014,6 +1014,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_ssm_scan_f32_d256;
     vk_pipeline pipeline_ssm_conv_f32;
     vk_pipeline pipeline_mul_mat_sparse_t_q4_0, pipeline_mul_mat_sparse_t_q4_1; // b65
+    vk_pipeline pipeline_kv_block_minmax, pipeline_kv_quest_mask; // b65 Quest
     vk_pipeline pipeline_ssm_conv_silu_f32;
     vk_pipeline pipeline_ssm_conv_bias_silu_f32;
     vk_pipeline pipeline_opt_step_adamw_f32;
