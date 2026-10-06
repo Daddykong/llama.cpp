@@ -1898,13 +1898,21 @@ void init_iq_shmem(uvec3 wgsize)
 }
 
 #ifdef KVALUES_IQ4NL_I8
-i32vec2 iq4nl_to_i8x8(uint32_t vui) {
-    const u8vec4 i0 = unpack8( vui       & 0x0F0F0F0F);
-    const u8vec4 i1 = unpack8((vui >> 4) & 0x0F0F0F0F);
+// b65: register lookup. kvalues_iq4nl_const as little-endian int8 bytes in 4 words:
+// {-127,-104,-83,-65} {-49,-35,-22,-10} {1,13,25,38} {53,69,89,113}
+uint iq4nl_lut4(uint n4) {   // n4: four nibbles, one per byte (already masked with 0x0F0F0F0F)
+    uint r = 0u;
+    [[unroll]] for (uint b = 0u; b < 4u; ++b) {
+        const uint n = (n4 >> (8u * b)) & 0xFu;
+        const uint w = (n < 8u) ? ((n < 4u) ? 0xBFAD9881u : 0xF6EADDCFu)
+                                : ((n < 12u) ? 0x26190D01u : 0x71594535u);
+        r |= ((w >> (8u * (n & 3u))) & 0xFFu) << (8u * b);
+    }
+    return r;
+}
 
-    return i32vec2(
-        pack32(i8vec4(kvalues_iq4nl[i0.x], kvalues_iq4nl[i0.y], kvalues_iq4nl[i0.z], kvalues_iq4nl[i0.w])),
-        pack32(i8vec4(kvalues_iq4nl[i1.x], kvalues_iq4nl[i1.y], kvalues_iq4nl[i1.z], kvalues_iq4nl[i1.w])));
+i32vec2 iq4nl_to_i8x8(uint32_t vui) {
+    return i32vec2(int32_t(iq4nl_lut4(vui & 0x0F0F0F0Fu)), int32_t(iq4nl_lut4((vui >> 4) & 0x0F0F0F0Fu)));
 }
 #endif
 #endif

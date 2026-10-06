@@ -6812,6 +6812,11 @@ static bool ggml_vk_should_use_mmvq(const vk_device& device, uint32_t m, uint32_
             if (src0_type == GGML_TYPE_Q4_0 && k >= 2048) {
                 return true;
             }
+            // b65: IQ4 batch-1 on the integer-dot path (register lookup table), opt-in for A/B
+            static const bool iq4_mmvq = getenv("GGML_VK_IQ4_MMVQ") != nullptr && atoi(getenv("GGML_VK_IQ4_MMVQ")) != 0;
+            if (iq4_mmvq && (src0_type == GGML_TYPE_IQ4_XS || src0_type == GGML_TYPE_IQ4_NL)) {
+                return true;
+            }
         }
 
         if (device->driver_id == vk::DriverId::eIntelProprietaryWindows) {
