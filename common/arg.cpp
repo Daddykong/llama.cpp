@@ -259,6 +259,17 @@ static void parse_tensor_buffer_overrides(const std::string & value, std::vector
         if (buft) {
             buft_list[ggml_backend_buft_name(buft)] = buft;
         }
+        // b65: Vulkan GPU-readable system-RAM buffer type (e.g. -ot "blk\.1[0-9]\.ffn_.*=Vulkan0_SysMem")
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+        auto * sysmem_fn = reg ? (ggml_backend_buffer_type_t (*)(size_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_vk_sysmem_buffer_type") : nullptr;
+        if (sysmem_fn) {
+            for (size_t d = 0; d < ggml_backend_reg_dev_count(reg); ++d) {
+                if (ggml_backend_reg_dev_get(reg, d) == dev) {
+                    auto * sb = sysmem_fn(d);
+                    buft_list[ggml_backend_buft_name(sb)] = sb;
+                }
+            }
+        }
     }
 
     for (const auto & override : string_split<std::string>(value, ',')) {
