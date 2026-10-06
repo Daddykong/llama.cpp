@@ -9408,6 +9408,7 @@ static void add_b65_sparse_t_cases(std::vector<std::unique_ptr<test_case>> & tes
             }
         }
         test_cases.emplace_back(new test_mul_mat_sparse_t(t, 5120, 17408, 1, 48, 0.4f));
+        for (int64_t nt : {2, 3, 4}) test_cases.emplace_back(new test_mul_mat_sparse_t(t, 5120, 17408, nt, 48, 0.4f));
     }
     for (int ctx : {3904, 27904, 32768}) {   // b65 attention shapes
         for (int n : {1, 2, 3, 4}) {

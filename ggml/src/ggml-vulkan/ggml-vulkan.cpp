@@ -3859,6 +3859,10 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_mul_mat_masked_q4_0, "mul_mat_masked_q4_0", mul_mat_masked_q4_0_len, mul_mat_masked_q4_0_data, "main", 4, sizeof(vk_op_mm_masked_push_constants), {1, 1, 1}, {}, 1, false, true, 32);
     ggml_vk_create_pipeline(device, device->pipeline_kv_block_minmax, "kv_block_minmax", kv_block_minmax_len, kv_block_minmax_data, "main", 4, sizeof(vk_op_kv_minmax_push_constants), {256, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_kv_quest_mask, "kv_quest_mask", kv_quest_mask_len, kv_quest_mask_data, "main", 4, sizeof(vk_op_kv_quest_push_constants), {1, 1, 1}, {}, 1, false, true, 32);
+    for (uint32_t nt = 2; nt <= 4; ++nt) {   // b65 multi-token sparse down
+        ggml_vk_create_pipeline(device, device->pipeline_mul_mat_sparse_t_mt[0][nt], "mul_mat_sparse_t_mt_q4_0_" + std::to_string(nt), mul_mat_sparse_t_mt_q4_0_len, mul_mat_sparse_t_mt_q4_0_data, "main", 3, sizeof(vk_op_sparse_t_push_constants), {64, 1, 1}, {64, nt}, 1);
+        ggml_vk_create_pipeline(device, device->pipeline_mul_mat_sparse_t_mt[1][nt], "mul_mat_sparse_t_mt_q4_1_" + std::to_string(nt), mul_mat_sparse_t_mt_q4_1_len, mul_mat_sparse_t_mt_q4_1_data, "main", 3, sizeof(vk_op_sparse_t_push_constants), {64, 1, 1}, {64, nt}, 1);
+    }
     ggml_vk_create_pipeline(device, device->pipeline_mul_mat_sparse_t_q4_0, "mul_mat_sparse_t_q4_0", mul_mat_sparse_t_q4_0_len, mul_mat_sparse_t_q4_0_data, "main", 3, sizeof(vk_op_sparse_t_push_constants), {64, 1, 1}, {64}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_mul_mat_sparse_t_q4_1, "mul_mat_sparse_t_q4_1", mul_mat_sparse_t_q4_1_len, mul_mat_sparse_t_q4_1_data, "main", 3, sizeof(vk_op_sparse_t_push_constants), {64, 1, 1}, {64}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_f32,           "ssm_conv_f32",           ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 0, 0}, 1);
@@ -10806,6 +10810,20 @@ static void ggml_vk_kv_quest_mask(ggml_backend_vk_context * ctx, vk_context& sub
 static void ggml_vk_mul_mat_sparse_t(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {  // b65
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
+    static const bool mt = getenv("GGML_VK_SPARSE_T_MT") != nullptr && atoi(getenv("GGML_VK_SPARSE_T_MT")) != 0;
+    const int64_t nt = dst->ne[2];
+    if (mt && nt >= 2 && nt <= 4) {   // all tokens in one pass: each row read once
+        vk_pipeline pipeline = ctx->device->pipeline_mul_mat_sparse_t_mt[src0->type == GGML_TYPE_Q4_1 ? 1 : 0][nt];
+        ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+        vk_op_sparse_t_push_constants pc = {
+            (uint32_t)(src0->ne[0] / 32), (uint32_t)src0->ne[1], (uint32_t)dst->ne[1], (uint32_t)nt,
+            (uint32_t)(src1->nb[1] / 4), (uint32_t)(dst->nb[1] / 4), (uint32_t)(dst->nb[2] / 4),
+            ggml_get_op_params_f32(dst, 0),
+        };
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { ggml_vk_tensor_subbuffer(ctx, src0), ggml_vk_tensor_subbuffer(ctx, src1),
+            ggml_vk_tensor_subbuffer(ctx, dst) }, pc, { (uint32_t)(src0->ne[0] / 32) * 2, (uint32_t)dst->ne[1], 1 });
+        return;
+    }
     ggml_vk_op_f32<vk_op_sparse_t_push_constants>(ctx, subctx, src0, src1, nullptr, nullptr, dst, GGML_OP_MUL_MAT_SPARSE_T, {
         (uint32_t)(src0->ne[0] / 32), (uint32_t)src0->ne[1], (uint32_t)dst->ne[1], (uint32_t)dst->ne[2],
         (uint32_t)(src1->nb[1] / 4), (uint32_t)(dst->nb[1] / 4), (uint32_t)(dst->nb[2] / 4),

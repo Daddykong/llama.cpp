@@ -1,0 +1,55 @@
+#version 450
+// b65: multi-token sparse transposed matvec. Invocation = half of one output quant block (16 outputs) for all NTOK
+// tokens; an input row is skipped only if every token's |activation| is below thr, and read once otherwise.
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#include "types.glsl"
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+layout(constant_id = 1) const uint NTOK = 2;
+layout(binding = 0) readonly buffer A { A_TYPE_PACKED16 data_a[]; };
+layout(binding = 1) readonly buffer B { float data_b[]; };
+layout(binding = 2) writeonly buffer D { float data_d[]; };
+layout(push_constant) uniform PushConstants {
+    uint bpr; uint n_in; uint n_chunks; uint n_tok; uint b_stride; uint d_stride_c; uint d_stride_t; float thr;
+};
+void main() {
+    const uint gi = gl_GlobalInvocationID.x;
+    const uint jb = gi >> 1, hb = gi & 1u;          // output block, which half (0: outputs 0-15, 1: 16-31)
+    const uint c  = gl_WorkGroupID.y;
+    if (jb >= bpr) return;
+    const uint i0 = (n_in * c) / n_chunks, i1 = (n_in * (c + 1)) / n_chunks;
+    float acc[NTOK][16];
+    [[unroll]] for (uint t = 0; t < NTOK; ++t) [[unroll]] for (uint k = 0; k < 16; ++k) acc[t][k] = 0.0;
+    for (uint i = i0; i < i1; ++i) {
+        float h[NTOK];
+        bool any_live = false;
+        [[unroll]] for (uint t = 0; t < NTOK; ++t) {
+            h[t] = data_b[t * b_stride + i];
+            if (!(abs(h[t]) >= thr)) h[t] = 0.0; else any_live = true;
+        }
+        if (!any_live) continue;
+        const uint ib = i * bpr + jb;
+        const float d = float(data_a[ib].d);
+#if defined(DATA_A_Q4_1)
+        const float m = float(data_a[ib].m);
+#endif
+        [[unroll]] for (uint q = 0; q < 8; ++q) {
+            const uint v = uint(data_a[ib].qs[q]) >> (4u * hb);     // low nibbles -> outputs 0-15, high -> 16-31
+#if defined(DATA_A_Q4_1)
+            const float w0 = d * float(v & 0xF) + m, w1 = d * float((v >> 8) & 0xF) + m;
+#else
+            const float w0 = d * (float(v & 0xF) - 8.0), w1 = d * (float((v >> 8) & 0xF) - 8.0);
+#endif
+            [[unroll]] for (uint t = 0; t < NTOK; ++t) {
+                acc[t][2*q]     += h[t] * w0;
+                acc[t][2*q + 1] += h[t] * w1;
+            }
+        }
+    }
+    [[unroll]] for (uint t = 0; t < NTOK; ++t) {
+        const uint o = t * d_stride_t + c * d_stride_c + jb * 32 + hb * 16;
+        [[unroll]] for (uint k = 0; k < 16; ++k) data_d[o + k] = acc[t][k];
+    }
+}

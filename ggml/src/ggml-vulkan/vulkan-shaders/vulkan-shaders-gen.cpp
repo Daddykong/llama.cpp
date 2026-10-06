@@ -1273,6 +1273,8 @@ void process_shaders() {
     string_to_spv("mul_mat_masked_q4_0", "mul_mat_masked.comp", {});
     string_to_spv("kv_quest_mask", "kv_quest_mask.comp", {});
     string_to_spv("mul_mat_sparse_t_q4_1", "mul_mat_sparse_t.comp", {{"DATA_A_Q4_1", "1"}});
+    string_to_spv("mul_mat_sparse_t_mt_q4_0", "mul_mat_sparse_t_mt.comp", {{"DATA_A_Q4_0", "1"}});
+    string_to_spv("mul_mat_sparse_t_mt_q4_1", "mul_mat_sparse_t_mt.comp", {{"DATA_A_Q4_1", "1"}});
 
     string_to_spv("topk_moe_f32", "topk_moe.comp", {});
 
