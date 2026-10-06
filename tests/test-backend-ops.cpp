@@ -9284,6 +9284,12 @@ static void add_b65_sparse_t_cases(std::vector<std::unique_ptr<test_case>> & tes
         }
         test_cases.emplace_back(new test_mul_mat_sparse_t(t, 5120, 17408, 1, 48, 0.4f));
     }
+    for (int ctx : {3904, 27904, 32768}) {   // b65 attention shapes
+        for (int n : {1, 2, 3, 4}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, ctx, n, 256, {4, 1}, {6, 1}, {0, 2, 1, 3}));
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 256, n, ctx, {4, 1}, {6, 1}, {0, 1, 2, 3}, 131072));
+        }
+    }
 }
 
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
@@ -11532,6 +11538,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+    for (int ctx : {3904, 27904, 32768}) {   // b65 attention shapes
+        for (int n : {1, 2, 3, 4}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, ctx, n, 256, {4, 1}, {6, 1}, {0, 2, 1, 3}));
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 256, n, ctx, {4, 1}, {6, 1}, {0, 1, 2, 3}, 131072));
+        }
+    }
+    for (float thr : {0.0f, 0.4f, 0.5f, 0.6f}) for (int nc : {24, 48, 96}) test_cases.emplace_back(new test_mul_mat_sparse_t(GGML_TYPE_Q4_0, 5120, 17408, 1, nc, thr));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 5120, 1, 17408, {1, 1}, {1, 1}));
 
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
     // note: same bytes either way, so a backend that indexes them differently shows it here
