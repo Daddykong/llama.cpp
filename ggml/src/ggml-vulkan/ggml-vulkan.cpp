@@ -3588,6 +3588,12 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_soft_max_f32_wg512, "soft_max_f32_wg512", soft_max_f32_len, soft_max_f32_data, "main", 4, sizeof(vk_op_soft_max_push_constants), {1, 1, 1}, { 512 }, 1);
     ggml_vk_create_pipeline(device, device->pipeline_soft_max_f32_f16, "soft_max_f32_f16", soft_max_f32_f16_len, soft_max_f32_f16_data, "main", 4, sizeof(vk_op_soft_max_push_constants), {1, 1, 1}, { device->subgroup_size }, 1);
     ggml_vk_create_pipeline(device, device->pipeline_soft_max_f32_f16_wg512, "soft_max_f32_f16_wg512", soft_max_f32_f16_len, soft_max_f32_f16_data, "main", 4, sizeof(vk_op_soft_max_push_constants), {1, 1, 1}, { 512 }, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_soft_max_f32_d16, "soft_max_f32_d16", soft_max_f32_d16_len, soft_max_f32_d16_data, "main", 4, sizeof(vk_op_soft_max_push_constants), {1, 1, 1}, { device->subgroup_size }, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_soft_max_f32_d16_wg512, "soft_max_f32_d16_wg512", soft_max_f32_d16_len, soft_max_f32_d16_data, "main", 4, sizeof(vk_op_soft_max_push_constants), {1, 1, 1}, { 512 }, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_soft_max_f32_f16_d16, "soft_max_f32_f16_d16", soft_max_f32_f16_d16_len, soft_max_f32_f16_d16_data, "main", 4, sizeof(vk_op_soft_max_push_constants), {1, 1, 1}, { device->subgroup_size }, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_soft_max_f32_f16_d16_wg512, "soft_max_f32_f16_d16_wg512", soft_max_f32_f16_d16_len, soft_max_f32_f16_d16_data, "main", 4, sizeof(vk_op_soft_max_push_constants), {1, 1, 1}, { 512 }, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_soft_max_large_online2_f32_d16, "soft_max_large_online2_f32_d16", soft_max_large_online2_f32_d16_len, soft_max_large_online2_f32_d16_data, "main", 6, sizeof(vk_op_soft_max_push_constants), {1, 1, 1}, { 128, 32 }, 1, true);
+    ggml_vk_create_pipeline(device, device->pipeline_soft_max_large_online2_f32_f16_d16, "soft_max_large_online2_f32_f16_d16", soft_max_large_online2_f32_f16_d16_len, soft_max_large_online2_f32_f16_d16_data, "main", 6, sizeof(vk_op_soft_max_push_constants), {1, 1, 1}, { 128, 32 }, 1, true);
     ggml_vk_create_pipeline(device, device->pipeline_soft_max_back_f32, "soft_max_back_f32", soft_max_back_f32_len, soft_max_back_f32_data, "main", 3, sizeof(vk_op_push_constants), {1, 1, 1}, { device->subgroup_size }, 1, true);
 
     ggml_vk_create_pipeline(device, device->pipeline_soft_max_large1_f32,     "soft_max_large1_f32",     soft_max_large1_f32_len,     soft_max_large1_f32_data,     "main", 6, sizeof(vk_op_soft_max_push_constants), {1, 1, 1}, { 128, 4 }, 1, true);
@@ -9248,6 +9254,13 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
         if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F16 && dst->type == GGML_TYPE_F32) {
             return src0->ne[0] > 1024 ? ctx->device->pipeline_soft_max_f32_f16_wg512 : ctx->device->pipeline_soft_max_f32_f16;
         }
+        // b65: f16 output
+        if (src0->type == GGML_TYPE_F32 && (src1 == nullptr || src1->type == GGML_TYPE_F32) && dst->type == GGML_TYPE_F16) {
+            return src0->ne[0] > 1024 ? ctx->device->pipeline_soft_max_f32_d16_wg512 : ctx->device->pipeline_soft_max_f32_d16;
+        }
+        if (src0->type == GGML_TYPE_F32 && src1 && src1->type == GGML_TYPE_F16 && dst->type == GGML_TYPE_F16) {
+            return src0->ne[0] > 1024 ? ctx->device->pipeline_soft_max_f32_f16_d16_wg512 : ctx->device->pipeline_soft_max_f32_f16_d16;
+        }
         return nullptr;
     case GGML_OP_SOFT_MAX_BACK:
         if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
@@ -11479,6 +11492,9 @@ void ggml_vk_soft_max(ggml_backend_vk_context * ctx, vk_context& subctx, const g
             const bool f16m = src1 && src1->type == GGML_TYPE_F16;
             vk_pipeline po1 = f16m ? ctx->device->pipeline_soft_max_large_online1_f32_f16 : ctx->device->pipeline_soft_max_large_online1_f32;
             vk_pipeline po2 = f16m ? ctx->device->pipeline_soft_max_large_online2_f32_f16 : ctx->device->pipeline_soft_max_large_online2_f32;
+            if (dst->type == GGML_TYPE_F16) {   // b65
+                po2 = f16m ? ctx->device->pipeline_soft_max_large_online2_f32_f16_d16 : ctx->device->pipeline_soft_max_large_online2_f32_d16;
+            }
             ggml_pipeline_request_descriptor_sets(ctx, po1, 1);
             ggml_pipeline_request_descriptor_sets(ctx, po2, 1);
             ggml_vk_dispatch_pipeline(ctx, subctx, po1, { buf_a, buf_b, buf_c, buf_d, buf_x, buf_y }, pc, elements);
@@ -16426,7 +16442,8 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
             return ggml_is_contiguous(op->src[0]) && op->src[0]->type == GGML_TYPE_F32;
         case GGML_OP_SOFT_MAX:
             return ggml_is_contiguous(op->src[0]) && op->src[0]->type == GGML_TYPE_F32
-                && (!op->src[1] || (op->src[1]->type == GGML_TYPE_F32 || op->src[1]->type == GGML_TYPE_F16));
+                && (!op->src[1] || (op->src[1]->type == GGML_TYPE_F32 || op->src[1]->type == GGML_TYPE_F16))
+                && (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16);   // b65: f16 output allowed
         case GGML_OP_SOFT_MAX_BACK:
             return ggml_is_contiguous(op->src[0]) && op->src[0]->type == GGML_TYPE_F32
                 && ggml_is_contiguous(op->src[1]) && op->src[1]->type == GGML_TYPE_F32;

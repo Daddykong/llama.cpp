@@ -963,6 +963,8 @@ struct vk_device_struct {
     vk_pipeline pipeline_soft_max_large3_f32, pipeline_soft_max_large3_f32_f16;
     vk_pipeline pipeline_soft_max_large_online1_f32, pipeline_soft_max_large_online1_f32_f16;
     vk_pipeline pipeline_soft_max_large_online2_f32, pipeline_soft_max_large_online2_f32_f16;
+    vk_pipeline pipeline_soft_max_f32_d16, pipeline_soft_max_f32_d16_wg512, pipeline_soft_max_f32_f16_d16, pipeline_soft_max_f32_f16_d16_wg512; // b65
+    vk_pipeline pipeline_soft_max_large_online2_f32_d16, pipeline_soft_max_large_online2_f32_f16_d16; // b65
 
     vk_pipeline pipeline_rope_norm_f32, pipeline_rope_norm_f16, pipeline_rope_norm_f32_f16;
     vk_pipeline pipeline_rope_neox_f32, pipeline_rope_neox_f16, pipeline_rope_neox_f32_f16;

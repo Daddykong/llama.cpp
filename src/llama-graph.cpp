@@ -2725,6 +2725,17 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
         kq = ggml_soft_max_ext(ctx0, kq, kq_mask, kq_scale, hparams.f_max_alibi_bias);
         ggml_soft_max_add_sinks(kq, sinks);
+        {   // b65: f16 attention probabilities for prompt batches (LLAMA_KQ_SM_F16=1); decode stays f32
+            static const bool sm_f16 = getenv("LLAMA_KQ_SM_F16") != nullptr && atoi(getenv("LLAMA_KQ_SM_F16")) != 0;
+            static const int  sm_min = getenv("LLAMA_KQ_SM_F16_MIN_TOK") ? atoi(getenv("LLAMA_KQ_SM_F16_MIN_TOK")) : 8;
+            // only while the f32 scores stay under 4 GiB: above that this op can land on the CPU backend, whose softmax
+            // writes f32
+            if (sm_f16 && kq->ne[1] > sm_min && !sinks && ggml_is_contiguous(kq) && ggml_nelements(kq) * 4.0 < 4294967296.0) {
+                kq->type  = GGML_TYPE_F16;
+                kq->nb[0] = ggml_type_size(GGML_TYPE_F16);
+                for (int d = 1; d < GGML_MAX_DIMS; ++d) kq->nb[d] = kq->nb[d-1] * kq->ne[d-1];
+            }
+        }
         cb(kq, "kq_soft_max", il);
 
         if (!v_trans) {
