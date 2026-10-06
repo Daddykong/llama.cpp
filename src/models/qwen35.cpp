@@ -512,7 +512,7 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_ffn(ggml_tensor * cur, cons
     // b65: activation-sparse down projection for small steps (decode, MTP verify) when configured
     {
         const auto & layer = model.layers[il];
-        static const int ds_max_tok = getenv("LLAMA_DS_MAX_TOK") ? atoi(getenv("LLAMA_DS_MAX_TOK")) : 4;
+        static const int ds_max_tok = getenv("LLAMA_DS_MAX_TOK") ? atoi(getenv("LLAMA_DS_MAX_TOK")) : 1; // default 1: the MTP 3-token verify needs ~90% of neurons (union), and the kernel reads rows per token, so verify stays dense
         static const int ds_chunks  = getenv("LLAMA_DS_CHUNKS")  ? atoi(getenv("LLAMA_DS_CHUNKS"))  : 48;
         const float thr = il < 256 ? b65_ds_thr()[il] : -1.0f;
         if (layer.ffn_down_t && thr >= 0.0f && cur->ne[1] <= ds_max_tok && !layer.ffn_up_s && !layer.ffn_gate_s) {
