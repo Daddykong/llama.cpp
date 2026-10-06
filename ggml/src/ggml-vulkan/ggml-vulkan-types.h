@@ -1051,6 +1051,7 @@ struct vk_device_struct {
     vk_buffer sync_staging;
 
     ggml_backend_buffer_type buffer_type;
+    ggml_backend_buffer_type buffer_type_sysmem; // b65: host-visible system RAM, GPU-readable
 
     bool disable_fusion;
     bool disable_descriptor_reuse;

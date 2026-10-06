@@ -218,6 +218,21 @@ llama_kv_cache::llama_kv_cache(
             buft = ggml_backend_dev_buffer_type(dev);
 
             dev_name = ggml_backend_dev_name(dev);
+
+            // b65: LLAMA_KV_SYSMEM=1 keeps this layer's KV in system RAM, read by the GPU over PCIe (Vulkan only)
+            static const bool kv_sysmem = getenv("LLAMA_KV_SYSMEM") != nullptr && atoi(getenv("LLAMA_KV_SYSMEM")) != 0;
+            if (kv_sysmem) {
+                ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+                auto * fn = reg ? (ggml_backend_buffer_type_t (*)(size_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_vk_sysmem_buffer_type") : nullptr;
+                if (fn) {
+                    size_t dev_idx = 0;   // index of dev among this backend's devices
+                    for (size_t d = 0; d < ggml_backend_reg_dev_count(reg); ++d) {
+                        if (ggml_backend_reg_dev_get(reg, d) == dev) { dev_idx = d; break; }
+                    }
+                    buft = fn(dev_idx);
+                    dev_name = "Vulkan system RAM";
+                }
+            }
         }
 
         LLAMA_LOG_DEBUG("%s: layer %3d: dev = %s\n", __func__, il, dev_name);

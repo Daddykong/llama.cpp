@@ -11,11 +11,17 @@ ggml_backend_buffer_type_i ggml_backend_vk_buffer_type_interface = {
     /* .is_host             = */ NULL,
 };
 
+// b65: set while allocating system-RAM buffers, so device-local (incl. ReBAR VRAM) memory types are skipped
+static thread_local bool ggml_vk_exclude_device_local = false;
+
 static std::vector<uint32_t> ggml_vk_find_memory_properties(const vk::PhysicalDeviceMemoryProperties* mem_props, vk::MemoryRequirements* mem_req, vk::MemoryPropertyFlags flags) {
     std::vector<uint32_t> indices;
 
     for (uint32_t i = 0; i < mem_props->memoryTypeCount; ++i) {
         vk::MemoryType memory_type = mem_props->memoryTypes[i];
+        if (ggml_vk_exclude_device_local && (memory_type.propertyFlags & vk::MemoryPropertyFlagBits::eDeviceLocal)) {
+            continue;
+        }
         if ((mem_req->memoryTypeBits & ((uint64_t)1 << i)) &&
             (flags & memory_type.propertyFlags) == flags &&
             mem_props->memoryHeaps[memory_type.heapIndex].size >= mem_req->size) {
@@ -190,6 +196,22 @@ vk_buffer ggml_vk_create_buffer_check(vk_device& device, size_t size, vk::Memory
         std::cerr << "ggml_vulkan: " << e.what() << std::endl;
         throw e;
     }
+}
+
+// b65: buffer in host-visible system RAM (never device-local); GPU kernels read it over PCIe
+vk_buffer ggml_vk_create_buffer_sysmem(vk_device& device, size_t size) {
+    ggml_vk_exclude_device_local = true;
+    vk_buffer buf;
+    try {
+        buf = ggml_vk_create_buffer(device, size, {vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent | vk::MemoryPropertyFlagBits::eHostCached,
+                                                   vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent});
+    } catch (const vk::SystemError& e) {
+        ggml_vk_exclude_device_local = false;
+        std::cerr << "ggml_vulkan: system-memory allocation of size " << size << " failed: " << e.what() << std::endl;
+        throw e;
+    }
+    ggml_vk_exclude_device_local = false;
+    return buf;
 }
 
 vk_buffer ggml_vk_create_buffer_device(vk_device& device, size_t size) {

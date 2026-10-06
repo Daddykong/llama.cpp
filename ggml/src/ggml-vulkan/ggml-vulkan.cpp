@@ -4105,6 +4105,8 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     }
 }
 
+static ggml_backend_buffer_type_i ggml_backend_vk_sysmem_buffer_type_interface(); // b65 (defined with the buffer types)
+
 vk_device ggml_vk_get_device(size_t idx) {
     VK_LOG_DEBUG("ggml_vk_get_device(" << idx << ")");
 
@@ -5020,6 +5022,11 @@ vk_device ggml_vk_get_device(size_t idx) {
             /* .iface    = */ ggml_backend_vk_buffer_type_interface,
             /* .device   = */ ggml_backend_reg_dev_get(ggml_backend_vk_reg(), idx),
             /* .context  = */ new ggml_backend_vk_buffer_type_context{ device->name, device },
+        };
+        device->buffer_type_sysmem = {   // b65
+            /* .iface    = */ ggml_backend_vk_sysmem_buffer_type_interface(),
+            /* .device   = */ ggml_backend_reg_dev_get(ggml_backend_vk_reg(), idx),
+            /* .context  = */ new ggml_backend_vk_buffer_type_context{ device->name + "_SysMem", device },
         };
 
         device->fence = device->device.createFence({});
@@ -13607,6 +13614,25 @@ const char * ggml_backend_vk_buffer_type_name(ggml_backend_buffer_type_t buft) {
     return ctx->name.c_str();
 }
 
+// b65: system-RAM variant (same buffer context and interface as device buffers)
+static ggml_backend_buffer_t ggml_backend_vk_sysmem_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
+    ggml_backend_vk_buffer_type_context * ctx = (ggml_backend_vk_buffer_type_context *) buft->context;
+    vk_buffer dev_buffer = nullptr;
+    try {
+        dev_buffer = ggml_vk_create_buffer_sysmem(ctx->device, size);
+    } catch (const vk::SystemError& e) {
+        return nullptr;
+    }
+    ggml_backend_vk_buffer_context * bufctx = new ggml_backend_vk_buffer_context(ctx->device, std::move(dev_buffer), ctx->name);
+    return ggml_backend_buffer_init(buft, ggml_backend_vk_buffer_interface, bufctx, size);
+}
+
+static ggml_backend_buffer_type_i ggml_backend_vk_sysmem_buffer_type_interface() {
+    ggml_backend_buffer_type_i i = ggml_backend_vk_buffer_type_interface;
+    i.alloc_buffer = ggml_backend_vk_sysmem_buffer_type_alloc_buffer;
+    return i;
+}
+
 ggml_backend_buffer_t ggml_backend_vk_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
     VK_LOG_MEMORY("ggml_backend_vk_buffer_type_alloc_buffer(" << size << ")");
     ggml_backend_vk_buffer_type_context * ctx = (ggml_backend_vk_buffer_type_context *) buft->context;
@@ -13637,6 +13663,12 @@ size_t ggml_backend_vk_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buf
     return ggml_nbytes(tensor);
 
     UNUSED(buft);
+}
+
+ggml_backend_buffer_type_t ggml_backend_vk_sysmem_buffer_type(size_t dev_num) {   // b65
+    ggml_vk_instance_init();
+    vk_device dev = ggml_vk_get_device(dev_num);
+    return &dev->buffer_type_sysmem;
 }
 
 ggml_backend_buffer_type_t ggml_backend_vk_buffer_type(size_t dev_num) {
@@ -16933,11 +16965,19 @@ static ggml_backend_dev_t ggml_backend_vk_reg_get_device(ggml_backend_reg_t reg,
     return devices[device];
 }
 
+static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {   // b65
+    GGML_UNUSED(reg);
+    if (strcmp(name, "ggml_backend_vk_sysmem_buffer_type") == 0) {
+        return (void *) ggml_backend_vk_sysmem_buffer_type;
+    }
+    return NULL;
+}
+
 static const struct ggml_backend_reg_i ggml_backend_vk_reg_i = {
     /* .get_name         = */ ggml_backend_vk_reg_get_name,
     /* .get_device_count = */ ggml_backend_vk_reg_get_device_count,
     /* .get_device       = */ ggml_backend_vk_reg_get_device,
-    /* .get_proc_address = */ NULL,
+    /* .get_proc_address = */ ggml_backend_vk_reg_get_proc_address,
 };
 
 ggml_backend_reg_t ggml_backend_vk_reg() {

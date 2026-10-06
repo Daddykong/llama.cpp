@@ -19,6 +19,8 @@ GGML_BACKEND_API void ggml_backend_vk_get_device_description(int device, char * 
 GGML_BACKEND_API void ggml_backend_vk_get_device_memory(int device, size_t * free, size_t * total);
 
 GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_vk_buffer_type(size_t dev_num);
+// b65: GPU-usable buffers in host-visible system RAM (read over PCIe)
+GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_vk_sysmem_buffer_type(size_t dev_num);
 // pinned host buffer for use with the CPU backend for faster copies between CPU and GPU
 GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_vk_host_buffer_type(void);
 
