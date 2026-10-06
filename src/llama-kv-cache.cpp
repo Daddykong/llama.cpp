@@ -246,7 +246,14 @@ llama_kv_cache::llama_kv_cache(
 
         map_layer_ids[il] = layers.size();
 
-        layers.push_back({ il, k, v, k_stream, v_stream, });
+        ggml_tensor * kmm = nullptr;   // b65 Quest
+        if (const char * qb = getenv("LLAMA_KV_QUEST_BLOCK"); qb && atoi(qb) > 0 && has_k) {
+            const uint32_t B = (uint32_t) atoi(qb);
+            kmm = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2*n_embd_k_gqa, (kv_size + B - 1) / B, n_stream);
+            ggml_format_name(kmm, "cache_%skmm_l%d", name_tag, il);
+        }
+
+        layers.push_back({ il, k, v, k_stream, v_stream, kmm });
     }
 
     if (reuse) {
@@ -1358,6 +1365,10 @@ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggm
 
     // store the current K values into the cache
     return ggml_set_rows(ctx, k, k_cur, k_idxs);
+}
+
+ggml_tensor * llama_kv_cache::get_kmm(int32_t il) const {   // b65 Quest
+    return layers[map_layer_ids.at(il)].kmm;
 }
 
 ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const slot_info & sinfo) const {
@@ -2879,6 +2890,10 @@ ggml_tensor * llama_kv_cache_context::get_v(ggml_context * ctx, int32_t il) cons
 
 ggml_tensor * llama_kv_cache_context::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const {
     return kv->cpy_k(ctx, k_cur, k_idxs, il, sinfos[i_cur]);
+}
+
+ggml_tensor * llama_kv_cache_context::get_kmm(int32_t il) const {   // b65 Quest
+    return kv->get_kmm(il);
 }
 
 ggml_tensor * llama_kv_cache_context::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il) const {

@@ -1182,6 +1182,10 @@ struct llm_graph_context {
     // attention
     //
 
+    // b65 Quest: set by build_attn (KV path) for build_attn_mha
+    mutable ggml_tensor * quest_kmm = nullptr;
+    mutable ggml_tensor * quest_q   = nullptr;
+
     ggml_tensor * build_attn_mha(
             ggml_tensor * q,       // [n_embd_head_q, n_head_q, n_tokens]
             ggml_tensor * k,       // [n_embd_head_k, n_head_k, n_tokens]

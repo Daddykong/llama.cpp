@@ -2723,6 +2723,20 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             cb(kq, "kq_plus_kq_b", il);
         }
 
+        // b65 Quest: small steps attend only to the selected blocks (mask; the GQA kernels can skip masked rows)
+        if (quest_kmm && quest_q && kq_mask && kq_mask->type == GGML_TYPE_F32 && kq->type == GGML_TYPE_F32 &&
+            kq_mask->ne[2] == 1 && kq_mask->ne[3] == 1) {
+            static const int q_max  = getenv("LLAMA_KV_QUEST_MAX_TOK") ? atoi(getenv("LLAMA_KV_QUEST_MAX_TOK")) : 4;
+            static const int q_bud  = getenv("LLAMA_KV_QUEST_BUDGET")  ? atoi(getenv("LLAMA_KV_QUEST_BUDGET"))  : 2048;
+            static const int q_sink = getenv("LLAMA_KV_QUEST_SINK")    ? atoi(getenv("LLAMA_KV_QUEST_SINK"))    : 64;
+            static const int q_rec  = getenv("LLAMA_KV_QUEST_RECENT")  ? atoi(getenv("LLAMA_KV_QUEST_RECENT"))  : 2;
+            static const int qb     = atoi(getenv("LLAMA_KV_QUEST_BLOCK"));
+            if (quest_q->ne[2] <= q_max && kq_mask->ne[0] > q_bud) {
+                kq_mask = ggml_kv_quest_mask(ctx0, quest_q, quest_kmm, kq_mask, (int) k->ne[2], qb, q_bud, q_sink, q_rec);
+                cb(kq_mask, "kq_mask_quest", il);
+            }
+        }
+
         kq = ggml_soft_max_ext(ctx0, kq, kq_mask, kq_scale, hparams.f_max_alibi_bias);
         ggml_soft_max_add_sinks(kq, sinks);
         {   // b65: f16 attention probabilities for prompt batches (LLAMA_KQ_SM_F16=1); decode stays f32
@@ -2927,8 +2941,21 @@ ggml_tensor * llm_graph_context::build_attn(
             const auto & k_idxs = inp->get_k_idxs();
             const auto & v_idxs = inp->get_v_idxs();
 
-            ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
+            ggml_tensor * k_set = mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il);
+            ggml_build_forward_expand(gf, k_set);
             ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
+
+            // b65 Quest: grow the per-block key min/max with this batch's keys
+            quest_kmm = nullptr; quest_q = nullptr;
+            if (ggml_tensor * kmm = mctx_cur->get_kmm(il); kmm && kmm->ne[2] == 1 && k_cur->type == GGML_TYPE_F32) {
+                static const int qb = atoi(getenv("LLAMA_KV_QUEST_BLOCK"));
+                ggml_tensor * kmm2 = ggml_view_2d(ctx0, kmm, kmm->ne[0], kmm->ne[1], kmm->nb[1], 0);
+                ggml_tensor * k2   = ggml_view_2d(ctx0, k_cur, k_cur->ne[0]*k_cur->ne[1], k_cur->ne[2], k_cur->nb[2], 0);
+                ggml_tensor * upd  = ggml_kv_block_minmax(ctx0, kmm2, k2, k_idxs, k_set, qb);
+                ggml_build_forward_expand(gf, upd);
+                quest_kmm = upd;
+                quest_q   = q_cur;
+            }
         }
 
         k = mctx_cur->get_k(ctx0, il);
@@ -2938,6 +2965,7 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * kq_mask = inp->get_kq_mask();
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il);
+    quest_kmm = nullptr; quest_q = nullptr;
     cb(cur, "kqv_out", il);
 
     if (inp->self_v_rot) {
