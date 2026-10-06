@@ -603,6 +603,8 @@ extern "C" {
         GGML_OP_MUL_MAT_SPARSE_T,
         GGML_OP_KV_BLOCK_MINMAX,
         GGML_OP_KV_QUEST_MASK,
+        GGML_OP_SIGN_SCORE,
+        GGML_OP_MUL_MAT_MASKED,
 
         GGML_OP_COUNT,
     };
@@ -2495,6 +2497,21 @@ extern "C" {
             int                   budget,
             int                   sink,
             int                   recent);
+
+    // b65: sparse gate/up (sign-sketch predictor + masked matvec)
+    GGML_API struct ggml_tensor * ggml_sign_score(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * sg,
+            struct ggml_tensor  * su,
+            struct ggml_tensor  * sc);
+
+    GGML_API struct ggml_tensor * ggml_mul_mat_masked(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * w,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * s,
+            float                 thr);
 
     GGML_API struct ggml_tensor * ggml_top_k(
             struct ggml_context * ctx,

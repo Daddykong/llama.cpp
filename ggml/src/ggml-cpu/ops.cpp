@@ -8886,6 +8886,60 @@ void ggml_compute_forward_kv_quest_mask(const ggml_compute_params * params, ggml
     }
 }
 
+// b65 sparse gate/up: sign-sketch score (threads split the neurons)
+void ggml_compute_forward_sign_score(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * x = dst->src[0], * sg = dst->src[1], * su = dst->src[2], * sc = dst->src[3];
+    const int64_t E = x->ne[0], T = x->ne[1], F = sg->ne[1], W32 = sg->ne[0];
+    const int64_t f0 = (F * params->ith) / params->nth, f1 = (F * (params->ith + 1)) / params->nth;
+    for (int64_t t = 0; t < T; ++t) {
+        const float * xr = (const float *) ((const char *) x->data + t * x->nb[1]);
+        float total = 0.0f;
+        for (int64_t j = 0; j < E; ++j) total += xr[j];
+        for (int64_t f = f0; f < f1; ++f) {
+            const uint32_t * g = (const uint32_t *) ((const char *) sg->data + f * sg->nb[1]);
+            const uint32_t * u = (const uint32_t *) ((const char *) su->data + f * su->nb[1]);
+            float pg = 0.0f, pu = 0.0f;   // sum of x over positive-sign positions
+            for (int64_t w = 0; w < W32; ++w) {
+                for (int b = 0; b < 32; ++b) {
+                    const float v = xr[w * 32 + b];
+                    if ((g[w] >> b) & 1u) pg += v;
+                    if ((u[w] >> b) & 1u) pu += v;
+                }
+            }
+            const float * s = (const float *) ((const char *) sc->data + f * sc->nb[1]);
+            const float a = s[0] * (2.0f * pg - total), c = s[1] * (2.0f * pu - total);
+            ((float *) ((char *) dst->data + t * dst->nb[1]))[f] = fabsf(a / (1.0f + expf(-a)) * c);
+        }
+    }
+}
+
+// b65 sparse gate/up: masked matvec (rows with score < thr are 0 and not read)
+void ggml_compute_forward_mul_mat_masked(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * w = dst->src[0], * x = dst->src[1], * s = dst->src[2];
+    const float thr = ggml_get_op_params_f32(dst, 0);
+    const int64_t E = w->ne[0], F = w->ne[1], T = x->ne[1];
+    const int64_t f0 = (F * params->ith) / params->nth, f1 = (F * (params->ith + 1)) / params->nth;
+    ggml_to_float_t to_float = ggml_get_type_traits(w->type)->to_float;
+    std::vector<float> row(E);
+    for (int64_t f = f0; f < f1; ++f) {
+        bool loaded = false;
+        for (int64_t t = 0; t < T; ++t) {
+            const float sv = ((const float *) ((const char *) s->data + t * s->nb[1]))[f];
+            float * o = (float *) ((char *) dst->data + t * dst->nb[1]);
+            if (!(sv >= thr)) { o[f] = 0.0f; continue; }
+            if (!loaded) {
+                const char * r = (const char *) w->data + f * w->nb[1];
+                if (to_float) to_float(r, row.data(), E); else memcpy(row.data(), r, E * sizeof(float));
+                loaded = true;
+            }
+            const float * xr = (const float *) ((const char *) x->data + t * x->nb[1]);
+            float acc = 0.0f;
+            for (int64_t j = 0; j < E; ++j) acc += row[j] * xr[j];
+            o[f] = acc;
+        }
+    }
+}
+
 static void ggml_compute_forward_top_k_f32(
     const ggml_compute_params * params,
     ggml_tensor * dst) {

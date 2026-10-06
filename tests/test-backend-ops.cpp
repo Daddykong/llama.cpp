@@ -6813,6 +6813,49 @@ struct test_argsort : public test_case {
 };
 
 // GGML_OP_TOP_K
+// b65: GGML_OP_SIGN_SCORE
+struct test_sign_score : public test_case {
+    const int64_t E, F, T;
+    std::string vars() override { return VARS_TO_STR3(E, F, T); }
+    test_sign_score(int64_t E = 5120, int64_t F = 512, int64_t T = 1) : E(E), F(F), T(T) {}
+    double max_nmse_err() override { return 1e-5; }
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, E, T);      ggml_set_name(x, "x");
+        ggml_tensor * sg = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, E/32, F);   ggml_set_name(sg, "sg");
+        ggml_tensor * su = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, E/32, F);   ggml_set_name(su, "su");
+        ggml_tensor * sc = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2, F);      ggml_set_name(sc, "sc");
+        ggml_tensor * out = ggml_sign_score(ctx, x, sg, su, sc); ggml_set_name(out, "out");
+        return out;
+    }
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 rng(7);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I32) {
+                std::vector<int32_t> v(ggml_nelements(t));
+                for (auto & e : v) e = (int32_t) rng();
+                ggml_backend_tensor_set(t, v.data(), 0, v.size() * sizeof(int32_t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
+// b65: GGML_OP_MUL_MAT_MASKED
+struct test_mul_mat_masked : public test_case {
+    const int64_t E, F, T; const float thr;
+    std::string vars() override { return VARS_TO_STR4(E, F, T, thr); }
+    test_mul_mat_masked(int64_t E = 5120, int64_t F = 512, int64_t T = 1, float thr = 0.3f) : E(E), F(F), T(T), thr(thr) {}
+    double max_nmse_err() override { return 5e-4; }
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_0, E, F); ggml_set_name(w, "w");
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, E, T);  ggml_set_name(x, "x");
+        ggml_tensor * s = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, F, T);  ggml_set_name(s, "s");
+        ggml_tensor * out = ggml_mul_mat_masked(ctx, w, x, s, thr); ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // b65 Quest: GGML_OP_KV_BLOCK_MINMAX
 struct test_kv_block_minmax : public test_case {
     const int64_t E, NB, T; const int B;
@@ -9342,6 +9385,11 @@ static const ggml_type other_types[] = {
 // Test cases for evaluation: should try to cover edge cases while using small input sizes to keep the runtime low
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval();
 static void add_b65_sparse_t_cases(std::vector<std::unique_ptr<test_case>> & test_cases) {
+    for (int64_t T : {1, 3}) {
+        test_cases.emplace_back(new test_sign_score(5120, 512, T));
+        for (float thr : {-2.0f, 0.0f, 0.5f}) test_cases.emplace_back(new test_mul_mat_masked(5120, 512, T, thr));
+    }
+    test_cases.emplace_back(new test_mul_mat_masked(5120, 17408, 1, 0.2f));
     for (int64_t T : {1, 3, 4}) {
         test_cases.emplace_back(new test_kv_block_minmax(1024, 64, T, 32));
         for (int64_t nkv : {1024, 4096, 32768}) {

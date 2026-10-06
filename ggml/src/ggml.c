@@ -1102,9 +1102,11 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "MUL_MAT_SPARSE_T",
     "KV_BLOCK_MINMAX",
     "KV_QUEST_MASK",
+    "SIGN_SCORE",
+    "MUL_MAT_MASKED",
 };
 
-static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
+static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1220,9 +1222,11 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sparse_t(x,y)",
     "kv_minmax(k)",
     "kv_quest(q)",
+    "sign_score(x)",
+    "mul_mat_masked(w,x)",
 };
 
-static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
+static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5549,6 +5553,42 @@ struct ggml_tensor * ggml_kv_quest_mask(
     result->src[0] = q;
     result->src[1] = kmm;
     result->src[2] = mask;
+    return result;
+}
+
+// b65 sparse gate/up
+
+struct ggml_tensor * ggml_sign_score(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * sg,
+        struct ggml_tensor  * su,
+        struct ggml_tensor  * sc) {
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && sg->type == GGML_TYPE_I32 && su->type == GGML_TYPE_I32 && sc->type == GGML_TYPE_F32);
+    GGML_ASSERT(sg->ne[0] * 32 == x->ne[0] && ggml_are_same_shape(sg, su) && sc->ne[0] == 2 && sc->ne[1] == sg->ne[1]);
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, sg->ne[1], x->ne[1]);
+    result->op     = GGML_OP_SIGN_SCORE;
+    result->src[0] = x;
+    result->src[1] = sg;
+    result->src[2] = su;
+    result->src[3] = sc;
+    return result;
+}
+
+struct ggml_tensor * ggml_mul_mat_masked(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * w,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * s,
+        float                 thr) {
+    GGML_ASSERT(w->ne[0] == x->ne[0] && s->ne[0] == w->ne[1] && s->ne[1] == x->ne[1]);
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && s->type == GGML_TYPE_F32);
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, w->ne[1], x->ne[1]);
+    ggml_set_op_params_f32(result, 0, thr);
+    result->op     = GGML_OP_MUL_MAT_MASKED;
+    result->src[0] = w;
+    result->src[1] = x;
+    result->src[2] = s;
     return result;
 }
 

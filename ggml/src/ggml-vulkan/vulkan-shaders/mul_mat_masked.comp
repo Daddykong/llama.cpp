@@ -1,0 +1,51 @@
+#version 450
+// b65: masked Q4_0 matvec. One 32-lane group per row; a row whose score is below thr for every token is skipped
+// (output 0, weights never read). Plain Q4_0 layout (not the GGML_VK_Q4_0_REPACK row-reordered one).
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#define DATA_A_Q4_0 1
+#include "types.glsl"
+#define NT_MAX 4
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+layout(binding = 0) readonly buffer A { block_q4_0_packed16 data_a[]; };
+layout(binding = 1) readonly buffer X { float data_x[]; };
+layout(binding = 2) readonly buffer S { float data_s[]; };
+layout(binding = 3) writeonly buffer D { float data_d[]; };
+layout(push_constant) uniform PC { uint E; uint F; uint T; uint bpr; uint x_row; uint s_row; uint d_row;
+                                   uint a_off; uint x_off; uint s_off; uint d_off; float thr; } p;
+void main() {
+    const uint f = gl_WorkGroupID.x, lane = gl_LocalInvocationID.x;
+    if (f >= p.F) return;
+    bool live[NT_MAX];
+    bool any_live = false;
+    [[unroll]] for (uint t = 0; t < NT_MAX; ++t) {
+        live[t] = t < p.T && data_s[p.s_off + t * p.s_row + f] >= p.thr;
+        any_live = any_live || live[t];
+    }
+    float acc[NT_MAX];
+    [[unroll]] for (uint t = 0; t < NT_MAX; ++t) acc[t] = 0.0;
+    if (any_live) {
+        for (uint ib = lane; ib < p.bpr; ib += 32) {
+            const uint bi = p.a_off + f * p.bpr + ib;
+            const float d = float(data_a[bi].d);
+            [[unroll]] for (uint q = 0; q < 8; ++q) {
+                const uint v = uint(data_a[bi].qs[q]);
+                const float w0 = d * (float( v        & 0xF) - 8.0), w1 = d * (float((v >> 8)  & 0xF) - 8.0);
+                const float w2 = d * (float((v >> 4)  & 0xF) - 8.0), w3 = d * (float((v >> 12) & 0xF) - 8.0);
+                [[unroll]] for (uint t = 0; t < NT_MAX; ++t) {
+                    if (!live[t]) continue;
+                    const uint xb = p.x_off + t * p.x_row + ib * 32;
+                    acc[t] += w0 * data_x[xb + 2*q] + w1 * data_x[xb + 2*q + 1] + w2 * data_x[xb + 2*q + 16] + w3 * data_x[xb + 2*q + 17];
+                }
+            }
+        }
+    }
+    [[unroll]] for (uint t = 0; t < NT_MAX; ++t) acc[t] = subgroupAdd(acc[t]);
+    if (lane == 0) {
+        [[unroll]] for (uint t = 0; t < NT_MAX; ++t) if (t < p.T) data_d[p.d_off + t * p.d_row + f] = live[t] ? acc[t] : 0.0;
+    }
+}

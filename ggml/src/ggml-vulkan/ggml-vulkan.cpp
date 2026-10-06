@@ -3855,6 +3855,8 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         ggml_vk_create_pipeline(device, device->pipeline_ssm_scan_f32_d256, "ssm_scan_256_f32", ssm_scan_f32_len, ssm_scan_f32_data, "main", 8, sizeof(vk_op_ssm_scan_push_constants), {1, 1, 1}, {256, device->subgroup_size, 16}, 1, true, true);
     }
 
+    ggml_vk_create_pipeline(device, device->pipeline_sign_score, "sign_score", sign_score_len, sign_score_data, "main", 5, sizeof(vk_op_sign_score_push_constants), {1, 1, 1}, {}, 1, false, true, 32);
+    ggml_vk_create_pipeline(device, device->pipeline_mul_mat_masked_q4_0, "mul_mat_masked_q4_0", mul_mat_masked_q4_0_len, mul_mat_masked_q4_0_data, "main", 4, sizeof(vk_op_mm_masked_push_constants), {1, 1, 1}, {}, 1, false, true, 32);
     ggml_vk_create_pipeline(device, device->pipeline_kv_block_minmax, "kv_block_minmax", kv_block_minmax_len, kv_block_minmax_data, "main", 4, sizeof(vk_op_kv_minmax_push_constants), {256, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_kv_quest_mask, "kv_quest_mask", kv_quest_mask_len, kv_quest_mask_data, "main", 4, sizeof(vk_op_kv_quest_push_constants), {1, 1, 1}, {}, 1, false, true, 32);
     ggml_vk_create_pipeline(device, device->pipeline_mul_mat_sparse_t_q4_0, "mul_mat_sparse_t_q4_0", mul_mat_sparse_t_q4_0_len, mul_mat_sparse_t_q4_0_data, "main", 3, sizeof(vk_op_sparse_t_push_constants), {64, 1, 1}, {64}, 1);
@@ -10730,6 +10732,37 @@ void ggml_vk_ssm_scan(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_te
         pc, elements);
 }
 
+static void ggml_vk_sign_score(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {  // b65
+    const ggml_tensor * x = dst->src[0], * sg = dst->src[1], * su = dst->src[2], * sc = dst->src[3];
+    vk_pipeline pipeline = ctx->device->pipeline_sign_score;
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+    vk_op_sign_score_push_constants pc = {
+        (uint32_t)x->ne[0], (uint32_t)sg->ne[1], (uint32_t)x->ne[1], (uint32_t)sg->ne[0],
+        (uint32_t)(x->nb[1] / 4), (uint32_t)(sg->nb[1] / 4), (uint32_t)(sc->nb[1] / 4), (uint32_t)(dst->nb[1] / 4),
+        (uint32_t)(get_misalign_bytes(ctx, x) / 4), (uint32_t)(get_misalign_bytes(ctx, sg) / 4), (uint32_t)(get_misalign_bytes(ctx, su) / 4),
+        (uint32_t)(get_misalign_bytes(ctx, sc) / 4), (uint32_t)(get_misalign_bytes(ctx, dst) / 4),
+    };
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { ggml_vk_tensor_subbuffer(ctx, x, true), ggml_vk_tensor_subbuffer(ctx, sg, true),
+        ggml_vk_tensor_subbuffer(ctx, su, true), ggml_vk_tensor_subbuffer(ctx, sc, true), ggml_vk_tensor_subbuffer(ctx, dst, true) },
+        pc, { (uint32_t)sg->ne[1], (uint32_t)x->ne[1], 1 });
+}
+
+static void ggml_vk_mul_mat_masked(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {  // b65
+    const ggml_tensor * w = dst->src[0], * x = dst->src[1], * s = dst->src[2];
+    vk_pipeline pipeline = ctx->device->pipeline_mul_mat_masked_q4_0;
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+    vk_op_mm_masked_push_constants pc = {
+        (uint32_t)w->ne[0], (uint32_t)w->ne[1], (uint32_t)x->ne[1], (uint32_t)(w->ne[0] / 32),
+        (uint32_t)(x->nb[1] / 4), (uint32_t)(s->nb[1] / 4), (uint32_t)(dst->nb[1] / 4),
+        (uint32_t)(get_misalign_bytes(ctx, w) / 18), (uint32_t)(get_misalign_bytes(ctx, x) / 4),
+        (uint32_t)(get_misalign_bytes(ctx, s) / 4), (uint32_t)(get_misalign_bytes(ctx, dst) / 4),
+        ggml_get_op_params_f32(dst, 0),
+    };
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { ggml_vk_tensor_subbuffer(ctx, w, true), ggml_vk_tensor_subbuffer(ctx, x, true),
+        ggml_vk_tensor_subbuffer(ctx, s, true), ggml_vk_tensor_subbuffer(ctx, dst, true) },
+        pc, { (uint32_t)w->ne[1], 1, 1 });
+}
+
 static void ggml_vk_kv_block_minmax(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {  // b65 Quest
     const ggml_tensor * kmm = dst->src[0];
     const ggml_tensor * k   = dst->src[1];
@@ -13254,6 +13287,12 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
         break;
     case GGML_OP_KV_BLOCK_MINMAX:
         ggml_vk_kv_block_minmax(ctx, compute_ctx, node);
+        break;
+    case GGML_OP_SIGN_SCORE:
+        ggml_vk_sign_score(ctx, compute_ctx, node);
+        break;
+    case GGML_OP_MUL_MAT_MASKED:
+        ggml_vk_mul_mat_masked(ctx, compute_ctx, node);
         break;
     case GGML_OP_KV_QUEST_MASK:
         ggml_vk_kv_quest_mask(ctx, compute_ctx, node);
@@ -16736,6 +16775,11 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
 
                 return true;
             }
+        case GGML_OP_SIGN_SCORE:        // b65
+            return op->src[0]->type == GGML_TYPE_F32 && op->src[0]->ne[0] % 32 == 0;
+        case GGML_OP_MUL_MAT_MASKED:    // b65: plain Q4_0 only, <= 4 tokens; misaligned starts must be whole blocks
+            return op->src[0]->type == GGML_TYPE_Q4_0 && op->src[1]->ne[1] <= 4 && op->src[0]->ne[0] % 32 == 0 &&
+                   op->src[1]->type == GGML_TYPE_F32 && op->src[2]->type == GGML_TYPE_F32;
         case GGML_OP_KV_BLOCK_MINMAX:   // b65 Quest
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 && op->src[2]->type == GGML_TYPE_I64 &&
                    op->src[1]->nb[0] == sizeof(float);

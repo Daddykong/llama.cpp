@@ -1,0 +1,33 @@
+#version 450
+// b65: sign-sketch score. One subgroup-sized group of lanes per neuron row: lanes split the 32-bit words, then add.
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+layout(binding = 0) readonly buffer X { float data_x[]; };
+layout(binding = 1) readonly buffer G { uint data_g[]; };
+layout(binding = 2) readonly buffer U { uint data_u[]; };
+layout(binding = 3) readonly buffer S { float data_s[]; };
+layout(binding = 4) writeonly buffer D { float data_d[]; };
+layout(push_constant) uniform PC { uint E; uint F; uint T; uint W32; uint x_row; uint g_row; uint s_row; uint d_row;
+                                   uint x_off; uint g_off; uint u_off; uint s_off; uint d_off; } p;
+void main() {
+    const uint f = gl_WorkGroupID.x, t = gl_WorkGroupID.y, lane = gl_LocalInvocationID.x;
+    if (f >= p.F) return;
+    float pg = 0.0, pu = 0.0, tot = 0.0;
+    for (uint w = lane; w < p.W32; w += 32) {
+        const uint gb = data_g[p.g_off + f * p.g_row + w], ub = data_u[p.u_off + f * p.g_row + w];
+        [[unroll]] for (uint b = 0; b < 32; ++b) {
+            const float v = data_x[p.x_off + t * p.x_row + w * 32 + b];
+            tot += v;
+            pg += ((gb >> b) & 1u) != 0u ? v : 0.0;
+            pu += ((ub >> b) & 1u) != 0u ? v : 0.0;
+        }
+    }
+    pg = subgroupAdd(pg); pu = subgroupAdd(pu); tot = subgroupAdd(tot);
+    if (lane == 0) {
+        const float a = data_s[p.s_off + f * p.s_row] * (2.0 * pg - tot);
+        const float c = data_s[p.s_off + f * p.s_row + 1] * (2.0 * pu - tot);
+        data_d[p.d_off + t * p.d_row + f] = abs(a / (1.0 + exp(-a)) * c);
+    }
+}

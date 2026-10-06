@@ -5,6 +5,22 @@
 #include <cstdlib>
 #include <vector>
 
+// b65: per-layer threshold file reader ("<layer> <tag> <thr>" lines)
+static std::vector<float> b65_read_thr(const char * env) {
+    std::vector<float> v(256, -1.0f);
+    const char * f = getenv(env);
+    if (f && *f) {
+        if (FILE * fp = fopen(f, "r")) {
+            int il; char tag[32]; float t;
+            while (fscanf(fp, "%d %31s %f", &il, tag, &t) == 3) {
+                if (il >= 0 && il < 256) v[il] = t;
+            }
+            fclose(fp);
+        }
+    }
+    return v;
+}
+
 // b65: per-layer thresholds for the sparse down projection (LLAMA_DS_THR_FILE), read once
 static const std::vector<float> & b65_ds_thr() {
     static std::vector<float> thr = [] {
@@ -115,6 +131,9 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
         layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", il), {n_embd,   n_ff}, flags);
         layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", il), {  n_ff, n_embd}, flags);
         layer.ffn_down_t = create_tensor(tn(LLM_TENSOR_FFN_DOWN_T, "weight", il), {n_embd, n_ff}, TENSOR_NOT_REQUIRED);
+        layer.ffn_sk_gate  = create_tensor(tn(LLM_TENSOR_FFN_SK_GATE,  "weight", il), {n_embd / 32, n_ff}, TENSOR_NOT_REQUIRED);
+        layer.ffn_sk_up    = create_tensor(tn(LLM_TENSOR_FFN_SK_UP,    "weight", il), {n_embd / 32, n_ff}, TENSOR_NOT_REQUIRED);
+        layer.ffn_sk_scale = create_tensor(tn(LLM_TENSOR_FFN_SK_SCALE, "weight", il), {2, n_ff}, TENSOR_NOT_REQUIRED);
         layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", il), {n_embd,   n_ff}, flags);
     };
 
@@ -516,6 +535,35 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
 ggml_tensor * llama_model_qwen35::graph::build_layer_ffn(ggml_tensor * cur, const int il) {
     // Qwen3.5 does not use MoE FFN
     GGML_ASSERT(model.layers[il].ffn_gate_inp == nullptr);
+
+    // b65: sparse gate/up (sign-sketch predictor + masked matvecs) for small steps, then sparse or dense down
+    {
+        const auto & layer = model.layers[il];
+        static const std::vector<float> sk_thr = b65_read_thr("LLAMA_SK_THR_FILE");
+        static const int sk_max_tok = getenv("LLAMA_SK_MAX_TOK") ? atoi(getenv("LLAMA_SK_MAX_TOK")) : 1;
+        static const int ds_chunks2 = getenv("LLAMA_DS_CHUNKS") ? atoi(getenv("LLAMA_DS_CHUNKS")) : 48;
+        const float st = il < 256 ? sk_thr[il] : -1.0f;
+        if (layer.ffn_sk_gate && layer.ffn_sk_up && layer.ffn_sk_scale && st >= 0.0f && cur->ne[1] <= sk_max_tok && cur->ne[1] <= 4) {
+            ggml_tensor * s    = ggml_sign_score(ctx0, cur, layer.ffn_sk_gate, layer.ffn_sk_up, layer.ffn_sk_scale);
+            cb(s, "ffn_sk_score", il);
+            ggml_tensor * gate = ggml_mul_mat_masked(ctx0, layer.ffn_gate, cur, s, st);
+            ggml_tensor * up   = ggml_mul_mat_masked(ctx0, layer.ffn_up,   cur, s, st);
+            ggml_tensor * h    = ggml_swiglu_split(ctx0, gate, up);
+            cb(h, "ffn_swiglu", il);
+            const float dt = il < 256 ? b65_ds_thr()[il] : -1.0f;
+            if (layer.ffn_down_t) {
+                // skipped neurons have h == 0 exactly; with no down threshold, skip only those
+                ggml_tensor * p = ggml_mul_mat_sparse_t(ctx0, layer.ffn_down_t, h, dt >= 0.0f ? dt : 1e-30f, ds_chunks2);
+                p = ggml_cont(ctx0, ggml_permute(ctx0, p, 1, 0, 2, 3));
+                p = ggml_sum_rows(ctx0, p);
+                cur = ggml_reshape_2d(ctx0, p, layer.ffn_down_t->ne[0], h->ne[1]);
+            } else {
+                cur = build_lora_mm(layer.ffn_down, h);
+            }
+            cb(cur, "ffn_out", il);
+            return cur;
+        }
+    }
 
     // b65: activation-sparse down projection for small steps (decode, MTP verify) when configured
     {

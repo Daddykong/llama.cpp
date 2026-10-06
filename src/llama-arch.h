@@ -481,6 +481,9 @@ enum llm_tensor {
     LLM_TENSOR_FFN_GATE,
     LLM_TENSOR_FFN_DOWN,
     LLM_TENSOR_FFN_DOWN_T, // b65: neuron-major copy for the sparse down projection
+    LLM_TENSOR_FFN_SK_GATE, // b65: sign sketch of ffn_gate rows
+    LLM_TENSOR_FFN_SK_UP,
+    LLM_TENSOR_FFN_SK_SCALE,
     LLM_TENSOR_FFN_UP,
     LLM_TENSOR_FFN_ACT,
     LLM_TENSOR_FFN_DOWN_EXP,  // split experts for backward compatibility

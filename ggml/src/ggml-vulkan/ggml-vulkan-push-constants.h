@@ -742,6 +742,14 @@ struct vk_op_ssm_scan_push_constants {
     uint32_t n_seq, K;
 };
 
+struct vk_op_sign_score_push_constants {   // b65
+    uint32_t E; uint32_t F; uint32_t T; uint32_t W32; uint32_t x_row; uint32_t g_row; uint32_t s_row; uint32_t d_row;
+    uint32_t x_off; uint32_t g_off; uint32_t u_off; uint32_t s_off; uint32_t d_off;
+};
+struct vk_op_mm_masked_push_constants {   // b65
+    uint32_t E; uint32_t F; uint32_t T; uint32_t bpr; uint32_t x_row; uint32_t s_row; uint32_t d_row;
+    uint32_t a_off; uint32_t x_off; uint32_t s_off; uint32_t d_off; float thr;
+};
 struct vk_op_kv_minmax_push_constants {   // b65 Quest
     uint32_t E; uint32_t T; uint32_t B; uint32_t kmm_row; uint32_t k_row; uint32_t kmm_off; uint32_t k_off; uint32_t idx_off;
 };
