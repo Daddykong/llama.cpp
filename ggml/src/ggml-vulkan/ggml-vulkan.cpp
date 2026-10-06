@@ -1746,7 +1746,13 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     const bool cm1_use_wave32 = device->vendor_id == VK_VENDOR_ID_AMD &&
                                 device->subgroup_size_control &&
                                 device->subgroup_min_size <= 32 && device->subgroup_max_size >= 32;
-    const uint32_t cm1_sg = cm1_use_wave32 ? 32 : device->subgroup_size;
+    // b65: opt-in int8 coopmat MMQ on Intel Xe2 (see GGML_VK_XE2_MMQ_*)
+    const bool xe2_mmq = device->architecture == INTEL_XE2 && getenv("GGML_VK_XE2_MMQ_CM1") != nullptr && atoi(getenv("GGML_VK_XE2_MMQ_CM1")) != 0;
+    const uint32_t xe2_mmq_sg = getenv("GGML_VK_XE2_MMQ_SG") ? (uint32_t)atoi(getenv("GGML_VK_XE2_MMQ_SG")) : 16u;
+    const bool xe2_map_block = !getenv("GGML_VK_XE2_MMQ_MAP") || atoi(getenv("GGML_VK_XE2_MMQ_MAP")) != 0;
+    const uint32_t cm1_sg = cm1_use_wave32 ? 32 : (xe2_mmq ? xe2_mmq_sg : device->subgroup_size);
+    // the shader picks its accumulator row mapping from this value (RDNA4 = blocked, anything else = interleaved)
+    const uint32_t cm1_arch = xe2_mmq ? (xe2_map_block ? (uint32_t)AMD_RDNA4 : (uint32_t)INTEL_XE2) : (uint32_t)device->architecture;
 
     vk_pipeline wait_pipeline;
     CompileTask claimed_task {};
@@ -1828,13 +1834,13 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             return cm1_sg * (bm / std::min(cm1_sg, bm)) * (bn / 32);
         };
 
-        l_warptile_mmq_cm1_int = { cm1_bs(128, 128), 128, 128, 32, std::min(cm1_sg, 128u), 32, 2, itm, itn, itk, cm1_sg, (uint32_t)device->architecture };
-        m_warptile_mmq_cm1_int = { cm1_bs( 64,  64),  64,  64, 32, std::min(cm1_sg,  64u), 32, 2, itm, itn, itk, cm1_sg, (uint32_t)device->architecture };
-        s_warptile_mmq_cm1_int = { cm1_bs( 32,  32),  32,  32, 32, std::min(cm1_sg,  32u), 32, 2, itm, itn, itk, cm1_sg, (uint32_t)device->architecture };
+        l_warptile_mmq_cm1_int = { cm1_bs(128, 128), 128, 128, 32, std::min(cm1_sg, 128u), 32, 2, itm, itn, itk, cm1_sg, cm1_arch };
+        m_warptile_mmq_cm1_int = { cm1_bs( 64,  64),  64,  64, 32, std::min(cm1_sg,  64u), 32, 2, itm, itn, itk, cm1_sg, cm1_arch };
+        s_warptile_mmq_cm1_int = { cm1_bs( 32,  32),  32,  32, 32, std::min(cm1_sg,  32u), 32, 2, itm, itn, itk, cm1_sg, cm1_arch };
 
-        l_warptile_mmq_cm1_int_k = { cm1_bs( 64, 128),  64, 128, 32, std::min(cm1_sg,  64u), 32, 2, itm, itn, itk, cm1_sg, (uint32_t)device->architecture };
-        m_warptile_mmq_cm1_int_k = { cm1_bs( 64,  64),  64,  64, 32, std::min(cm1_sg,  64u), 32, 2, itm, itn, itk, cm1_sg, (uint32_t)device->architecture };
-        s_warptile_mmq_cm1_int_k = { cm1_bs( 32,  32),  32,  32, 32, std::min(cm1_sg,  32u), 32, 2, itm, itn, itk, cm1_sg, (uint32_t)device->architecture };
+        l_warptile_mmq_cm1_int_k = { cm1_bs( 64, 128),  64, 128, 32, std::min(cm1_sg,  64u), 32, 2, itm, itn, itk, cm1_sg, cm1_arch };
+        m_warptile_mmq_cm1_int_k = { cm1_bs( 64,  64),  64,  64, 32, std::min(cm1_sg,  64u), 32, 2, itm, itn, itk, cm1_sg, cm1_arch };
+        s_warptile_mmq_cm1_int_k = { cm1_bs( 32,  32),  32,  32, 32, std::min(cm1_sg,  32u), 32, 2, itm, itn, itk, cm1_sg, cm1_arch };
 
         l_mmq_cm1_wg_denoms_k = { l_warptile_mmq_cm1_int_k[1], l_warptile_mmq_cm1_int_k[2], 1 };
         m_mmq_cm1_wg_denoms_k = { m_warptile_mmq_cm1_int_k[1], m_warptile_mmq_cm1_int_k[2], 1 };
@@ -1897,7 +1903,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         }
 
         const bool use_cm1_int = device->coopmat_int_support &&
-                                 (device->architecture == AMD_RDNA3 || device->architecture == AMD_RDNA4);
+                                 (device->architecture == AMD_RDNA3 || device->architecture == AMD_RDNA4 || xe2_mmq);
 
         for (uint32_t i = 0; i < GGML_TYPE_COUNT; ++i) {
             ggml_type t = (ggml_type)i;
@@ -2522,7 +2528,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         }
 #undef X_CM1
 
-        if (device->coopmat_int_support && (rdna3 || rdna4)) {
+        if (device->coopmat_int_support && (rdna3 || rdna4 || xe2_mmq)) {
             cm1_create_mmq({GGML_TYPE_Q4_0,   GGML_TYPE_Q8_1, false, false}, tc_mmq_cm1_int,   "matmul_q4_0_q8_1",   matmul_q4_0_q8_1_cm1_len,   matmul_q4_0_q8_1_cm1_data,   sizeof(vk_mat_mat_push_constants), 3);
             if (!rdna4) { cm1_create_mmq({GGML_TYPE_Q4_1, GGML_TYPE_Q8_1, false, false}, tc_mmq_cm1_int,   "matmul_q4_1_q8_1",   matmul_q4_1_q8_1_cm1_len,   matmul_q4_1_q8_1_cm1_data,   sizeof(vk_mat_mat_push_constants), 3); }
             cm1_create_mmq({GGML_TYPE_Q5_0,   GGML_TYPE_Q8_1, false, false}, tc_mmq_cm1_int,   "matmul_q5_0_q8_1",   matmul_q5_0_q8_1_cm1_len,   matmul_q5_0_q8_1_cm1_data,   sizeof(vk_mat_mat_push_constants), 3);
@@ -2595,7 +2601,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         }
 #undef X_CM1_ID
 
-        if (device->coopmat_int_support && (rdna3 || rdna4)) {
+        if (device->coopmat_int_support && (rdna3 || rdna4 || xe2_mmq)) {
             cm1_create_mmq({GGML_TYPE_Q4_0,   GGML_TYPE_Q8_1, true, false}, tc_mmq_cm1_int,   "matmul_id_subgroup_q4_0_q8_1",   matmul_id_subgroup_q4_0_q8_1_cm1_len,   matmul_id_subgroup_q4_0_q8_1_cm1_data,   sizeof(vk_mat_mat_id_push_constants), mul_mat_id_param_count);
             cm1_create_mmq({GGML_TYPE_Q4_1,   GGML_TYPE_Q8_1, true, false}, tc_mmq_cm1_int,   "matmul_id_subgroup_q4_1_q8_1",   matmul_id_subgroup_q4_1_q8_1_cm1_len,   matmul_id_subgroup_q4_1_q8_1_cm1_data,   sizeof(vk_mat_mat_id_push_constants), mul_mat_id_param_count);
             cm1_create_mmq({GGML_TYPE_Q5_0,   GGML_TYPE_Q8_1, true, false}, tc_mmq_cm1_int,   "matmul_id_subgroup_q5_0_q8_1",   matmul_id_subgroup_q5_0_q8_1_cm1_len,   matmul_id_subgroup_q5_0_q8_1_cm1_data,   sizeof(vk_mat_mat_id_push_constants), mul_mat_id_param_count);
