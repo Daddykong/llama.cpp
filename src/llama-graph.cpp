@@ -2731,7 +2731,10 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             static const int q_sink = getenv("LLAMA_KV_QUEST_SINK")    ? atoi(getenv("LLAMA_KV_QUEST_SINK"))    : 64;
             static const int q_rec  = getenv("LLAMA_KV_QUEST_RECENT")  ? atoi(getenv("LLAMA_KV_QUEST_RECENT"))  : 2;
             static const int qb     = atoi(getenv("LLAMA_KV_QUEST_BLOCK"));
-            if (quest_q->ne[2] <= q_max && kq_mask->ne[0] > q_bud) {
+            static const int q_from = getenv("LLAMA_KV_QUEST_FROM") ? atoi(getenv("LLAMA_KV_QUEST_FROM")) : 0;
+            llama_pos q_pmax = 0;
+            for (uint32_t i = 0; i < ubatch.n_tokens; ++i) q_pmax = std::max(q_pmax, ubatch.pos[i]);
+            if (quest_q->ne[2] <= q_max && kq_mask->ne[0] > q_bud && q_pmax >= q_from) {
                 kq_mask = ggml_kv_quest_mask(ctx0, quest_q, quest_kmm, kq_mask, (int) k->ne[2], qb, q_bud, q_sink, q_rec);
                 cb(kq_mask, "kq_mask_quest", il);
             }
