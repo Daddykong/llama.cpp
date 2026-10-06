@@ -600,6 +600,7 @@ extern "C" {
         GGML_OP_OPT_STEP_SGD,
 
         GGML_OP_GLU,
+        GGML_OP_MUL_MAT_SPARSE_T,
 
         GGML_OP_COUNT,
     };
@@ -2462,6 +2463,17 @@ extern "C" {
 
     // top k elements per row
     // note: the resulting top k indices are in no particular order
+    // b65: sparse transposed matvec. a: ne [n_out, n_in], row i holds input i's output column (quantized),
+    // b: ne [n_in, n_tok] F32. Inputs are split into n_chunks contiguous ranges; result ne [n_out, n_chunks, n_tok]
+    // holds, per chunk, the sum over its inputs i with |b_i| >= thr of b_i * row_i of a (sum over ne1 for the product).
+    // Only the rows of active inputs are read (activation-sparse FFN down projection).
+    GGML_API struct ggml_tensor * ggml_mul_mat_sparse_t(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b,
+            float                 thr,
+            int                   n_chunks);
+
     GGML_API struct ggml_tensor * ggml_top_k(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,

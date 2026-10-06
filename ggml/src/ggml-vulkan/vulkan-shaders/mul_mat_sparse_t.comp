@@ -1,0 +1,66 @@
+#version 450
+// b65: sparse transposed matvec (ggml_mul_mat_sparse_t). One invocation = one 32-element quant block of the output,
+// i.e. 32 output values; it walks its chunk of inputs and skips every input whose |activation| < thr, so only the
+// rows of active inputs are read. Reads of one input row are contiguous across the workgroup.
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#include "types.glsl"
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer A { A_TYPE_PACKED16 data_a[]; };
+layout(binding = 1) readonly buffer B { float data_b[]; };
+layout(binding = 2) writeonly buffer D { float data_d[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint bpr;        // quant blocks per row (n_out / 32)
+    uint n_in;
+    uint n_chunks;
+    uint n_tok;
+    uint b_stride;   // floats between tokens in b
+    uint d_stride_c; // floats between chunks in d
+    uint d_stride_t; // floats between tokens in d
+    float thr;
+};
+
+void main() {
+    const uint jb = gl_GlobalInvocationID.x;   // output block
+    const uint c  = gl_WorkGroupID.y;          // input chunk
+    const uint t  = gl_WorkGroupID.z;          // token
+    if (jb >= bpr) {
+        return;
+    }
+    const uint i0 = (n_in * c) / n_chunks;
+    const uint i1 = (n_in * (c + 1)) / n_chunks;
+    float acc[32];
+    [[unroll]] for (uint k = 0; k < 32; ++k) acc[k] = 0.0;
+    for (uint i = i0; i < i1; ++i) {
+        const float h = data_b[t * b_stride + i];
+        if (!(abs(h) >= thr)) {
+            continue;
+        }
+        const uint ib = i * bpr + jb;
+        const float d = float(data_a[ib].d) * h;
+#if defined(DATA_A_Q4_1)
+        const float m = float(data_a[ib].m) * h;
+#endif
+        [[unroll]] for (uint q = 0; q < 8; ++q) {
+            const uint v = uint(data_a[ib].qs[q]);
+#if defined(DATA_A_Q4_1)
+            acc[2*q]      += d * float( v        & 0xF) + m;
+            acc[2*q + 1]  += d * float((v >> 8)  & 0xF) + m;
+            acc[2*q + 16] += d * float((v >> 4)  & 0xF) + m;
+            acc[2*q + 17] += d * float((v >> 12) & 0xF) + m;
+#else
+            acc[2*q]      += d * (float( v        & 0xF) - 8.0);
+            acc[2*q + 1]  += d * (float((v >> 8)  & 0xF) - 8.0);
+            acc[2*q + 16] += d * (float((v >> 4)  & 0xF) - 8.0);
+            acc[2*q + 17] += d * (float((v >> 12) & 0xF) - 8.0);
+#endif
+        }
+    }
+    const uint o = t * d_stride_t + c * d_stride_c + jb * 32;
+    [[unroll]] for (uint k = 0; k < 32; ++k) data_d[o + k] = acc[k];
+}

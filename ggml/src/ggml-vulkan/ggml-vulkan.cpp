@@ -3833,6 +3833,8 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         ggml_vk_create_pipeline(device, device->pipeline_ssm_scan_f32_d256, "ssm_scan_256_f32", ssm_scan_f32_len, ssm_scan_f32_data, "main", 8, sizeof(vk_op_ssm_scan_push_constants), {1, 1, 1}, {256, device->subgroup_size, 16}, 1, true, true);
     }
 
+    ggml_vk_create_pipeline(device, device->pipeline_mul_mat_sparse_t_q4_0, "mul_mat_sparse_t_q4_0", mul_mat_sparse_t_q4_0_len, mul_mat_sparse_t_q4_0_data, "main", 3, sizeof(vk_op_sparse_t_push_constants), {64, 1, 1}, {64}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_mul_mat_sparse_t_q4_1, "mul_mat_sparse_t_q4_1", mul_mat_sparse_t_q4_1_len, mul_mat_sparse_t_q4_1_data, "main", 3, sizeof(vk_op_sparse_t_push_constants), {64, 1, 1}, {64}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_f32,           "ssm_conv_f32",           ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 0, 0}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_silu_f32,      "ssm_conv_silu_f32",      ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 0, 1}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_bias_silu_f32, "ssm_conv_bias_silu_f32", ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 1, 1}, 1);
@@ -9425,6 +9427,10 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
             }
         }
         return nullptr;
+    case GGML_OP_MUL_MAT_SPARSE_T:
+        if (src0->type == GGML_TYPE_Q4_0) return ctx->device->pipeline_mul_mat_sparse_t_q4_0;
+        if (src0->type == GGML_TYPE_Q4_1) return ctx->device->pipeline_mul_mat_sparse_t_q4_1;
+        return nullptr;
     case GGML_OP_SSM_CONV:
         if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
             switch (ctx->num_additional_fused_ops) {
@@ -9625,7 +9631,7 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
     }
     std::cerr << "), (" << dst << ", name=" << dst->name << ", type=" << dst->type << ", ne0=" << dst->ne[0] << ", ne1=" << dst->ne[1] << ", ne2=" << dst->ne[2] << ", ne3=" << dst->ne[3] << ", nb0=" << dst->nb[0] << ", nb1=" << dst->nb[1] << ", nb2=" << dst->nb[2] << ", nb3=" << dst->nb[3];
     std::cerr << "), " << ggml_op_name(op) << ")");
-    GGML_ASSERT(op == GGML_OP_GET_ROWS || op == GGML_OP_CPY || op == GGML_OP_CONCAT || (!ggml_is_quantized(src0->type) && (src1 == nullptr || !ggml_is_quantized(src1->type))));  // NOLINT
+    GGML_ASSERT(op == GGML_OP_GET_ROWS || op == GGML_OP_CPY || op == GGML_OP_CONCAT || op == GGML_OP_MUL_MAT_SPARSE_T || (!ggml_is_quantized(src0->type) && (src1 == nullptr || !ggml_is_quantized(src1->type))));  // NOLINT
     GGML_ASSERT(dst->buffer != nullptr);
     const uint64_t ne00 = src0->ne[0];
     const uint64_t ne01 = src0->ne[1];
@@ -9952,6 +9958,9 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
                 elements = { ne, 1, 1 };
             }
         }
+        break;
+    case GGML_OP_MUL_MAT_SPARSE_T:
+        elements = { (uint32_t)(src0->ne[0] / 32), (uint32_t)dst->ne[1], (uint32_t)dst->ne[2] };
         break;
     case GGML_OP_SSM_CONV:
         {
@@ -10644,6 +10653,16 @@ void ggml_vk_ssm_scan(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_te
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
         {src_buf[0], src_buf[1], src_buf[2], src_buf[3], src_buf[4], src_buf[5], src_buf[6], dst_buf},
         pc, elements);
+}
+
+static void ggml_vk_mul_mat_sparse_t(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {  // b65
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+    ggml_vk_op_f32<vk_op_sparse_t_push_constants>(ctx, subctx, src0, src1, nullptr, nullptr, dst, GGML_OP_MUL_MAT_SPARSE_T, {
+        (uint32_t)(src0->ne[0] / 32), (uint32_t)src0->ne[1], (uint32_t)dst->ne[1], (uint32_t)dst->ne[2],
+        (uint32_t)(src1->nb[1] / 4), (uint32_t)(dst->nb[1] / 4), (uint32_t)(dst->nb[2] / 4),
+        ggml_get_op_params_f32(dst, 0),
+    });
 }
 
 void ggml_vk_ssm_conv(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
@@ -13112,6 +13131,9 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
 
         break;
 
+    case GGML_OP_MUL_MAT_SPARSE_T:
+        ggml_vk_mul_mat_sparse_t(ctx, compute_ctx, node);
+        break;
     case GGML_OP_SSM_CONV:
         ggml_vk_ssm_conv(ctx, compute_ctx, cgraph, node_idx);
 
@@ -16564,6 +16586,10 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
 
                 return true;
             }
+        case GGML_OP_MUL_MAT_SPARSE_T:
+            return (op->src[0]->type == GGML_TYPE_Q4_0 || op->src[0]->type == GGML_TYPE_Q4_1) &&
+                   op->src[1]->type == GGML_TYPE_F32 && op->src[0]->ne[0] % 32 == 0 &&
+                   ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]);
         case GGML_OP_SSM_CONV:
             return op->src[0]->type == GGML_TYPE_F32;
         case GGML_OP_CONV_TRANSPOSE_1D:

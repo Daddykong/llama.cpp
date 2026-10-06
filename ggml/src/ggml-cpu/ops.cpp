@@ -8782,6 +8782,35 @@ struct cmp_top_k {
     }
 };
 
+// b65: sparse transposed matvec (see ggml_mul_mat_sparse_t). Threads split the output columns.
+void ggml_compute_forward_mul_mat_sparse_t(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * a = dst->src[0];
+    const ggml_tensor * b = dst->src[1];
+    const float thr = ggml_get_op_params_f32(dst, 0);
+    const int64_t n_out = a->ne[0], n_in = a->ne[1], n_tok = b->ne[1];
+    const int64_t n_chunks = ggml_get_op_params_i32(dst, 1);
+    const int ith = params->ith, nth = params->nth;
+    const int64_t c0 = (n_out * ith) / nth, c1 = (n_out * (ith + 1)) / nth;
+    ggml_to_float_t to_float = ggml_get_type_traits(a->type)->to_float;
+    std::vector<float> row(n_out);
+    for (int64_t t = 0; t < n_tok; ++t)
+    for (int64_t c = 0; c < n_chunks; ++c) {
+        float * y = (float *) ((char *) dst->data + t * dst->nb[2] + c * dst->nb[1]);
+        for (int64_t j = c0; j < c1; ++j) y[j] = 0.0f;
+        const float * x = (const float *) ((const char *) b->data + t * b->nb[1]);
+        const int64_t i0 = (n_in * c) / n_chunks, i1 = (n_in * (c + 1)) / n_chunks;
+        for (int64_t i = i0; i < i1; ++i) {
+            const float h = x[i];
+            if (!(fabsf(h) >= thr)) continue;
+            const char * r = (const char *) a->data + i * a->nb[1];
+            if (to_float) to_float(r, row.data(), n_out); else memcpy(row.data(), r, n_out * sizeof(float));
+            for (int64_t j = c0; j < c1; ++j) y[j] += h * row[j];
+        }
+    }
+}
+
 static void ggml_compute_forward_top_k_f32(
     const ggml_compute_params * params,
     ggml_tensor * dst) {

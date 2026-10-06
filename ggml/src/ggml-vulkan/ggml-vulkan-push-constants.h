@@ -738,6 +738,11 @@ struct vk_op_ssm_scan_push_constants {
     uint32_t n_seq, K;
 };
 
+struct vk_op_sparse_t_push_constants {   // b65
+    uint32_t bpr; uint32_t n_in; uint32_t n_chunks; uint32_t n_tok;
+    uint32_t b_stride; uint32_t d_stride_c; uint32_t d_stride_t; float thr;
+};
+
 struct vk_op_ssm_conv_push_constants {
     uint32_t nb01, nb02;
     uint32_t nb11;

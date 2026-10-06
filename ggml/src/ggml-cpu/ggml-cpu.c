@@ -2010,6 +2010,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_argsort(params, tensor);
             } break;
+        case GGML_OP_MUL_MAT_SPARSE_T:
+            {
+                ggml_compute_forward_mul_mat_sparse_t(params, tensor);
+            } break;
         case GGML_OP_TOP_K:
             {
                 ggml_compute_forward_top_k(params, tensor);
@@ -2424,6 +2428,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_ARANGE:
         case GGML_OP_TIMESTEP_EMBEDDING:
         case GGML_OP_ARGSORT:
+        case GGML_OP_MUL_MAT_SPARSE_T:
         case GGML_OP_TOP_K:
         case GGML_OP_FLASH_ATTN_EXT:
         case GGML_OP_FLASH_ATTN_BACK:

@@ -6813,6 +6813,39 @@ struct test_argsort : public test_case {
 };
 
 // GGML_OP_TOP_K
+// b65: GGML_OP_MUL_MAT_SPARSE_T
+struct test_mul_mat_sparse_t : public test_case {
+    const ggml_type type_a;
+    const int64_t n_out, n_in, n_tok;
+    const int n_chunks;
+    const float thr;
+
+    std::string vars() override {
+        return VARS_TO_STR6(type_a, n_out, n_in, n_tok, n_chunks, thr);
+    }
+
+    test_mul_mat_sparse_t(ggml_type type_a = GGML_TYPE_Q4_0, int64_t n_out = 256, int64_t n_in = 512,
+            int64_t n_tok = 1, int n_chunks = 4, float thr = 0.4f)
+        : type_a(type_a), n_out(n_out), n_in(n_in), n_tok(n_tok), n_chunks(n_chunks), thr(thr) {}
+
+    double max_nmse_err() override { return 5e-4; }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return 2 * n_out * n_in * n_tok;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, type_a, n_out, n_in);
+        ggml_set_name(a, "a");
+        ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_in, n_tok);
+        ggml_set_name(b, "b");
+        ggml_tensor * out = ggml_mul_mat_sparse_t(ctx, a, b, thr, n_chunks);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 struct test_top_k : public test_case {
     const ggml_type type;
     const std::array<int64_t, 4> ne;
@@ -9239,8 +9272,23 @@ static const ggml_type other_types[] = {
 #endif
 
 // Test cases for evaluation: should try to cover edge cases while using small input sizes to keep the runtime low
+static std::vector<std::unique_ptr<test_case>> make_test_cases_eval();
+static void add_b65_sparse_t_cases(std::vector<std::unique_ptr<test_case>> & test_cases) {
+    for (ggml_type t : {GGML_TYPE_Q4_0, GGML_TYPE_Q4_1}) {
+        for (int64_t n_tok : {1, 3}) {
+            for (int nc : {1, 4, 7}) {
+                for (float thr : {0.0f, 0.4f, 0.9f}) {
+                    test_cases.emplace_back(new test_mul_mat_sparse_t(t, 256, 512, n_tok, nc, thr));
+                }
+            }
+        }
+        test_cases.emplace_back(new test_mul_mat_sparse_t(t, 5120, 17408, 1, 48, 0.4f));
+    }
+}
+
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+    add_b65_sparse_t_cases(test_cases);
     std::default_random_engine rng(0);
 
     // unary ops
