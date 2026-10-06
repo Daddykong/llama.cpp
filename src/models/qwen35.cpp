@@ -328,7 +328,12 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
         ggml_element_size(Qcur_full) * n_embd_head * 2,
         ggml_element_size(Qcur_full) * n_embd_head * 2 * n_head,
         ggml_element_size(Qcur_full) * n_embd_head);
-    gate = ggml_cont_2d(ctx0, gate, n_embd_head * n_head, n_tokens);
+    // b65: LLAMA_GATE_NOCONT=1 applies the sigmoid straight to the strided view (Vulkan unary ops take strided input;
+    // the sigmoid output is contiguous), dropping one CONT dispatch per full-attention layer
+    static const bool gate_nocont = getenv("LLAMA_GATE_NOCONT") != nullptr && atoi(getenv("LLAMA_GATE_NOCONT")) != 0;
+    if (!gate_nocont) {
+        gate = ggml_cont_2d(ctx0, gate, n_embd_head * n_head, n_tokens);
+    }
     cb(gate, "gate_reshaped", il);
 
     Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
@@ -359,6 +364,9 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
     cb(cur, "attn_pregate", il);
 
     ggml_tensor * gate_sigmoid = ggml_sigmoid(ctx0, gate);
+    if (gate_nocont) {
+        gate_sigmoid = ggml_reshape_2d(ctx0, gate_sigmoid, n_embd_head * n_head, n_tokens);
+    }
     cb(gate_sigmoid, "gate_sigmoid", il);
 
     cur = ggml_mul(ctx0, cur, gate_sigmoid);
