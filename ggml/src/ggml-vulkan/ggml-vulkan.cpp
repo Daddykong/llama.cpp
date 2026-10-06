@@ -5709,7 +5709,9 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec(ggml_backend_vk_context * 
             dmmv_wg = DMMV_WG_SIZE_SUBGROUP;
         }
         // Xe2: long rows (k >= 16384, e.g. ffn_down) are faster with 4 subgroups per row
-        if (a_type == GGML_TYPE_Q4_0R_VK && num_cols == 1 && k >= 16384 && ctx->device->architecture == INTEL_XE2) {
+        // b65: GGML_VK_Q4_0R_LONG_NCOLS=N extends this to steps of up to N tokens (MTP verify = 3); default 1 = unchanged
+        static const uint32_t q40r_long_ncols = getenv("GGML_VK_Q4_0R_LONG_NCOLS") ? (uint32_t)atoi(getenv("GGML_VK_Q4_0R_LONG_NCOLS")) : 1u;
+        if (a_type == GGML_TYPE_Q4_0R_VK && num_cols <= q40r_long_ncols && k >= 16384 && ctx->device->architecture == INTEL_XE2) {
             dmmv_wg = DMMV_WG_SIZE_LARGE;
         }
         if (a_type == GGML_TYPE_Q4_0R_VK && getenv("GGML_VK_Q4_0R_WG_LARGE")) {
