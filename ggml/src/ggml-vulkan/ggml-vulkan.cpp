@@ -7264,9 +7264,34 @@ static void ggml_vk_mul_mat_vec_gqa_f16_f32(ggml_backend_vk_context * ctx, vk_co
     };
     init_pushconst_tensor_offsets(ctx, pc, src0, src1, nullptr, nullptr, dst);
 
+    // b65 Quest: mask-aware skipping in the v2 kernels (GGML_VK_ATTN_MASK_SKIP=1)
+    vk_subbuffer d_M = d_D;
+    static const bool mask_skip = getenv("GGML_VK_ATTN_MASK_SKIP") != nullptr && atoi(getenv("GGML_VK_ATTN_MASK_SKIP")) != 0;
+    if (mask_skip && split && split2) {
+        pc.flags |= 2u;
+    } else if (mask_skip && !split && rows2) {
+        for (int n = node_idx + 1; n < cgraph->n_nodes && n <= node_idx + 16; ++n) {
+            const ggml_tensor * sm = cgraph->nodes[n];
+            if (sm->op != GGML_OP_SOFT_MAX || sm->src[0] != dst) {
+                continue;
+            }
+            const ggml_tensor * m = sm->src[1];
+            if (m && m->type == GGML_TYPE_F32 && m->ne[0] == (int64_t) rows && m->ne[1] >= (int64_t) ntok &&
+                (m->ne[2] == 1 || m->ne[2] == src1->ne[2]) && m->ne[3] == 1 && m->nb[0] == sizeof(float) &&
+                (get_misalign_bytes(ctx, m) % sizeof(float)) == 0) {
+                d_M = ggml_vk_tensor_subbuffer(ctx, m, true);
+                pc.mask_offset      = (uint32_t)(get_misalign_bytes(ctx, m) / sizeof(float));
+                pc.mask_tok_stride  = (uint32_t)(m->nb[1] / sizeof(float));
+                pc.mask_head_stride = m->ne[2] == 1 ? 0u : (uint32_t)(m->nb[2] / sizeof(float));
+                pc.flags |= 1u;
+            }
+            break;
+        }
+    }
+
     const uint32_t groups_x = split ? CEIL_DIV(rows, split2 ? ctx->device->mul_mat_vec_gqa_split2_rows[gqa - 1][ntok - 1]
                                                             : ctx->device->mul_mat_vec_gqa_split_rows[gqa - 1][ntok - 1]) : CEIL_DIV(rows, rows2 ? 8u : 64u);
-    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { d_Qx, d_Qy, d_D, d_D, d_D }, pc, { groups_x, (uint32_t)src0->ne[2], 1 });
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { d_Qx, d_Qy, d_D, d_M, d_D }, pc, { groups_x, (uint32_t)src0->ne[2], 1 });
 }
 
 static void ggml_vk_mul_mat_vec_nc_f16_f32(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {

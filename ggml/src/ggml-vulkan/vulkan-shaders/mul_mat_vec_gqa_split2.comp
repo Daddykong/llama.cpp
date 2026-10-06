@@ -23,6 +23,7 @@ layout (push_constant) uniform parameter
     uint ncols; uint nrows; uint a_row_stride; uint a_chan_stride;
     uint b_chan_stride; uint b_tok_stride; uint d_chan_stride; uint d_tok_stride;
     uint a_offset; uint b_offset; uint d_offset;
+    uint mask_offset; uint mask_tok_stride; uint mask_head_stride; uint flags;   // b65
 } p;
 
 void main() {
@@ -43,7 +44,19 @@ void main() {
     const uint b_ts = p.b_tok_stride / 4;
     const uint n4 = p.ncols / 4;
 
+    const bool skip0 = (p.flags & 2u) != 0u;   // b65
     for (uint k4 = lane; k4 < n4; k4 += SG) {
+        if (skip0) {
+            bool nz = false;
+            [[unroll]] for (uint t = 0; t < NTOK; ++t) {
+                [[unroll]] for (uint c = 0; c < GQA; ++c) {
+                    nz = nz || any(notEqual(data_b_v4[b_base + c * b_cs + t * b_ts + k4], vec4(0.0)));
+                }
+            }
+            if (!nz) {
+                continue;
+            }
+        }
         vec4 av[NROWS];
         [[unroll]] for (uint r = 0; r < NROWS; ++r) av[r] = vec4(data_a_v4[a_base[r] + k4]);
         [[unroll]] for (uint t = 0; t < NTOK; ++t) {

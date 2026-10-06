@@ -58,6 +58,10 @@ struct vk_mat_vec_gqa_push_constants {
     uint32_t a_offset;
     uint32_t b_offset;
     uint32_t d_offset;
+    uint32_t mask_offset;       // b65: element offset of the mask (binding 3)
+    uint32_t mask_tok_stride;
+    uint32_t mask_head_stride;  // 0 = one mask for all heads
+    uint32_t flags;             // 1 = rows: skip fully masked rows, 2 = split: skip zero-probability positions
 };
 
 struct vk_mat_vec_nc_push_constants {

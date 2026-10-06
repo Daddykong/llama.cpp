@@ -20,6 +20,7 @@ layout (push_constant) uniform parameter
     uint ncols; uint nrows; uint a_row_stride; uint a_chan_stride;
     uint b_chan_stride; uint b_tok_stride; uint d_chan_stride; uint d_tok_stride;
     uint a_offset; uint b_offset; uint d_offset;
+    uint mask_offset; uint mask_tok_stride; uint mask_head_stride; uint flags;   // b65
 } p;
 
 void main() {
@@ -31,12 +32,22 @@ void main() {
     float acc[NTOK * GQA];
     [[unroll]] for (uint i = 0; i < NTOK * GQA; ++i) acc[i] = 0.0;
 
+    bool live = true;   // b65: fully masked rows are skipped (their outputs are masked by the softmax anyway)
+    if ((p.flags & 1u) != 0u) {
+        live = false;
+        [[unroll]] for (uint t = 0; t < NTOK; ++t) {
+            [[unroll]] for (uint c = 0; c < GQA; ++c) {
+                live = live || float(data_fuse0[p.mask_offset + t * p.mask_tok_stride + (h * GQA + c) * p.mask_head_stride + rr]) > -1e30;
+            }
+        }
+    }
+
     const uint a_base = (p.a_offset + h * p.a_chan_stride + rr * p.a_row_stride) / 4;
     const uint b_base = (p.b_offset + h * GQA * p.b_chan_stride) / 4;
     const uint b_cs = p.b_chan_stride / 4;
     const uint b_ts = p.b_tok_stride / 4;
 
-    for (uint k4 = j; k4 < p.ncols / 4; k4 += LPR) {
+    for (uint k4 = j; live && k4 < p.ncols / 4; k4 += LPR) {
         const vec4 av = vec4(data_a_v4[a_base + k4]);
         [[unroll]] for (uint t = 0; t < NTOK; ++t) {
             [[unroll]] for (uint c = 0; c < GQA; ++c) {
