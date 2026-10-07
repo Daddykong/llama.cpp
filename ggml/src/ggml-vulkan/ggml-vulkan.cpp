@@ -6959,6 +6959,30 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     }
 }
 
+// b65: chain check for fusions whose ops change shape (ggml_can_fuse requires equal shapes)
+static bool ggml_vk_b65_chain_ok(const struct ggml_cgraph * cgraph, int node_idx, std::initializer_list<enum ggml_op> ops) {
+    const int n = (int)ops.size();
+    if (node_idx + n > cgraph->n_nodes) {
+        return false;
+    }
+    for (int i = 0; i < n; ++i) {
+        const ggml_tensor * node = cgraph->nodes[node_idx + i];
+        if (node->op != ops.begin()[i] || (node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            return false;
+        }
+        if (i < n - 1 && !ggml_node_has_n_uses(cgraph, node_idx + i, 1)) {
+            return false;
+        }
+        if (i > 0) {
+            const ggml_tensor * prev = cgraph->nodes[node_idx + i - 1];
+            if (node->src[0] != prev && node->src[1] != prev) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 // b65: SOFT_MAX + MUL_MAT(V, P): row statistics into P's memory, then the matmul reads the raw scores
 static bool ggml_vk_can_fuse_sm_mm(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
     static const bool enabled = getenv("GGML_VK_SM_FUSE") != nullptr && atoi(getenv("GGML_VK_SM_FUSE")) != 0;
@@ -6973,8 +6997,10 @@ static bool ggml_vk_can_fuse_sm_mm(ggml_backend_vk_context * ctx, const struct g
     const ggml_tensor * scores = sm->src[0];
     const ggml_tensor * mask = sm->src[1];
     const float max_bias = ((const float *)sm->op_params)[1];
-    if (scores->type != GGML_TYPE_F32 || !ggml_is_contiguous(scores) || !mask || mask->type != GGML_TYPE_F16 ||
-        mask->ne[2] != 1 || mask->ne[3] != 1 || mask->nb[0] != sizeof(ggml_fp16_t) || sm->src[2] != nullptr ||
+    // b65: f16 mask (flash attention on) or f32 mask (flash attention off, the live path)
+    if (scores->type != GGML_TYPE_F32 || !ggml_is_contiguous(scores) || !mask ||
+        (mask->type != GGML_TYPE_F16 && mask->type != GGML_TYPE_F32) ||
+        mask->ne[2] != 1 || mask->ne[3] != 1 || mask->nb[0] != ggml_type_size(mask->type) || sm->src[2] != nullptr ||
         max_bias != 0.0f || scores->ne[3] != 1) {
         return false;
     }
@@ -6992,7 +7018,8 @@ static void ggml_vk_soft_max_mm_fused(ggml_backend_vk_context * ctx, vk_context&
     const ggml_tensor * mask = sm->src[1];
     const uint32_t nrows = (uint32_t)ggml_nrows(scores);
     vk_op_sm_stats_push_constants pc = {
-        (uint32_t)scores->ne[0], (uint32_t)scores->ne[1], (uint32_t)(mask->nb[1] / mask->nb[0]), nrows,
+        (uint32_t)scores->ne[0], (uint32_t)scores->ne[1],
+        (uint32_t)(mask->nb[1] / mask->nb[0]) | (mask->type == GGML_TYPE_F32 ? 0x80000000u : 0u), nrows,
         ((const float *)sm->op_params)[0],
     };
     vk_subbuffer stats = ggml_vk_tensor_subbuffer(ctx, sm);
@@ -7006,6 +7033,8 @@ static void ggml_vk_soft_max_mm_fused(ggml_backend_vk_context * ctx, vk_context&
     ctx->sm_fuse_stats = stats;
     ctx->sm_fuse_on = true;
     ctx->sm_mode = 1;
+    static bool said = false;
+    if (!said) { said = true; fprintf(stderr, "b65: softmax fused into V x P (mask %s, %u rows)\n", ggml_type_name(mask->type), nrows); }
     ggml_vk_mul_mat_q_f16(ctx, subctx, mm->src[0], scores, mm, true);
     ctx->sm_fuse_on = false;
     ctx->sm_mode = 0;
@@ -7060,7 +7089,8 @@ static void ggml_vk_kq_sm_mm_fused(ggml_backend_vk_context * ctx, vk_context& su
 
     const uint32_t nrows = (uint32_t)ggml_nrows(kq);
     vk_op_sm_stats_push_constants pc = {
-        (uint32_t)kq->ne[0], (uint32_t)kq->ne[1], (uint32_t)(mask->nb[1] / mask->nb[0]), nrows,
+        (uint32_t)kq->ne[0], (uint32_t)kq->ne[1],
+        (uint32_t)(mask->nb[1] / mask->nb[0]) | (mask->type == GGML_TYPE_F32 ? 0x80000000u : 0u), nrows,
         ((const float *)sm->op_params)[0],
     };
     vk_subbuffer stats = ggml_vk_tensor_subbuffer(ctx, sm);
@@ -7075,6 +7105,8 @@ static void ggml_vk_kq_sm_mm_fused(ggml_backend_vk_context * ctx, vk_context& su
     ctx->sm_fuse_stats = stats;
     ctx->sm_fuse_on = true;
     ctx->sm_mode = 3;
+    static bool said = false;
+    if (!said) { said = true; fprintf(stderr, "b65: KQ + softmax fused into V x P (mask %s, %u rows)\n", ggml_type_name(mask->type), nrows); }
     ggml_vk_mul_mat_q_f16(ctx, subctx, mm->src[0], &kq16, mm, true);
     ctx->sm_fuse_on = false;
     ctx->sm_mode = 0;
@@ -15653,12 +15685,12 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         const char *fusion_string {};
         if (!ctx->device->disable_fusion) {
             uint32_t num_adds = ggml_vk_fuse_multi_add(ctx, cgraph, i);
-            if (ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_SOFT_MAX, GGML_OP_MUL_MAT }) && ggml_vk_can_fuse_kq_sm_mm(ctx, cgraph, i)) {
+            if (ggml_vk_b65_chain_ok(cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_SOFT_MAX, GGML_OP_MUL_MAT }) && ggml_vk_can_fuse_kq_sm_mm(ctx, cgraph, i)) {
                 ctx->num_additional_fused_ops = 2;   // b65
                 ctx->fused_kq_sm_mm = true;
                 fusion_string = "MUL_MAT_SOFT_MAX_MUL_MAT";
                 std::fill_n(op_srcs_fused_elementwise, 3, false);
-            } else if (ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_SOFT_MAX, GGML_OP_MUL_MAT }) && ggml_vk_can_fuse_sm_mm(ctx, cgraph, i)) {
+            } else if (ggml_vk_b65_chain_ok(cgraph, i, { GGML_OP_SOFT_MAX, GGML_OP_MUL_MAT }) && ggml_vk_can_fuse_sm_mm(ctx, cgraph, i)) {
                 ctx->num_additional_fused_ops = 1;   // b65
                 ctx->fused_sm_mm = true;
                 fusion_string = "SOFT_MAX_MUL_MAT";

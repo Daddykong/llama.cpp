@@ -9,7 +9,7 @@ layout(binding = 0) readonly buffer X { float16_t data_x[]; };
 #else
 layout(binding = 0) readonly buffer X { float data_x[]; };
 #endif
-layout(binding = 1) readonly buffer M { float16_t data_m[]; };
+layout(binding = 1) readonly buffer M { uint data_m[]; };   // f16 or f32 mask (top bit of p.mstride = f32)
 layout(binding = 2) writeonly buffer S { vec2 data_s[]; };
 shared float sh_m[256];
 shared float sh_s[256];
@@ -27,9 +27,13 @@ void main() {
     const uint tid = gl_LocalInvocationID.x;
     if (row >= p.nrows) return;
     const uint n = row % p.nrows_y;
+    const bool mf32 = (p.mstride >> 31) != 0;
+    const uint ms = p.mstride & 0x7FFFFFFFu;
     float m = NEG_INF, s = 0.0;
     for (uint k = tid; k < p.ncols; k += 256) {
-        const float v = float(data_x[row * p.ncols + k]) * p.scale + float(data_m[n * p.mstride + k]);
+        const uint mi = n * ms + k;
+        const float mv = mf32 ? uintBitsToFloat(data_m[mi]) : unpackHalf2x16(data_m[mi >> 1])[mi & 1];
+        const float v = float(data_x[row * p.ncols + k]) * p.scale + mv;
         combine(m, s, v, 1.0);
     }
     sh_m[tid] = m; sh_s[tid] = s;

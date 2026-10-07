@@ -9409,10 +9409,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval();
 struct test_b65_sm_mm : public test_case {
     const int64_t n_kv, n_tok, d, heads, heads_kv;
     const bool with_kq;
-    std::string vars() override { return VARS_TO_STR6(n_kv, n_tok, d, heads, heads_kv, with_kq); }
-    test_b65_sm_mm(int64_t n_kv, int64_t n_tok, int64_t d, int64_t heads, int64_t heads_kv, bool with_kq = false)
-        : n_kv(n_kv), n_tok(n_tok), d(d), heads(heads), heads_kv(heads_kv), with_kq(with_kq) {}
+    const ggml_type mask_type;   // f32 = flash attention off (the live path), f16 = on
+    std::string vars() override { return VARS_TO_STR7(n_kv, n_tok, d, heads, heads_kv, with_kq, mask_type); }
+    test_b65_sm_mm(int64_t n_kv, int64_t n_tok, int64_t d, int64_t heads, int64_t heads_kv, bool with_kq = false,
+                   ggml_type mask_type = GGML_TYPE_F16)
+        : n_kv(n_kv), n_tok(n_tok), d(d), heads(heads), heads_kv(heads_kv), with_kq(with_kq), mask_type(mask_type) {}
     double max_nmse_err() override { return 1e-3; }
+    bool run_whole_graph() override { return true; }   // else the fused path is never run
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * kq;
         if (with_kq) {
@@ -9423,22 +9426,29 @@ struct test_b65_sm_mm : public test_case {
         } else {
             kq = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_kv, n_tok, heads);
         }
-        ggml_tensor * mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n_kv, n_tok);
+        ggml_tensor * mask = ggml_new_tensor_2d(ctx, mask_type, n_kv, n_tok);
+        ggml_set_name(mask, "b65_mask");
         ggml_tensor * v = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, n_kv, d, heads_kv);
         ggml_tensor * p = ggml_soft_max_ext(ctx, kq, mask, 0.125f, 0.0f);
         return ggml_mul_mat(ctx, v, p);
     }
     void initialize_tensors(ggml_context * ctx) override {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
-            if (t->type == GGML_TYPE_F16 && ggml_n_dims(t) == 2 && t->ne[1] == n_tok) {
+            if (strcmp(t->name, "b65_mask") == 0) {
                 // causal-style mask: key k visible to token n when k <= n_kv - n_tok + n
-                std::vector<ggml_fp16_t> m(ggml_nelements(t));
+                std::vector<float> m(ggml_nelements(t));
                 for (int64_t n = 0; n < n_tok; n++) {
                     for (int64_t k = 0; k < n_kv; k++) {
-                        m[n * n_kv + k] = ggml_fp32_to_fp16(k <= n_kv - n_tok + n ? 0.0f : -INFINITY);
+                        m[n * n_kv + k] = k <= n_kv - n_tok + n ? 0.0f : -INFINITY;
                     }
                 }
-                ggml_backend_tensor_set(t, m.data(), 0, m.size() * sizeof(ggml_fp16_t));
+                if (t->type == GGML_TYPE_F16) {
+                    std::vector<ggml_fp16_t> h(m.size());
+                    ggml_fp32_to_fp16_row(m.data(), h.data(), (int64_t)m.size());
+                    ggml_backend_tensor_set(t, h.data(), 0, h.size() * sizeof(ggml_fp16_t));
+                } else {
+                    ggml_backend_tensor_set(t, m.data(), 0, m.size() * sizeof(float));
+                }
             } else {
                 init_tensor_uniform(t, -4.0f, 4.0f);
             }
@@ -9452,6 +9462,7 @@ struct test_b65_gate_mul : public test_case {
     std::string vars() override { return VARS_TO_STR3(d, h, t); }
     test_b65_gate_mul(int64_t d, int64_t h, int64_t t) : d(d), h(h), t(t) {}
     std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "B65_GATE_MUL"; }
+    bool run_whole_graph() override { return true; }   // else the fused path is never run
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * qg = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2 * d, h, t);   // query and gate interleaved per head
         ggml_tensor * gate = ggml_view_3d(ctx, qg, d, h, t, qg->nb[1], qg->nb[2], d * ggml_element_size(qg));
@@ -9479,6 +9490,13 @@ static void add_b65_sparse_t_cases(std::vector<std::unique_ptr<test_case>> & tes
     test_cases.emplace_back(new test_b65_sm_mm(512, 64, 128, 8, 2, true));
     test_cases.emplace_back(new test_b65_sm_mm(1000, 100, 128, 6, 1, true));
     test_cases.emplace_back(new test_b65_sm_mm(4096, 512, 256, 24, 4, true));
+    // f32 mask: flash attention off, as the live model runs
+    test_cases.emplace_back(new test_b65_sm_mm(512, 64, 128, 8, 2, false, GGML_TYPE_F32));
+    test_cases.emplace_back(new test_b65_sm_mm(1000, 100, 128, 6, 1, false, GGML_TYPE_F32));
+    test_cases.emplace_back(new test_b65_sm_mm(4096, 512, 256, 24, 4, false, GGML_TYPE_F32));
+    test_cases.emplace_back(new test_b65_sm_mm(512, 64, 128, 8, 2, true, GGML_TYPE_F32));
+    test_cases.emplace_back(new test_b65_sm_mm(1000, 100, 128, 6, 1, true, GGML_TYPE_F32));
+    test_cases.emplace_back(new test_b65_sm_mm(4096, 512, 256, 24, 4, true, GGML_TYPE_F32));
     // b65 row-reordered weights (GGML_VK_*_REPACK=2): model-sized k, decode (1-8 tokens) and prompt batches;
     // k=1280 (5 IQ4_XS superblocks) is not eligible for the IQ4_XS reorder and checks the fallback
     for (ggml_type t : {GGML_TYPE_IQ4_XS, GGML_TYPE_Q5_K, GGML_TYPE_Q8_0, GGML_TYPE_IQ4_NL, GGML_TYPE_Q6_K, GGML_TYPE_Q4_1}) {
