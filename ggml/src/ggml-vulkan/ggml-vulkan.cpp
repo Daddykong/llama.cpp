@@ -6603,7 +6603,8 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     GGML_ASSERT(mmp_map != nullptr);
 
     const uint32_t kpad = quantize_y ? 0 : ggml_vk_align_size(ne10, ggml_vk_guess_matmul_pipeline_align_map(ctx, *mmp_map, ne01, ne11, false));
-    const bool aligned = !quantize_y && ne10 == kpad && ne01 > 8 && ne11 > 8 && !ctx->sm_fuse_on;
+    static const bool sm_fuse_unaligned = getenv("GGML_VK_SM_FUSE_UNALIGNED") != nullptr;
+    const bool aligned = !quantize_y && ne10 == kpad && ne01 > 8 && ne11 > 8 && !(ctx->sm_fuse_on && sm_fuse_unaligned);
 
     vk_pipeline pipeline = ggml_vk_guess_matmul_pipeline_map(ctx, *mmp_map, ne01, ne11, aligned, false);
 

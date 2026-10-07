@@ -663,7 +663,18 @@ void load_b_to_shmem(const uint pos_b, const uint row, const uint col, const uin
         // Not supported for b_type bf16 because bf16mat2x4 does not exist
         const uint idx = pos_b + col * p.stride_b / LOAD_VEC_B + row;
         const uint buf_idx = col * SHMEM_STRIDE + row * LOAD_VEC_B / 2;
+#ifdef SM_FUSE
+        mat2x4 raw = mat2x4(data_b[idx]);
+        const uint k0 = block + row * LOAD_VEC_B;
+        [[unroll]] for (uint h = 0; h < 2; h++) {
+            [[unroll]] for (uint c = 0; c < 4; c++) {
+                raw[h][c] = idx_n < p.N ? sm_p(raw[h][c], k0 + h * 4 + c, idx_n) : 0.0;
+            }
+        }
+        FLOAT_TYPEV8 bb = FLOAT_TYPEV8(raw);
+#else
         FLOAT_TYPEV8 bb = FLOAT_TYPEV8(data_b[idx]);
+#endif
         buf_b[buf_idx + 0] = bb[0].xy;
         buf_b[buf_idx + 1] = bb[0].zw;
         buf_b[buf_idx + 2] = bb[1].xy;
