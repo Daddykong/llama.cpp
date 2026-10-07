@@ -14,6 +14,7 @@ layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
 layout(constant_id = 0) const uint GQA = 1;   // B channels per A channel, 1..8
 layout(constant_id = 1) const uint NTOK = 1;  // columns of B, 1..4
+layout(constant_id = 2) const uint R = 1;     // b65 [mtp]: rows per invocation (rows i, i+64, ...): each B load serves R rows
 
 layout (push_constant) uniform parameter
 {
@@ -31,34 +32,50 @@ layout (push_constant) uniform parameter
 } p;
 
 void main() {
-    const uint row = gl_GlobalInvocationID.x;
-    const uint h   = gl_WorkGroupID.y;
-    if (row >= p.nrows) {
+    const uint row0 = gl_WorkGroupID.x * 64 * R + gl_LocalInvocationID.x;
+    const uint h    = gl_WorkGroupID.y;
+    if (row0 >= p.nrows) {
         return;
     }
 
-    float acc[NTOK * GQA];
-    [[unroll]] for (uint i = 0; i < NTOK * GQA; ++i) {
+    float acc[R * NTOK * GQA];
+    [[unroll]] for (uint i = 0; i < R * NTOK * GQA; ++i) {
         acc[i] = 0.0;
     }
 
-    const uint a_base = (p.a_offset + h * p.a_chan_stride + row * p.a_row_stride) / 4;
+    uint a_base[R];
+    [[unroll]] for (uint r = 0; r < R; ++r) {
+        // rows past the end re-read row0; their results are not written
+        const uint row = row0 + r * 64 < p.nrows ? row0 + r * 64 : row0;
+        a_base[r] = (p.a_offset + h * p.a_chan_stride + row * p.a_row_stride) / 4;
+    }
     const uint b_base = (p.b_offset + h * GQA * p.b_chan_stride) / 4;
     const uint b_cs   = p.b_chan_stride / 4;
     const uint b_ts   = p.b_tok_stride / 4;
 
     for (uint k4 = 0; k4 < p.ncols / 4; ++k4) {
-        const vec4 av = vec4(data_a_v4[a_base + k4]);
+        vec4 av[R];
+        [[unroll]] for (uint r = 0; r < R; ++r) {
+            av[r] = vec4(data_a_v4[a_base[r] + k4]);
+        }
         [[unroll]] for (uint t = 0; t < NTOK; ++t) {
             [[unroll]] for (uint c = 0; c < GQA; ++c) {
-                acc[t * GQA + c] += dot(av, data_b_v4[b_base + c * b_cs + t * b_ts + k4]);
+                const vec4 bv = data_b_v4[b_base + c * b_cs + t * b_ts + k4];
+                [[unroll]] for (uint r = 0; r < R; ++r) {
+                    acc[(r * NTOK + t) * GQA + c] += dot(av[r], bv);
+                }
             }
         }
     }
 
-    [[unroll]] for (uint t = 0; t < NTOK; ++t) {
-        [[unroll]] for (uint c = 0; c < GQA; ++c) {
-            data_d[p.d_offset + (h * GQA + c) * p.d_chan_stride + t * p.d_tok_stride + row] = acc[t * GQA + c];
+    [[unroll]] for (uint r = 0; r < R; ++r) {
+        const uint row = row0 + r * 64;
+        if (row < p.nrows) {
+            [[unroll]] for (uint t = 0; t < NTOK; ++t) {
+                [[unroll]] for (uint c = 0; c < GQA; ++c) {
+                    data_d[p.d_offset + (h * GQA + c) * p.d_chan_stride + t * p.d_tok_stride + row] = acc[(r * NTOK + t) * GQA + c];
+                }
+            }
         }
     }
 }

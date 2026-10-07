@@ -3410,7 +3410,13 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             // b65: GGML_VK_BATCH_INVARIANT=1 pins the subgroup size (Intel picks it per pipeline from register pressure)
             static const bool batch_inv_sg = getenv("GGML_VK_BATCH_INVARIANT") != nullptr && atoi(getenv("GGML_VK_BATCH_INVARIANT")) != 0;
             const uint32_t gqa_sg = (batch_inv_sg && device->subgroup_size_control) ? device->subgroup_min_size : 0;
-            ggml_vk_create_pipeline2(device, device->pipeline_mul_mat_vec_gqa_rows_f16_f32[g][t],  "mul_mat_vec_gqa_rows_f16_f32" + sfx,  mul_mat_vec_gqa_rows_f16_f32_len,  mul_mat_vec_gqa_rows_f16_f32_data,  "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_gqa_push_constants), {1, 1, 1}, {g + 1, t + 1}, 1, false, false, gqa_sg);
+            // b65 [mtp]: GGML_VK_GQA_KQ_ROWS=<r> rows per invocation of the short-k (K x Q) kernel, for 2-4 tokens
+            uint32_t kq_r = 1;
+            if (t > 0 && getenv("GGML_VK_GQA_KQ_ROWS")) {
+                kq_r = std::max(1, atoi(getenv("GGML_VK_GQA_KQ_ROWS")));
+            }
+            device->mul_mat_vec_gqa_rows_r[g][t] = kq_r;
+            ggml_vk_create_pipeline2(device, device->pipeline_mul_mat_vec_gqa_rows_f16_f32[g][t],  "mul_mat_vec_gqa_rows_f16_f32" + sfx,  mul_mat_vec_gqa_rows_f16_f32_len,  mul_mat_vec_gqa_rows_f16_f32_data,  "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_gqa_push_constants), {1, 1, 1}, {g + 1, t + 1, kq_r}, 1, false, false, gqa_sg);
             // rows of A per workgroup for the long-k kernel: B loads are reused across them (env override for tuning)
             // b65: GGML_VK_BATCH_INVARIANT=1 uses the 4-token row counts for every token count, so each row's k sum is
             // cut into the same slices whether 1 or 4 tokens are verified
@@ -7762,7 +7768,8 @@ static void ggml_vk_mul_mat_vec_gqa_f16_f32(ggml_backend_vk_context * ctx, vk_co
     }
 
     const uint32_t groups_x = split ? CEIL_DIV(rows, split2 ? ctx->device->mul_mat_vec_gqa_split2_rows[gqa - 1][ntok - 1]
-                                                            : ctx->device->mul_mat_vec_gqa_split_rows[gqa - 1][ntok - 1]) : CEIL_DIV(rows, rows2 ? 8u : 64u);
+                                                            : ctx->device->mul_mat_vec_gqa_split_rows[gqa - 1][ntok - 1])
+                                    : CEIL_DIV(rows, rows2 ? 8u : 64u * ctx->device->mul_mat_vec_gqa_rows_r[gqa - 1][ntok - 1]);
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { d_Qx, d_Qy, d_D, d_M, d_D }, pc, { groups_x, (uint32_t)src0->ne[2], 1 });
 }
 
