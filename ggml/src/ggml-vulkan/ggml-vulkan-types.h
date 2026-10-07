@@ -798,6 +798,9 @@ struct vk_device_struct {
     uint32_t coopmat_int_k;
 
     bool coopmat2;
+    // b65: the matmul family (MUL_MAT / MUL_MAT_ID tiles and pipelines) uses coopmat2; GGML_VK_CM2_MM=0 keeps
+    // coopmat1 matmuls next to coopmat2 flash attention
+    bool coopmat2_mm {};
     bool coopmat2_bf16_support {};
     bool coopmat2_decode_vector;
 

@@ -11865,6 +11865,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 256, n, ctx, {4, 1}, {6, 1}, {0, 1, 2, 3}, 131072));
         }
     }
+    // b65 X27: Qwen3.8-27B prefill attention (head dim 256, 4 KV heads x 6, 512-token batch) at 0.5K-32K keys, f16 KV;
+    // flash attention and the FA-off K x Q / V x P matmuls
+    for (int kv : {512, 4096, 8192, 32768}) {
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, kv, 512, 256, {4, 1}, {6, 1}, {0, 2, 1, 3}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 256, 512, kv, {4, 1}, {6, 1}, {0, 1, 2, 3}, 2*kv));
+    }
+    // b65 X27: weight matmuls at a 512-token batch (prefill)
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 17408, 512, 5120, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 5120, 512, 17408, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 5120, 512, 5120, {1, 1}, {1, 1}));
     for (float thr : {0.0f, 0.4f, 0.5f, 0.6f}) for (int nc : {24, 48, 96}) test_cases.emplace_back(new test_mul_mat_sparse_t(GGML_TYPE_Q4_0, 5120, 17408, 1, nc, thr));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 5120, 1, 17408, {1, 1}, {1, 1}));
     // b65 [mtp]: Qwen3.8-27B weight matvecs at 1-4 columns (MTP verify = 3); m x k as the model uses them

@@ -45,6 +45,8 @@ const uint BNover2 = BN / 2;
 const uint BNover4 = enable_smaller_matrices ? (BN / 4) : (BN / 2);
 layout (constant_id = 5) const uint ALIGNED = 0;
 layout (constant_id = 6) const uint subgroup_size = 32;
+// b65: k-loop unroll for 32-element quant blocks (8 upstream; small tiles on Intel use less)
+layout (constant_id = 9) const uint UNROLL_LEGACY = 8;
 
 #ifdef MULMAT_QUANT
 
@@ -457,7 +459,7 @@ void main() {
     const uint START_ALIGN_K = 256;
     // For Qi_K (block size 256), unroll whole 256 element tiles.
     // For legacy quants (block size 32), unroll 8x.
-    const uint UNROLL_K = (qk == 256) ? 256 : (BK * 8);
+    const uint UNROLL_K = (qk == 256) ? 256 : (BK * UNROLL_LEGACY);
     const uint unroll_count = UNROLL_K / BK;
 
     // Detect a fast path where all loads are entirely in bounds and no clamping is required
