@@ -58,6 +58,7 @@ uint mm_load_vec_a() {
     case GGML_TYPE_Q4_0:
     case GGML_TYPE_Q4_0R:
     case GGML_TYPE_IQ4_NLR:   // b65: same layout and loader shape as Q4_0R
+    case GGML_TYPE_Q4_1R:
     case GGML_TYPE_Q4_1:
     case GGML_TYPE_Q5_1:
         return 8u;

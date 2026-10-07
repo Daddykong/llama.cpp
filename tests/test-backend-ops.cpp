@@ -9481,7 +9481,7 @@ static void add_b65_sparse_t_cases(std::vector<std::unique_ptr<test_case>> & tes
     test_cases.emplace_back(new test_b65_sm_mm(4096, 512, 256, 24, 4, true));
     // b65 row-reordered weights (GGML_VK_*_REPACK=2): model-sized k, decode (1-8 tokens) and prompt batches;
     // k=1280 (5 IQ4_XS superblocks) is not eligible for the IQ4_XS reorder and checks the fallback
-    for (ggml_type t : {GGML_TYPE_IQ4_XS, GGML_TYPE_Q5_K, GGML_TYPE_Q8_0, GGML_TYPE_IQ4_NL, GGML_TYPE_Q6_K}) {
+    for (ggml_type t : {GGML_TYPE_IQ4_XS, GGML_TYPE_Q5_K, GGML_TYPE_Q8_0, GGML_TYPE_IQ4_NL, GGML_TYPE_Q6_K, GGML_TYPE_Q4_1}) {
         for (int64_t k : {1024, 5120, 1280}) {
             for (int64_t n : {1, 2, 3, 4, 8, 17, 512}) {
                 test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 64, n, k, {1, 1}, {1, 1}));

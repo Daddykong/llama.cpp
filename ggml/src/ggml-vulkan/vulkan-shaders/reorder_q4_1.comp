@@ -1,0 +1,44 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+
+// In-place row reorder of Q4_1 weights for the row-reordered (Q4_1R) matvec/matmul shaders.
+// One workgroup per row: the row of nbpr 20-byte blocks (dm word + 16 quant bytes) becomes nbpr 16-byte quant blocks
+// followed by nbpr dm words. Lossless. Requires nbpr * 5 <= REORDER_MAX_WORDS.
+
+#define REORDER_MAX_WORDS 4096
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) buffer A {uint data_a[];};
+
+layout (push_constant) uniform parameter
+{
+    uint nbpr;
+    uint nrows;
+    uint row0;
+} p;
+
+shared uint sh[REORDER_MAX_WORDS];
+
+void main() {
+    const uint row = p.row0 + gl_WorkGroupID.x;
+    if (row >= p.nrows) {
+        return;
+    }
+    const uint tid = gl_LocalInvocationID.x;
+    const uint nw = p.nbpr * 5u;
+    const uint base = row * nw;
+
+    for (uint i = tid; i < nw; i += 256u) {
+        sh[i] = data_a[base + i];
+    }
+    barrier();
+
+    for (uint w = tid; w < p.nbpr * 4u; w += 256u) {
+        data_a[base + w] = sh[(w >> 2u) * 5u + 1u + (w & 3u)];
+    }
+    for (uint t = tid; t < p.nbpr; t += 256u) {
+        data_a[base + p.nbpr * 4u + t] = sh[t * 5u];
+    }
+}

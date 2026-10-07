@@ -431,6 +431,26 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
         store_a(col, k_pair + 1, FLOAT_TYPEV2(v0.zw));
         store_a(col, k_pair + 8, FLOAT_TYPEV2(v1.xy));
         store_a(col, k_pair + 9, FLOAT_TYPEV2(v1.zw));
+    } else if (MmTypeA == GGML_TYPE_Q4_1R) {
+        // row-reordered Q4_1 (reorder_q4_1.comp): per row nbpr 16-byte quant blocks, then nbpr dm words
+        const uint idx = pos_a + col * p.stride_a / mm_load_vec_a() + row;
+        const uint k_pair = row * mm_load_vec_a() / 4;
+
+        const uint ib = idx / 4;
+        const uint iqs = idx & 0x03;
+        const uint nbpr = p.stride_a / 32;
+        const uint jb = (block + row * mm_load_vec_a()) / 32;
+        const uint rsb = ib - jb;
+
+        const vec2 dm = unpackHalf2x16(a_q4_0r_u32.data[rsb * 5 + nbpr * 4 + jb]);
+        const uint vui = a_q4_0r_u32.data[rsb * 5 + jb * 4 + iqs];
+        const vec4 v0 = vec4(unpack8(vui & 0x0F0F0F0F)) * dm.x + dm.y;
+        const vec4 v1 = vec4(unpack8((vui >> 4) & 0x0F0F0F0F)) * dm.x + dm.y;
+
+        store_a(col, k_pair, FLOAT_TYPEV2(v0.xy));
+        store_a(col, k_pair + 1, FLOAT_TYPEV2(v0.zw));
+        store_a(col, k_pair + 8, FLOAT_TYPEV2(v1.xy));
+        store_a(col, k_pair + 9, FLOAT_TYPEV2(v1.zw));
     } else if (MmTypeA == GGML_TYPE_Q5_0) {
         const uint idx = pos_a + col * p.stride_a / mm_load_vec_a() + row;
         const uint k_pair = row * mm_load_vec_a() / 4;
