@@ -1019,6 +1019,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_mul_mat_sparse_t_mt[2][5]; // b65: [q4_0, q4_1][ntok 2..4]
     vk_pipeline pipeline_kv_block_minmax, pipeline_kv_quest_mask; // b65 Quest
     vk_pipeline pipeline_sign_score, pipeline_mul_mat_masked_q4_0; // b65 sparse gate/up
+    vk_pipeline pipeline_gdn_gates_f16, pipeline_gdn_gates_f32; // b65 GDN gates
     vk_pipeline pipeline_soft_max_stats, pipeline_soft_max_stats_f16; // b65 softmax folded into V x P
     vk_pipeline pipeline_gated_delta_net_chunk; // b65
     vk_pipeline pipeline_ssm_conv_silu_f32;

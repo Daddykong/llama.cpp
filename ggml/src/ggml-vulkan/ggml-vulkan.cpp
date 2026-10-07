@@ -3869,6 +3869,8 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     }
     ggml_vk_create_pipeline(device, device->pipeline_soft_max_stats, "soft_max_stats_f32", soft_max_stats_f32_len, soft_max_stats_f32_data, "main", 3, sizeof(vk_op_sm_stats_push_constants), {1, 1, 1}, {}, 1);   // b65
     ggml_vk_create_pipeline(device, device->pipeline_soft_max_stats_f16, "soft_max_stats_f16", soft_max_stats_f16_len, soft_max_stats_f16_data, "main", 3, sizeof(vk_op_sm_stats_push_constants), {1, 1, 1}, {}, 1);   // b65
+    ggml_vk_create_pipeline(device, device->pipeline_gdn_gates_f16, "gdn_gates_f16", gdn_gates_f16_len, gdn_gates_f16_data, "main", 6, sizeof(vk_op_gdn_gates_push_constants), {1, 1, 1}, {}, 1, false, true, 32);   // b65
+    ggml_vk_create_pipeline(device, device->pipeline_gdn_gates_f32, "gdn_gates_f32", gdn_gates_f32_len, gdn_gates_f32_data, "main", 6, sizeof(vk_op_gdn_gates_push_constants), {1, 1, 1}, {}, 1, false, true, 32);   // b65
     ggml_vk_create_pipeline(device, device->pipeline_sign_score, "sign_score", sign_score_len, sign_score_data, "main", 5, sizeof(vk_op_sign_score_push_constants), {1, 1, 1}, {}, 1, false, true, 32);
     ggml_vk_create_pipeline(device, device->pipeline_mul_mat_masked_q4_0, "mul_mat_masked_q4_0", mul_mat_masked_q4_0_len, mul_mat_masked_q4_0_data, "main", 4, sizeof(vk_op_mm_masked_push_constants), {1, 1, 1}, {}, 1, false, true, 32);
     ggml_vk_create_pipeline(device, device->pipeline_kv_block_minmax, "kv_block_minmax", kv_block_minmax_len, kv_block_minmax_data, "main", 4, sizeof(vk_op_kv_minmax_push_constants), {256, 1, 1}, {}, 1);
@@ -10905,6 +10907,23 @@ void ggml_vk_ssm_scan(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_te
         pc, elements);
 }
 
+static void ggml_vk_gdn_gates(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {  // b65
+    const ggml_tensor * x = dst->src[0], * wb = dst->src[1], * wa = dst->src[2], * dt = dst->src[3], * a = dst->src[4];
+    const bool f16 = wb->type == GGML_TYPE_F16;
+    vk_pipeline pipeline = f16 ? ctx->device->pipeline_gdn_gates_f16 : ctx->device->pipeline_gdn_gates_f32;
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+    const uint32_t ws = (uint32_t)ggml_type_size(wb->type);
+    vk_op_gdn_gates_push_constants pc = {
+        (uint32_t)x->ne[0], (uint32_t)wb->ne[1], (uint32_t)x->ne[1], (uint32_t)(x->nb[1] / 4), (uint32_t)(wb->nb[1] / ws),
+        (uint32_t)(dst->nb[1] / 4), (uint32_t)(dst->nb[2] / 4),
+        (uint32_t)(get_misalign_bytes(ctx, x) / 4), (uint32_t)(get_misalign_bytes(ctx, wb) / ws), (uint32_t)(get_misalign_bytes(ctx, wa) / ws),
+        (uint32_t)(get_misalign_bytes(ctx, dt) / 4), (uint32_t)(get_misalign_bytes(ctx, a) / 4), (uint32_t)(get_misalign_bytes(ctx, dst) / 4),
+    };
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { ggml_vk_tensor_subbuffer(ctx, x, true), ggml_vk_tensor_subbuffer(ctx, wb, true),
+        ggml_vk_tensor_subbuffer(ctx, wa, true), ggml_vk_tensor_subbuffer(ctx, dt, true), ggml_vk_tensor_subbuffer(ctx, a, true),
+        ggml_vk_tensor_subbuffer(ctx, dst, true) }, pc, { (uint32_t)(2 * wb->ne[1]), 1, 1 });
+}
+
 static void ggml_vk_sign_score(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {  // b65
     const ggml_tensor * x = dst->src[0], * sg = dst->src[1], * su = dst->src[2], * sc = dst->src[3];
     vk_pipeline pipeline = ctx->device->pipeline_sign_score;
@@ -13483,6 +13502,9 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
         break;
     case GGML_OP_SIGN_SCORE:
         ggml_vk_sign_score(ctx, compute_ctx, node);
+        break;
+    case GGML_OP_GDN_GATES:
+        ggml_vk_gdn_gates(ctx, compute_ctx, node);
         break;
     case GGML_OP_MUL_MAT_MASKED:
         ggml_vk_mul_mat_masked(ctx, compute_ctx, node);
@@ -17038,6 +17060,11 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
 
                 return true;
             }
+        case GGML_OP_GDN_GATES:         // b65: <= 8 tokens, contiguous rows
+            return op->src[1]->type == op->src[2]->type && (op->src[1]->type == GGML_TYPE_F16 || op->src[1]->type == GGML_TYPE_F32) &&
+                   op->src[0]->ne[1] <= 8 && op->src[0]->nb[0] == sizeof(float) && op->src[1]->nb[0] == ggml_type_size(op->src[1]->type) &&
+                   op->src[2]->nb[0] == op->src[1]->nb[0] && op->src[1]->nb[1] == op->src[2]->nb[1] &&
+                   ggml_is_contiguous(op->src[3]) && ggml_is_contiguous(op->src[4]);
         case GGML_OP_SIGN_SCORE:        // b65
             return op->src[0]->type == GGML_TYPE_F32 && op->src[0]->ne[0] % 32 == 0;
         case GGML_OP_MUL_MAT_MASKED:    // b65: plain Q4_0 only, <= 4 tokens; misaligned starts must be whole blocks

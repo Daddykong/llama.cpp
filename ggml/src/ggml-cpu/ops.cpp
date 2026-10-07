@@ -8940,6 +8940,35 @@ void ggml_compute_forward_mul_mat_masked(const ggml_compute_params * params, ggm
     }
 }
 
+// b65 GDN gates (threads split the 2H output rows)
+void ggml_compute_forward_gdn_gates(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * x = dst->src[0], * wb = dst->src[1], * wa = dst->src[2], * dt = dst->src[3], * a = dst->src[4];
+    const int64_t E = x->ne[0], T = x->ne[1], H = wb->ne[1];
+    const int64_t r0 = (2 * H * params->ith) / params->nth, r1 = (2 * H * (params->ith + 1)) / params->nth;
+    ggml_to_float_t to_float = ggml_get_type_traits(wb->type)->to_float;
+    std::vector<float> row(E);
+    for (int64_t r = r0; r < r1; ++r) {
+        const int64_t which = r / H, h = r % H;
+        const ggml_tensor * w = which ? wa : wb;
+        const char * src = (const char *) w->data + h * w->nb[1];
+        if (w->type == GGML_TYPE_F32) memcpy(row.data(), src, E * sizeof(float)); else to_float(src, row.data(), E);
+        const float dth = ((const float *) dt->data)[h], ah = ((const float *) a->data)[h];
+        for (int64_t t = 0; t < T; ++t) {
+            const float * xr = (const float *) ((const char *) x->data + t * x->nb[1]);
+            float acc = 0.0f;
+            for (int64_t j = 0; j < E; ++j) acc += row[j] * xr[j];
+            float v;
+            if (which == 0) {
+                v = 1.0f / (1.0f + expf(-acc));
+            } else {
+                const float z = acc + dth;
+                v = (z > 20.0f ? z : log1pf(expf(z))) * ah;
+            }
+            *(float *) ((char *) dst->data + which * dst->nb[2] + t * dst->nb[1] + h * dst->nb[0]) = v;
+        }
+    }
+}
+
 static void ggml_compute_forward_top_k_f32(
     const ggml_compute_params * params,
     ggml_tensor * dst) {

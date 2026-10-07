@@ -1,0 +1,51 @@
+#version 450
+// b65: GDN gates. One workgroup per output row r of 2H (r < H: beta row, else gate row); 64 lanes split the dot over
+// E for all T (<= 8) tokens, then the activation.
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#define NT 8
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+layout(binding = 0) readonly buffer X { float data_x[]; };
+#ifdef W_F16
+layout(binding = 1) readonly buffer WB { float16_t data_wb[]; };
+layout(binding = 2) readonly buffer WA { float16_t data_wa[]; };
+#else
+layout(binding = 1) readonly buffer WB { float data_wb[]; };
+layout(binding = 2) readonly buffer WA { float data_wa[]; };
+#endif
+layout(binding = 3) readonly buffer DT { float data_dt[]; };
+layout(binding = 4) readonly buffer AA { float data_aa[]; };
+layout(binding = 5) writeonly buffer D { float data_d[]; };
+layout(push_constant) uniform PC { uint E; uint H; uint T; uint x_row; uint w_row; uint d_tok; uint d_half;
+                                   uint x_off; uint wb_off; uint wa_off; uint dt_off; uint a_off; uint d_off; } p;
+shared float red[NT][4];
+void main() {
+    const uint r = gl_WorkGroupID.x, lane = gl_LocalInvocationID.x;
+    const uint which = r / p.H, h = r % p.H;
+    float acc[NT];
+    [[unroll]] for (uint t = 0; t < NT; ++t) acc[t] = 0.0;
+    for (uint j = lane; j < p.E; j += 64) {
+        const float w = which == 0 ? float(data_wb[p.wb_off + h * p.w_row + j]) : float(data_wa[p.wa_off + h * p.w_row + j]);
+        [[unroll]] for (uint t = 0; t < NT; ++t) {
+            if (t < p.T) acc[t] += w * data_x[p.x_off + t * p.x_row + j];
+        }
+    }
+    [[unroll]] for (uint t = 0; t < NT; ++t) {
+        const float s = subgroupAdd(acc[t]);
+        if (gl_SubgroupInvocationID == 0) red[t][gl_SubgroupID] = s;
+    }
+    barrier();
+    if (lane < p.T) {
+        float v = 0.0;
+        for (uint g = 0; g < gl_NumSubgroups; ++g) v += red[lane][g];
+        if (which == 0) {
+            v = 1.0 / (1.0 + exp(-v));
+        } else {
+            const float z = v + data_dt[p.dt_off + h];
+            v = (z > 20.0 ? z : log(1.0 + exp(z))) * data_aa[p.a_off + h];
+        }
+        data_d[p.d_off + which * p.d_half + lane * p.d_tok + h] = v;
+    }
+}

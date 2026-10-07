@@ -1104,9 +1104,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "KV_QUEST_MASK",
     "SIGN_SCORE",
     "MUL_MAT_MASKED",
+    "GDN_GATES",
 };
 
-static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");
+static_assert(GGML_OP_COUNT == 107, "GGML_OP_COUNT != 107");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1224,9 +1225,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "kv_quest(q)",
     "sign_score(x)",
     "mul_mat_masked(w,x)",
+    "gdn_gates(x)",
 };
 
-static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");
+static_assert(GGML_OP_COUNT == 107, "GGML_OP_COUNT != 107");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5589,6 +5591,29 @@ struct ggml_tensor * ggml_mul_mat_masked(
     result->src[0] = w;
     result->src[1] = x;
     result->src[2] = s;
+    return result;
+}
+
+// b65 GDN gates
+
+struct ggml_tensor * ggml_gdn_gates(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * wb,
+        struct ggml_tensor  * wa,
+        struct ggml_tensor  * dt,
+        struct ggml_tensor  * a) {
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && dt->type == GGML_TYPE_F32 && a->type == GGML_TYPE_F32);
+    GGML_ASSERT(wb->type == wa->type && (wb->type == GGML_TYPE_F16 || wb->type == GGML_TYPE_F32));
+    GGML_ASSERT(wb->ne[0] == x->ne[0] && ggml_are_same_shape(wb, wa) && ggml_nelements(dt) == wb->ne[1] && ggml_nelements(a) == wb->ne[1]);
+    GGML_ASSERT(x->ne[2] == 1 && x->ne[3] == 1);
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, wb->ne[1], x->ne[1], 2);
+    result->op     = GGML_OP_GDN_GATES;
+    result->src[0] = x;
+    result->src[1] = wb;
+    result->src[2] = wa;
+    result->src[3] = dt;
+    result->src[4] = a;
     return result;
 }
 

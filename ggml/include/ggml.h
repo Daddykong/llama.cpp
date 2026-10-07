@@ -605,6 +605,7 @@ extern "C" {
         GGML_OP_KV_QUEST_MASK,
         GGML_OP_SIGN_SCORE,
         GGML_OP_MUL_MAT_MASKED,
+        GGML_OP_GDN_GATES,
 
         GGML_OP_COUNT,
     };
@@ -2512,6 +2513,15 @@ extern "C" {
             struct ggml_tensor  * x,
             struct ggml_tensor  * s,
             float                 thr);
+
+    // b65: beta = sigmoid(wb x), gate = softplus(wa x + dt) * a -> [H, T, 2]
+    GGML_API struct ggml_tensor * ggml_gdn_gates(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * wb,
+            struct ggml_tensor  * wa,
+            struct ggml_tensor  * dt,
+            struct ggml_tensor  * a);
 
     GGML_API struct ggml_tensor * ggml_top_k(
             struct ggml_context * ctx,

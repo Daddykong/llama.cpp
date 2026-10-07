@@ -425,7 +425,23 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     ggml_tensor * qkv_mixed = qkvz.first;
     ggml_tensor * z         = qkvz.second;
 
-    ggml_tensor * beta = build_lora_mm(model.layers[il].ssm_beta, cur, model.layers[il].ssm_beta_s);
+    // b65: LLAMA_GDN_GATES=1 computes beta and the decay gate in one op for small steps
+    static const bool gdn_gates = getenv("LLAMA_GDN_GATES") != nullptr && atoi(getenv("LLAMA_GDN_GATES")) != 0;
+    const auto & lyr = model.layers[il];
+    ggml_tensor * beta;
+    ggml_tensor * gate;
+    if (gdn_gates && cur->ne[1] <= 8 && ggml_n_dims(cur) <= 2 && !lyr.ssm_beta_s && !lyr.ssm_alpha_s &&
+        lyr.ssm_beta->type == lyr.ssm_alpha->type && (lyr.ssm_beta->type == GGML_TYPE_F16 || lyr.ssm_beta->type == GGML_TYPE_F32) &&
+        lyr.ssm_dt->type == GGML_TYPE_F32 && lyr.ssm_a->type == GGML_TYPE_F32 &&
+        ggml_nelements(lyr.ssm_dt) == num_v_heads && ggml_nelements(lyr.ssm_a) == num_v_heads) {
+        ggml_tensor * gg = ggml_gdn_gates(ctx0, cur, lyr.ssm_beta, lyr.ssm_alpha, lyr.ssm_dt, lyr.ssm_a);
+        const int64_t T = cur->ne[1];
+        beta = ggml_reshape_4d(ctx0, ggml_view_2d(ctx0, gg, num_v_heads, T, gg->nb[1], 0), 1, num_v_heads, n_seq_tokens, n_seqs);
+        gate = ggml_reshape_3d(ctx0, ggml_view_2d(ctx0, gg, num_v_heads, T, gg->nb[1], gg->nb[2]), num_v_heads, n_seq_tokens, n_seqs);
+        cb(beta, "beta_sigmoid", il);
+        cb(gate, "gate", il);
+    } else {
+    beta = build_lora_mm(model.layers[il].ssm_beta, cur, model.layers[il].ssm_beta_s);
     beta = ggml_reshape_4d(ctx0, beta, 1, num_v_heads, n_seq_tokens, n_seqs);
     cb(beta, "beta", il);
 
@@ -440,8 +456,9 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     ggml_tensor * alpha_softplus = ggml_softplus(ctx0, alpha_biased);
     cb(alpha_softplus, "a_softplus", il);
 
-    ggml_tensor * gate = ggml_mul(ctx0, alpha_softplus, model.layers[il].ssm_a);  // -A_log.exp() * softplus
+    gate = ggml_mul(ctx0, alpha_softplus, model.layers[il].ssm_a);  // -A_log.exp() * softplus
     cb(gate, "gate", il);
+    }
 
     gate = ggml_reshape_4d(ctx0, gate, 1, num_v_heads, n_seq_tokens, n_seqs);
 

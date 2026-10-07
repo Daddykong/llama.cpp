@@ -6813,6 +6813,27 @@ struct test_argsort : public test_case {
 };
 
 // GGML_OP_TOP_K
+// b65: GGML_OP_GDN_GATES
+struct test_gdn_gates : public test_case {
+    const ggml_type wt; const int64_t E, H, T;
+    std::string vars() override { return VARS_TO_STR4(wt, E, H, T); }
+    test_gdn_gates(ggml_type wt = GGML_TYPE_F16, int64_t E = 5120, int64_t H = 48, int64_t T = 1) : wt(wt), E(E), H(H), T(T) {}
+    double max_nmse_err() override { return 1e-5; }
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, E, T);
+        ggml_tensor * wb = ggml_new_tensor_2d(ctx, wt, E, H);
+        ggml_tensor * wa = ggml_new_tensor_2d(ctx, wt, E, H);
+        ggml_tensor * dt = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, H);
+        ggml_tensor * a  = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, H);
+        return ggml_gdn_gates(ctx, x, wb, wa, dt, a);
+    }
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t, -0.05f, 0.05f);
+        }
+    }
+};
+
 // b65: GGML_OP_SIGN_SCORE
 struct test_sign_score : public test_case {
     const int64_t E, F, T;
@@ -9440,6 +9461,10 @@ struct test_b65_gate_mul : public test_case {
 };
 
 static void add_b65_sparse_t_cases(std::vector<std::unique_ptr<test_case>> & test_cases) {
+    for (int64_t t : {1, 3, 8}) {
+        test_cases.emplace_back(new test_gdn_gates(GGML_TYPE_F16, 5120, 48, t));
+        test_cases.emplace_back(new test_gdn_gates(GGML_TYPE_F32, 1024, 16, t));
+    }
     test_cases.emplace_back(new test_b65_gate_mul(256, 24, 1));
     test_cases.emplace_back(new test_b65_gate_mul(256, 24, 3));
     test_cases.emplace_back(new test_b65_gate_mul(256, 24, 512));
