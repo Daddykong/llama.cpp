@@ -14577,6 +14577,36 @@ static bool ggml_backend_vk_cpy_tensor_async(ggml_backend_t backend_src, ggml_ba
     return false;
 }
 
+// b65: GGML_VK_GRAPH_TIMER=1 -- one stderr line per graph once its fence has signalled:
+//   ntok (columns of the first MUL_MAT), nodes, gap_us (previous graph's sync -> this graph_compute entry, GPU idle),
+//   rec_us (graph_compute entry -> return), sub_us (entry -> first submit), wait_us (return -> sync done),
+//   gpu_us (GPU span: first command of the graph -> last command, from two timestamp queries)
+static bool ggml_vk_graph_timer_enabled() {
+    static const bool on = getenv("GGML_VK_GRAPH_TIMER") != nullptr && !vk_perf_logger_enabled;
+    return on;
+}
+
+static std::atomic<int64_t> vk_gt_t_prev_sync {0};  // across all backend contexts (target + draft)
+
+static void ggml_vk_graph_timer_report(ggml_backend_vk_context * ctx) {
+    if (!ctx->gt_pending) {
+        return;
+    }
+    ctx->gt_pending = false;
+    uint64_t ts[2] = {0, 0};
+    const vk::Result r = ctx->device->device.getQueryPoolResults(ctx->gt_pool, 0, 2, sizeof(ts), ts, sizeof(uint64_t),
+                                                                 vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWait);
+    const int64_t t_sync = ggml_time_us();
+    const double gpu_us = r == vk::Result::eSuccess ? double(ts[1] - ts[0]) * ctx->device->properties.limits.timestampPeriod / 1000.0 : -1.0;
+    fprintf(stderr, "VKGT t=%lld ntok=%d nodes=%d gap_us=%lld rec_us=%lld sub_us=%lld wait_us=%lld gpu_us=%.1f\n",
+            (long long) ctx->gt_t_entry, ctx->gt_ntok, ctx->gt_nodes,
+            (long long) (ctx->gt_t_prev_sync > 0 ? ctx->gt_t_entry - ctx->gt_t_prev_sync : -1),  // prev sync seen at entry
+            (long long) (ctx->gt_t_exit - ctx->gt_t_entry),
+            (long long) (ctx->gt_t_first_submit > 0 ? ctx->gt_t_first_submit - ctx->gt_t_entry : -1),
+            (long long) (t_sync - ctx->gt_t_exit), gpu_us);
+    vk_gt_t_prev_sync = t_sync;
+}
+
 void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
     VK_LOG_DEBUG("ggml_vk_synchronize()");
 
@@ -14645,6 +14675,10 @@ void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
             memcpy(cpy.dst, cpy.src, cpy.n);
         }
         ctx->compute_ctx.reset();
+    }
+
+    if (ctx->gt_pending) {
+        ggml_vk_graph_timer_report(ctx);
     }
 }
 
@@ -15620,6 +15654,34 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ggml_vk_sync_buffers(ctx, compute_ctx);
     }
 
+    const bool graph_timer = ggml_vk_graph_timer_enabled();
+    if (graph_timer) {
+        if (ctx->gt_pending) {
+            // previous graph never synchronized: drop its line rather than block here
+            ctx->gt_pending = false;
+        }
+        ctx->gt_t_entry = ggml_time_us();
+        ctx->gt_t_prev_sync = vk_gt_t_prev_sync;
+        ctx->gt_t_first_submit = 0;
+        ctx->gt_nodes = cgraph->n_nodes;
+        ctx->gt_ntok = 0;
+        for (int i = 0; i < cgraph->n_nodes; i++) {
+            if (cgraph->nodes[i]->op == GGML_OP_MUL_MAT) {
+                ctx->gt_ntok = (int) cgraph->nodes[i]->src[1]->ne[1];
+                break;
+            }
+        }
+        if (!ctx->gt_pool) {
+            vk::QueryPoolCreateInfo qci;
+            qci.queryType = vk::QueryType::eTimestamp;
+            qci.queryCount = 2;
+            ctx->gt_pool = ctx->device->device.createQueryPool(qci);
+        }
+        ctx->device->device.resetQueryPool(ctx->gt_pool, 0, 2);
+        compute_ctx = ggml_vk_get_compute_ctx(ctx);
+        compute_ctx->s->buffer->buf.writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe, ctx->gt_pool, 0);
+    }
+
     ctx->prealloc_y_last_pipeline_used = nullptr;
     ctx->prealloc_y_last_tensor_used = nullptr;
     ctx->prealloc_y_last_k_padded = false;
@@ -15672,6 +15734,9 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             ctx->device->diag_cgraph = cgraph;
             ctx->device->diag_prev_start = start;
             ctx->device->diag_prev_end = end;
+        }
+        if (graph_timer && ctx->gt_t_first_submit == 0) {
+            ctx->gt_t_first_submit = ggml_time_us();
         }
         first_node_in_batch = true;
         submitted_nodes = 0;
@@ -16062,6 +16127,14 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             }
         }
         ctx->perf_logger->print_timings();
+    }
+
+    if (graph_timer) {
+        // recorded into a fresh compute context that synchronize() submits (with any output copies)
+        compute_ctx = ggml_vk_get_compute_ctx(ctx);
+        compute_ctx->s->buffer->buf.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, ctx->gt_pool, 1);
+        ctx->gt_t_exit = ggml_time_us();
+        ctx->gt_pending = true;
     }
 
     if (!ctx->device->support_async) {

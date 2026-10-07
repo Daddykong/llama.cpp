@@ -1409,6 +1409,16 @@ struct ggml_backend_vk_context {
     std::vector<int> query_node_idx;
     int32_t num_queries {};
     int32_t query_idx {};
+
+    // b65: GGML_VK_GRAPH_TIMER=1 (one line per graph: CPU gaps + GPU span from two timestamps)
+    vk::QueryPool gt_pool;
+    bool gt_pending {};
+    int gt_nodes {};
+    int gt_ntok {};
+    int64_t gt_t_entry {};
+    int64_t gt_t_first_submit {};
+    int64_t gt_t_exit {};
+    int64_t gt_t_prev_sync {};
 };
 
 struct ggml_backend_vk_buffer_context {

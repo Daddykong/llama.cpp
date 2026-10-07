@@ -84,6 +84,14 @@ static const llm_fused_op_probe llm_fused_op_dsv4_hc_post_probe = {
     /*.n_tokens_per_seq =*/ 1,
 };
 
+// b65: LLAMA_B65_TRACE=1 -- phase timestamps on stderr ("B65T <label> t=<us> a=<arg>"), same clock as GGML_VK_GRAPH_TIMER
+static inline void b65_trace(const char * label, long a = -1) {
+    static const bool on = getenv("LLAMA_B65_TRACE") != nullptr;
+    if (on) {
+        fprintf(stderr, "B65T %s t=%lld a=%ld\n", label, (long long) ggml_time_us(), a);
+    }
+}
+
 llama_context::llama_context(
         const llama_model & model,
               llama_context_params params) :
@@ -776,7 +784,13 @@ void llama_context::synchronize() {
         return;
     }
 
+    if (n_queued_tokens > 0) {
+        b65_trace("sync0", (long) n_queued_tokens);
+    }
     ggml_backend_sched_synchronize(sched.get());
+    if (n_queued_tokens > 0) {
+        b65_trace("sync1");
+    }
 
     // FIXME: if multiple single tokens are evaluated without a synchronization,
     // the stats will be added to the prompt evaluation stats
@@ -1425,7 +1439,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
 
         n_reused++;
+        b65_trace("pu_reuse");
     } else {
+        b65_trace("pu_build0");
         gf_res_prev_active = nullptr;
         res->reset();
 
@@ -1451,6 +1467,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
 
         gf_res_prev_active = res;
+        b65_trace("pu_build1", gf ? ggml_graph_n_nodes(gf) : -1);
     }
 
     // set the input data for the input tensors
@@ -1463,7 +1480,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
+    b65_trace("pu_inputs");
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    b65_trace("pu_compute");
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -1715,6 +1734,7 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
 }
 
 int llama_context::decode(const llama_batch_ext & batch_inp) {
+    b65_trace("dec0", (long) batch_inp.tokens.size());
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
         return encode(batch_inp);
@@ -1815,6 +1835,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     llama_memory_context_ptr mctx;
 
+    b65_trace("dec_mem0");
     while (true) {
         mctx = memory->init_batch(*balloc, cparams.n_ubatch, output_all);
         if (!mctx) {
@@ -1858,6 +1879,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         break;
     }
 
+    b65_trace("dec_mem1");
     // reserve output buffer
     if (output_reserve(n_outputs_all) < n_outputs_all) {
         LLAMA_LOG_ERROR("%s: could not reserve space for batch with %d outputs\n", __func__, n_outputs_all);
@@ -2111,6 +2133,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     // wait for the computation to finish (automatically done when obtaining the model output)
     //synchronize();
 
+    b65_trace("dec1");
     return 0;
 }
 

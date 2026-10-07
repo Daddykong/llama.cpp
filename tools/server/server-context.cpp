@@ -898,6 +898,14 @@ struct server_slot {
 
 // returns 0 on success
 // caller need to update prompt.tokens after a successful call to keep track of the processing progress
+// b65: LLAMA_B65_TRACE=1 -- phase timestamps on stderr ("B65T <label> t=<us> a=<arg>"), same clock as GGML_VK_GRAPH_TIMER
+static inline void b65_trace(const char * label, long a = -1) {
+    static const bool on = getenv("LLAMA_B65_TRACE") != nullptr;
+    if (on) {
+        fprintf(stderr, "B65T %s t=%lld a=%ld\n", label, (long long) ggml_time_us(), a);
+    }
+}
+
 // note: this is not a member of server_slot because we want to run it inside yield_to_queue
 //       slot is passed as const to avoid accidental modification of the slot state
 //       some pointers are allowed to be used, they are not used by to_json()
@@ -3094,6 +3102,7 @@ private:
 #endif
 
     void update_slots() {
+        b65_trace("srv_upd0");
 #ifdef DEBUG_TIMINGS
         static int64_t t_prev = 0;
         int64_t t_start = ggml_time_us();
@@ -3351,9 +3360,13 @@ private:
 
         // generate the actual drafts (if any)
         if (!drafting.empty()) {
+            b65_trace("srv_draft0");
             queue_tasks.yield_to_queue([&]() {
+                b65_trace("srv_draft_in");
                 common_speculative_draft(spec.get());
+                b65_trace("srv_draft_out");
             });
+            b65_trace("srv_draft1");
         }
 
         // make checkpoints if needed
@@ -4039,12 +4052,14 @@ private:
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
+        b65_trace("srv_dec0", batch.view.size());
         queue_tasks.yield_to_queue([&]() {
             ret = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);
             }
         });
+        b65_trace("srv_dec1");
 
         if (ret != 0) {
             {
@@ -4104,9 +4119,11 @@ private:
         //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
         if (spec) {
             bool ok = true;
+            b65_trace("srv_proc0");
             queue_tasks.yield_to_queue([&]() {
                 ok = common_speculative_process(spec.get(), batch.view);
             });
+            b65_trace("srv_proc1");
 
             if (!ok) {
                 SRV_ERR("%s", "failed to process speculative batch\n");
@@ -4278,6 +4295,7 @@ private:
 
             // verify and try to accept the draft
             {
+                b65_trace("srv_acc0");
                 common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
 
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
@@ -4301,6 +4319,7 @@ private:
                     accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
                 }
                 slot.spec_i_batch.clear();
+                b65_trace("srv_acc1", (long) accepted.size());
 
                 GGML_ASSERT(accepted.size() >= 1);
 
