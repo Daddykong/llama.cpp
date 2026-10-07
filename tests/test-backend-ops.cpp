@@ -9456,6 +9456,24 @@ struct test_b65_sm_mm : public test_case {
     }
 };
 
+// b65: K x Q on one layer of a quantized K cache with flash attention off: K is a view of a [kv_heads*d, n_kv] cache
+// (row stride = all heads, channel stride = one head), Q is permuted like the model's
+struct test_b65_kq_quant : public test_case {
+    const ggml_type type;
+    const int64_t d, heads, heads_kv, n_kv, n_tok;
+    std::string vars() override { return VARS_TO_STR6(type, d, heads, heads_kv, n_kv, n_tok); }
+    test_b65_kq_quant(ggml_type type, int64_t d, int64_t heads, int64_t heads_kv, int64_t n_kv, int64_t n_tok)
+        : type(type), d(d), heads(heads), heads_kv(heads_kv), n_kv(n_kv), n_tok(n_tok) {}
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "B65_KQ_QUANT"; }
+    double max_nmse_err() override { return 5e-4; }
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * cache = ggml_new_tensor_2d(ctx, type, d * heads_kv, n_kv);
+        ggml_tensor * k = ggml_view_3d(ctx, cache, d, n_kv, heads_kv, cache->nb[1], ggml_row_size(type, d), 0);
+        ggml_tensor * q = ggml_permute(ctx, ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d, heads, n_tok), 0, 2, 1, 3);
+        return ggml_mul_mat(ctx, k, q);
+    }
+};
+
 // b65: sigmoid of a strided view times a same-shaped tensor (the qwen35 attention gate, LLAMA_GATE_NOCONT=1)
 struct test_b65_gate_mul : public test_case {
     const int64_t d, h, t;
@@ -9490,6 +9508,13 @@ static void add_b65_sparse_t_cases(std::vector<std::unique_ptr<test_case>> & tes
     test_cases.emplace_back(new test_b65_sm_mm(512, 64, 128, 8, 2, true));
     test_cases.emplace_back(new test_b65_sm_mm(1000, 100, 128, 6, 1, true));
     test_cases.emplace_back(new test_b65_sm_mm(4096, 512, 256, 24, 4, true));
+    // b65: quantized K cache, FA off (Qwen3.8-27B: d 256, 24 heads on 4 KV heads)
+    for (ggml_type kt : { GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_IQ4_NL }) {
+        for (int64_t n_tok : { 1, 2, 4, 7, 32, 512 }) {
+            test_cases.emplace_back(new test_b65_kq_quant(kt, 256, 24, 4, 4096, n_tok));
+        }
+        test_cases.emplace_back(new test_b65_kq_quant(kt, 128, 8, 2, 1000, 3));
+    }
     // f32 mask: flash attention off, as the live model runs
     test_cases.emplace_back(new test_b65_sm_mm(512, 64, 128, 8, 2, false, GGML_TYPE_F32));
     test_cases.emplace_back(new test_b65_sm_mm(1000, 100, 128, 6, 1, false, GGML_TYPE_F32));

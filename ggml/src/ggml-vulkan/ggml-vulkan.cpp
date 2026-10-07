@@ -6319,6 +6319,25 @@ bool ggml_vk_dim01_contiguous(const ggml_tensor * tensor) {
         (tensor->ne[3] == 1 || tensor->nb[3] == tensor->nb[2]*tensor->ne[2]);
 }
 
+// b65: a quantized A (32-element block types) whose rows are packed blocks but whose row / channel strides are not
+// the dense ones, e.g. one KV head of a quantized K cache (row stride = all heads, channel stride = one head). The
+// matmul shaders read it in place with stride_a / batch_stride_a; without this the op ran on the CPU.
+static bool ggml_vk_quant_strided_ok(const ggml_tensor * t) {
+    switch (t->type) {
+        case GGML_TYPE_Q8_0: case GGML_TYPE_Q4_0: case GGML_TYPE_Q4_1: case GGML_TYPE_Q5_0: case GGML_TYPE_Q5_1:
+        case GGML_TYPE_IQ4_NL:
+            break;
+        default:
+            return false;
+    }
+    if (ggml_vk_dim01_contiguous(t)) {
+        return false;
+    }
+    const size_t ts = ggml_type_size(t->type);
+    return t->nb[0] == ts && t->ne[0] % 32 == 0 && t->nb[1] % ts == 0 && t->nb[2] % ts == 0 && t->ne[3] == 1 &&
+           t->nb[1] / ts * 32 <= UINT32_MAX && t->nb[2] / ts * 32 <= UINT32_MAX;
+}
+
 // Batch stride in elements of a tensor read in place.
 static uint32_t ggml_vk_batch_stride(const ggml_tensor * tensor) {
     return (uint32_t)(tensor->nb[2] / ggml_type_size(tensor->type) * ggml_blck_size(tensor->type));
@@ -6673,7 +6692,8 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     std::cerr << "), (" << src1 << ", name=" << src1->name << ", type=" << ggml_type_name(src1->type) << ", ne0=" << src1->ne[0] << ", ne1=" << src1->ne[1] << ", ne2=" << src1->ne[2] << ", ne3=" << src1->ne[3] << ", nb0=" << src1->nb[0] << ", nb1=" << src1->nb[1] << ", nb2=" << src1->nb[2] << ", nb3=" << src1->nb[3];
     std::cerr << "), (" << dst << ", name=" << dst->name << ", type=" << ggml_type_name(dst->type) << ", ne0=" << dst->ne[0] << ", ne1=" << dst->ne[1] << ", ne2=" << dst->ne[2] << ", ne3=" << dst->ne[3] << ", nb0=" << dst->nb[0] << ", nb1=" << dst->nb[1] << ", nb2=" << dst->nb[2] << ", nb3=" << dst->nb[3];
     std::cerr << "))");
-    GGML_ASSERT(ggml_vk_dim01_contiguous(src0) || src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16);  // NOLINT
+    GGML_ASSERT(ggml_vk_dim01_contiguous(src0) || src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16 ||
+                ggml_vk_quant_strided_ok(src0));  // NOLINT (b65: strided quantized A)
     GGML_ASSERT(ggml_vk_dim01_contiguous(src1) || src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16);  // NOLINT
 
     const uint64_t ne00 = src0->ne[0];
@@ -6714,8 +6734,9 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
 
     // TODO: Clean up this logic to pick src1 type by capability
     // Reformat and convert to fp16 if non-contiguous, or for coopmat2 for better perf
-    const bool x_non_contig = (ctx->device->coopmat2 && src0->type == GGML_TYPE_F32) ||
-                              !ggml_vk_dim01_contiguous(src0);
+    const bool x_strided = ggml_vk_quant_strided_ok(src0);   // b65: read in place with its strides
+    const bool x_non_contig = ((ctx->device->coopmat2 && src0->type == GGML_TYPE_F32) ||
+                              !ggml_vk_dim01_contiguous(src0)) && !x_strided;
     // If src0 is BF16, try to use a BF16 x BF16 multiply
     ggml_type f16_type = src0->type == GGML_TYPE_BF16 ? GGML_TYPE_BF16 : GGML_TYPE_F16;
 
@@ -6935,6 +6956,12 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     if (!ggml_vk_dim01_contiguous(src0) && !qx_needs_dequant) {
         stride_batch_x = src0->nb[0] / ggml_type_size(src0->type);
     }
+    // b65: strided quantized A read in place: row and channel strides in elements
+    GGML_ASSERT(!x_strided || !qx_needs_dequant);
+    const uint32_t stride_a = x_strided ? (uint32_t)(src0->nb[1] / ggml_type_size(src0->type) * ggml_blck_size(src0->type)) : (uint32_t)ne10;
+    if (x_strided) {
+        stride_batch_x = (uint32_t)(src0->nb[2] / ggml_type_size(src0->type) * ggml_blck_size(src0->type));
+    }
 
     if (!ggml_vk_dim01_contiguous(src1) && !qy_needs_dequant && !quantize_y) {
         stride_batch_y = src1->nb[0] / ggml_type_size(src1->type);
@@ -6946,7 +6973,7 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
         { d_X, x_buf_offset, x_range }, { d_Y, y_buf_offset, y_range },
         ggml_vk_subbuffer(ctx, d_D, d_buf_offset), { ctx->prealloc_split_k, 0, d_sz * split_k },
         ne01, ne11, ne10,
-        ne10, ne10, stride_d, stride_batch_x, stride_batch_y, stride_batch_d,
+        stride_a, ne10, stride_d, stride_batch_x, stride_batch_y, stride_batch_d,
         split_k, ne12*ne13, ne02, ne12, r2, r3, padded_n,
         ctx->sm_fuse_on ? &ctx->sm_fuse_mask : nullptr, ctx->sm_fuse_on ? &ctx->sm_fuse_stats : nullptr
     );  // NOLINT
@@ -7960,6 +7987,9 @@ void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, const st
         ggml_vk_fwht(ctx, subctx, src1, dst);
     } else if (ggml_vk_mul_mat_vec_gqa_ok(ctx, src0, src1, dst)) {
         ggml_vk_mul_mat_vec_gqa_f16_f32(ctx, subctx, cgraph, node_idx);
+    } else if (ggml_vk_quant_strided_ok(src0)) {
+        // b65: strided quantized A (quantized K cache, FA off): matmul reads it in place
+        ggml_vk_mul_mat_q_f16(ctx, subctx, src0, src1, dst, false);
     } else if (src0->type == GGML_TYPE_F16 && ggml_is_permuted(src0) && ggml_is_permuted(src1) && dst->ne[1] <= 4 &&
         // detect 0213 permutation, and up to 4 tokens (e.g. a speculative-decoding verify batch)
         src0->nb[0] <= src0->nb[2] &&
@@ -16898,7 +16928,8 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 if (a->ne[3] != b->ne[3]) {
                     return false;
                 }
-                if (!(ggml_vk_dim01_contiguous(op->src[0]) || op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16 || op->src[0]->type == GGML_TYPE_BF16) ||
+                if (!(ggml_vk_dim01_contiguous(op->src[0]) || op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16 || op->src[0]->type == GGML_TYPE_BF16 ||
+                      (op->op == GGML_OP_MUL_MAT && ggml_vk_quant_strided_ok(op->src[0]))) ||   // b65
                     !(ggml_vk_dim01_contiguous(op->src[1]) || op->src[1]->type == GGML_TYPE_F32 || op->src[1]->type == GGML_TYPE_F16)) {
                     return false;
                 }
