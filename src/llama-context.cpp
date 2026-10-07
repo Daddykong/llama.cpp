@@ -4553,9 +4553,16 @@ bool llama_b65_seq_range_load(struct llama_context * ctx, llama_seq_id seq_id, c
     try {
         llama_file file(path, "rb");
         llama_io_read_file io(&file);
+        // b65: without the range flag, state_read() first removes the whole sequence (a full-sequence restore),
+        //      which left only the restored range in the conversation
+        kv->b65_set_range_read(true);
         kv->state_read(io, seq_id, 0);
+        kv->b65_set_range_read(false);
+        kv->b65_set_pos_filter(-1, -1);
         return true;
     } catch (const std::exception & e) {
+        kv->b65_set_range_read(false);
+        kv->b65_set_pos_filter(-1, -1);
         LLAMA_LOG_ERROR("%s: %s\n", __func__, e.what());
         return false;
     }

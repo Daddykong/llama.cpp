@@ -343,9 +343,11 @@ private:
 public:
     bool sparse_park(llama_seq_id seq_id, bool park);   // b65
     void b65_set_pos_filter(llama_pos p0, llama_pos p1) const { b65_p0 = p0; b65_p1 = p1; }   // b65: state_write filter
+    void b65_set_range_read(bool on) { b65_range_read = on; }   // b65: state_read replaces only the saved positions
 private:
     mutable llama_pos b65_p0 = -1;
     mutable llama_pos b65_p1 = -1;
+    bool b65_range_read = false;
 
     // model layer id -> KV cache layer id
     std::unordered_map<int32_t, int32_t> map_layer_ids;

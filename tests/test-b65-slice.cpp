@@ -1,12 +1,15 @@
-// b65: attention-KV range round trip. usage: test-b65-slice <model.gguf> [n_prompt=2048]
+// b65: attention-KV range round trip. usage: test-b65-slice <model.gguf> [n_prompt=2048] [n_gpu_layers=99] [fa=on|off|auto]
+// fa=off also covers the transposed V cache (the llama-server runs of X33 use -fa off)
 // Works for hybrid models (recurrent state cannot be rolled back): the prompt is decoded once into seq 0 and copied to
 // seq 1 and seq 2 before anything else. ref = next-token logits on seq 0. seq 1: save + drop positions [n/4, 3n/4)
-// of the attention cache, logits must change. seq 2: save + drop + load back, logits must match ref.
+// of the attention cache, logits must change. seq 2: save + drop + load back, logits must match ref. seq 2 keeps the
+// first 16 positions of the range (like llama-server's kept turn heads): the load must replace them, not duplicate them.
 #include "llama.h"
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <string>
 #include <vector>
 
 static std::vector<float> eval_one(llama_context * ctx, llama_token tok, llama_pos pos, llama_seq_id seq, int n_vocab) {
@@ -29,15 +32,19 @@ static double max_diff(const std::vector<float> & a, const std::vector<float> & 
 }
 
 int main(int argc, char ** argv) {
-    if (argc < 2) { printf("usage: %s model.gguf [n_prompt]\n", argv[0]); return 2; }
+    if (argc < 2) { printf("usage: %s model.gguf [n_prompt] [n_gpu_layers] [fa=on|off|auto]\n", argv[0]); return 2; }
     const int n = argc > 2 ? atoi(argv[2]) : 2048;
     llama_backend_init();
     llama_model_params mp = llama_model_default_params();
-    mp.n_gpu_layers = 99;
+    mp.n_gpu_layers = argc > 3 ? atoi(argv[3]) : 99;   // partial offload on smaller cards
     llama_model * model = llama_model_load_from_file(argv[1], mp);
     if (!model) { printf("SLICE_FAIL load\n"); return 1; }
     llama_context_params cp = llama_context_default_params();
     cp.n_ctx = 3 * (n + 64); cp.n_batch = 512; cp.n_ubatch = 512; cp.n_seq_max = 3; cp.kv_unified = true;
+    if (argc > 4) {
+        const std::string fa = argv[4];
+        cp.flash_attn_type = fa == "on" ? LLAMA_FLASH_ATTN_TYPE_ENABLED : fa == "off" ? LLAMA_FLASH_ATTN_TYPE_DISABLED : LLAMA_FLASH_ATTN_TYPE_AUTO;
+    }
     llama_context * ctx = llama_init_from_model(model, cp);
     if (!ctx) { printf("SLICE_FAIL context\n"); return 1; }
     const llama_vocab * vocab = llama_model_get_vocab(model);
@@ -61,7 +68,7 @@ int main(int argc, char ** argv) {
     const bool d1 = llama_b65_seq_range_drop(ctx, 1, p0, p1);
     std::vector<float> holed = eval_one(ctx, toks[n - 1], n - 1, 1, n_vocab);
     const size_t b2 = llama_b65_seq_range_save(ctx, 2, p0, p1, "/tmp/b65-slice-2.kv");
-    const bool d2 = llama_b65_seq_range_drop(ctx, 2, p0, p1);
+    const bool d2 = llama_b65_seq_range_drop(ctx, 2, p0 + 16, p1);
     const bool l2 = llama_b65_seq_range_load(ctx, 2, "/tmp/b65-slice-2.kv");
     std::vector<float> back = eval_one(ctx, toks[n - 1], n - 1, 2, n_vocab);
     const double d_hole = max_diff(ref, holed), d_back = max_diff(ref, back);

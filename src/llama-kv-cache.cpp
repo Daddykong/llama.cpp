@@ -2589,7 +2589,11 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
             return false;
         }
 
-        seq_rm(dest_seq_id, -1, -1);
+        // b65: a range restore (llama_b65_seq_range_load) keeps the rest of the sequence - only the saved positions
+        //      are removed, below, once they have been read
+        if (!b65_range_read) {
+            seq_rm(dest_seq_id, -1, -1);
+        }
 
         llama_batch_allocr balloc(hparams.n_pos_per_embd());
 
@@ -2639,6 +2643,20 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
             ubatch.pos[i]      = pos;
             ubatch.n_seq_id[i] = n_seq_id;
             ubatch.seq_id[i]   = &dest_seq_id;
+        }
+
+        if (b65_range_read && cell_count > 0) {
+            // b65: free what the sequence still holds in the saved range (kept turn heads, a summary) before
+            //      find_slot(); the failure path (state_clear) removes this same range only
+            llama_pos pmin = ubatch.pos[0];
+            llama_pos pmax = ubatch.pos[0];
+            for (uint32_t i = 1; i < cell_count; ++i) {
+                pmin = std::min(pmin, ubatch.pos[i]);
+                pmax = std::max(pmax, ubatch.pos[i]);
+            }
+            b65_p0 = pmin;
+            b65_p1 = pmax + 1;
+            seq_rm(dest_seq_id, b65_p0, b65_p1);
         }
 
         if (sinfo_in) {
@@ -2947,7 +2965,14 @@ void llama_kv_cache::state_clear(llama_seq_id seq_id, uint32_t strm, const slot_
         return;
     }
 
-    seq_rm(seq_id, -1, -1);
+    // b65: a failed range restore drops only that range, not the whole sequence
+    if (b65_range_read) {
+        if (b65_p0 >= 0) {
+            seq_rm(seq_id, b65_p0, b65_p1);
+        }
+    } else {
+        seq_rm(seq_id, -1, -1);
+    }
 
     // zero the K/V data of the failed restore attempt - the attention can still read the data of free cells
     if (sinfo.empty() || sinfo.size() == 0) {

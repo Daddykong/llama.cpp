@@ -1715,11 +1715,17 @@ struct llama_context_params common_context_params_to_llama(const common_params &
 
     cparams.n_ctx             = params.n_ctx;
     cparams.n_seq_max         = params.n_parallel;
-    if (getenv("LLAMA_SWAP_SUMMARY") && atoi(getenv("LLAMA_SWAP_SUMMARY"))) {
+    const bool b65_swap_summary = getenv("LLAMA_SWAP_SUMMARY") && atoi(getenv("LLAMA_SWAP_SUMMARY"));
+    if (b65_swap_summary) {
         cparams.n_seq_max += 1;   // b65: spare sequence for turn summaries (llama-server)
     }
     cparams.n_rs_seq          = params.speculative.need_n_rs_seq();
     cparams.n_outputs_max     = std::max(params.n_outputs_max, 0);
+    if (b65_swap_summary && cparams.n_outputs_max > 0) {
+        // b65: the spare sequence needs an output row too - llama-server sizes n_outputs_max from n_parallel and
+        //      output_reserve() reserves at least one row per sequence (asserts n_seq_max <= n_outputs_max)
+        cparams.n_outputs_max += 1;
+    }
     cparams.n_outputs_max_per_seq = std::max(params.n_outputs_max_per_seq, 0);
     cparams.n_batch           = params.n_batch;
     cparams.n_ubatch          = params.n_ubatch;
