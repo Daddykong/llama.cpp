@@ -1111,6 +1111,7 @@ struct vk_buffer_struct {
     bool sparse = false;
     uint64_t sparse_page = 0;
     std::vector<sparse_alloc> sparse_allocs;
+    std::vector<uint8_t> sparse_bound;   // per page: bound to some allocation
 
     ~vk_buffer_struct() {
         if (sparse) {

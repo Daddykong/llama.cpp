@@ -320,6 +320,12 @@ private:
 
     std::vector<kv_layer> layers;
 
+    // b65: sparse KV (LLAMA_KV_SPARSE=1): cells [0, sparse_cells) of every stream hold memory
+    bool sparse = false;
+    uint32_t sparse_cells = 0;
+    size_t sparse_vram = 0;
+    void sparse_ensure(uint32_t n_cells);
+
     // model layer id -> KV cache layer id
     std::unordered_map<int32_t, int32_t> map_layer_ids;
 

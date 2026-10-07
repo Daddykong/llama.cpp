@@ -1,4 +1,5 @@
 #include "llama-model.h"
+#include "llama-b65-place.h"
 
 #include "llama-arch.h"
 #include "llama-ext.h"
@@ -1499,6 +1500,105 @@ void llama_model_base::load_vocab(llama_model_loader & ml) {
     vocab.load(ml, kv);
 }
 
+// ---- b65: movable weight placement ----
+typedef int  (*b65_commit_fn)(ggml_backend_buffer_t, const size_t *, const size_t *, int, int);
+typedef bool (*b65_move_fn)(ggml_backend_buffer_t, int, int);
+
+static void * b65_vk_proc(ggml_backend_buffer_t buf, const char * name) {
+    ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(buf));
+    ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+    return reg ? ggml_backend_reg_get_proc_address(reg, name) : nullptr;
+}
+
+b65_place & b65_place_get() {
+    static b65_place p;
+    return p;
+}
+
+size_t b65_place::vram_weights() const {
+    size_t s = vram_fixed;
+    for (const auto & e : ffn) {
+        if (e.where == 0) s += e.bytes;
+    }
+    return s;
+}
+
+size_t b65_place::evict(size_t need) {
+    std::vector<b65_place_entry *> cand;
+    for (auto & e : ffn) {
+        if (e.where == 0) cand.push_back(&e);
+    }
+    std::sort(cand.begin(), cand.end(), [](const b65_place_entry * a, const b65_place_entry * b) { return a->prio > b->prio; });
+    size_t freed = 0;
+    bool synced = false;
+    for (auto * e : cand) {
+        if (freed >= need) break;
+        static b65_move_fn move = nullptr;
+        if (!move) move = (b65_move_fn) b65_vk_proc(e->buf, "ggml_backend_vk_sparse_move");
+        if (!move) break;
+        if (!synced && sync) { sync(); synced = true; }
+        if (move(e->buf, e->handle, 1)) {
+            e->where = 1;
+            freed += e->bytes;
+            LLAMA_LOG_INFO("%s: FFN of layer %d moved to system RAM (%.0f MB) to make room for the KV cache\n", __func__, e->il, e->bytes / 1e6);
+        }
+    }
+    return freed;
+}
+
+// commit a freshly allocated sparse weight buffer: non-FFN in VRAM, FFN per layer in keep order within the budget
+static void b65_place_commit(ggml_context * ctx, ggml_backend_buffer_t buf) {
+    auto commit = (b65_commit_fn) b65_vk_proc(buf, "ggml_backend_vk_sparse_commit");
+    if (!commit) {
+        return;
+    }
+    b65_place & pl = b65_place_get();
+    if (const char * b = getenv("LLAMA_VRAM_BUDGET_MB")) pl.budget_mb = atof(b);
+    char * base = (char *) ggml_backend_buffer_get_base(buf);
+    std::vector<size_t> bo, bs;
+    std::map<int, std::pair<std::vector<size_t>, std::vector<size_t>>> lay;
+    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+        const size_t off = (size_t) ((char *) t->data - base), sz = ggml_nbytes(t);
+        int il = -1;
+        if (strncmp(t->name, "blk.", 4) == 0 && strstr(t->name, ".ffn_")) il = atoi(t->name + 4);
+        if (il >= 0) { lay[il].first.push_back(off); lay[il].second.push_back(sz); }
+        else { bo.push_back(off); bs.push_back(sz); }
+    }
+    size_t fixed = 0;
+    for (size_t z : bs) fixed += z;
+    if (!bo.empty()) {
+        int h = commit(buf, bo.data(), bs.data(), (int) bo.size(), 0);
+        if (h < 0) h = commit(buf, bo.data(), bs.data(), (int) bo.size(), 1);
+        else pl.vram_fixed += fixed;
+        if (h < 0) throw std::runtime_error("b65: could not commit the non-FFN weights");
+    }
+    if (lay.empty()) {
+        return;
+    }
+    const int n = lay.rbegin()->first + 1;
+    std::vector<int> order;
+    for (int i = 0; i < 3 && i < n; ++i) order.push_back(i);
+    for (int i = n - 1; i >= n - 3 && i >= 3; --i) order.push_back(i);
+    for (int i = 3; i < n - 3; ++i) order.push_back(i);
+    double left = pl.budget_mb > 0 ? pl.budget_mb * 1e6 - (double) pl.vram_weights() : 1e300;
+    int n_vram = 0;
+    size_t ram = 0;
+    for (int p = 0; p < (int) order.size(); ++p) {
+        auto it = lay.find(order[p]);
+        if (it == lay.end()) continue;
+        size_t bytes = 0;
+        for (size_t z : it->second.second) bytes += z;
+        int where = (double) bytes <= left ? 0 : 1;
+        int h = commit(buf, it->second.first.data(), it->second.second.data(), (int) it->second.first.size(), where);
+        if (h < 0 && where == 0) { where = 1; h = commit(buf, it->second.first.data(), it->second.second.data(), (int) it->second.first.size(), 1); }
+        if (h < 0) throw std::runtime_error("b65: could not commit FFN weights");
+        if (where == 0) { left -= (double) bytes; ++n_vram; } else { ram += bytes; }
+        pl.ffn.push_back({ order[p], buf, h, bytes, where, p });
+    }
+    LLAMA_LOG_INFO("%s: movable weights: non-FFN %.0f MB in VRAM, FFN layers %d in VRAM, %d in system RAM (%.0f MB)\n",
+            __func__, fixed / 1e6, n_vram, (int) lay.size() - n_vram, ram / 1e6);
+}
+
 bool llama_model_base::load_tensors(llama_model_loader & ml) {
     const auto & split_mode   = params.split_mode;
     const bool use_mlock      = params.load_mode == LLAMA_LOAD_MODE_MLOCK || params.load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK;
@@ -1822,9 +1922,24 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     const size_t n_max_backend_buffer = ml.ctx_map.size() * ml.files.size();
     pimpl->ctxs_bufs.reserve(n_max_backend_buffer);
 
+    static const bool w_sparse = getenv("LLAMA_W_SPARSE") != nullptr && atoi(getenv("LLAMA_W_SPARSE")) != 0;   // b65
     for (auto & [ctx_key, ctx_ptr] : ml.ctx_map) {
         ggml_backend_buffer_type_t buft = ctx_key.buft;
         ggml_context * ctx = ctx_ptr.get();
+        bool b65_sparse_ctx = false;
+        if (w_sparse && !ml.no_alloc) {   // b65: device weights into the Vulkan sparse buffer type
+            ggml_backend_dev_t wdev = ggml_backend_buft_get_device(buft);
+            ggml_backend_reg_t reg = wdev ? ggml_backend_dev_backend_reg(wdev) : nullptr;
+            auto * fn = reg ? (ggml_backend_buffer_type_t (*)(size_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_vk_sparse_buffer_type") : nullptr;
+            if (fn && buft == ggml_backend_dev_buffer_type(wdev)) {
+                size_t di = 0;
+                for (size_t d = 0; d < ggml_backend_reg_dev_count(reg); ++d) {
+                    if (ggml_backend_reg_dev_get(reg, d) == wdev) { di = d; break; }
+                }
+                buft = fn(di);
+                b65_sparse_ctx = true;
+            }
+        }
 
         // skip contexts without tensors
         if (ggml_get_first_tensor(ctx) == nullptr) {
@@ -1886,6 +2001,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             }
             if (buf == nullptr) {
                 throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
+            }
+            if (b65_sparse_ctx) {
+                b65_place_commit(ctx, buf);
             }
             if (use_mlock && ggml_backend_buffer_is_host(buf)) {
                 pimpl->mlock_bufs.emplace_back(new llama_mlock);

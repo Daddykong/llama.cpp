@@ -1605,6 +1605,9 @@ static void b65_auto_placement(common_params & params) {
     if (!bud || atof(bud) <= 0 || params.model.path.empty()) {
         return;
     }
+    if (getenv("LLAMA_W_SPARSE") && atoi(getenv("LLAMA_W_SPARSE"))) {
+        return;   // movable weights: llama-model places (and later moves) the FFN layers itself
+    }
     ggml_backend_buffer_type_t sysmem = nullptr;
     for (size_t i = 0; i < ggml_backend_dev_count() && !sysmem; ++i) {
         ggml_backend_dev_t dev = ggml_backend_dev_get(i);

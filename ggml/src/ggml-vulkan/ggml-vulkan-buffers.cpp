@@ -822,6 +822,7 @@ vk_buffer ggml_vk_create_buffer_sparse(vk_device& device, size_t size) {
     const vk::MemoryRequirements req = device->device.getBufferMemoryRequirements(buf->buffer);
     buf->sparse_page = req.alignment;
     buf->size = size;
+    buf->sparse_bound.assign((size + req.alignment - 1) / req.alignment, 0);
     buf->memory_property_flags = vk::MemoryPropertyFlagBits::eDeviceLocal;   // never mapped: uploads go through staging
     buf->ptr = nullptr;
     if (device->buffer_device_address) {
@@ -891,17 +892,26 @@ int ggml_vk_sparse_commit(vk_buffer& buf, const size_t * offsets, const size_t *
     const uint64_t pg = buf->sparse_page;
     vk_buffer_struct::sparse_alloc a;
     for (int i = 0; i < n; ++i) {
-        uint64_t b = offsets[i] / pg * pg;
-        uint64_t e = std::min<uint64_t>((offsets[i] + sizes[i] + pg - 1) / pg * pg, (buf->size + pg - 1) / pg * pg);
-        if (e <= b) continue;
-        a.ranges.push_back({ b, e - b });
-        a.bytes += e - b;
+        const uint64_t p0 = offsets[i] / pg;
+        const uint64_t p1 = std::min<uint64_t>((offsets[i] + sizes[i] + pg - 1) / pg, buf->sparse_bound.size());
+        // only the pages nobody holds yet, as maximal runs
+        for (uint64_t p = p0; p < p1; ) {
+            if (buf->sparse_bound[p]) { ++p; continue; }
+            uint64_t q = p;
+            while (q < p1 && !buf->sparse_bound[q]) { buf->sparse_bound[q] = 1; ++q; }
+            a.ranges.push_back({ p * pg, (q - p) * pg });
+            a.bytes += (q - p) * pg;
+            p = q;
+        }
     }
     if (a.ranges.empty()) {
         return -1;
     }
     a.memory = ggml_vk_sparse_alloc(buf, a.bytes, where);
     if (!a.memory) {
+        for (auto & r : a.ranges) {   // give the pages back
+            for (uint64_t p = r.first / pg; p < (r.first + r.second) / pg; ++p) buf->sparse_bound[p] = 0;
+        }
         return -1;
     }
     std::vector<vk::SparseMemoryBind> binds;
@@ -967,6 +977,9 @@ void ggml_vk_sparse_release(vk_buffer& buf, int handle) {
     }
     ggml_vk_sparse_bind(buf, binds);
     buf->device->device.freeMemory(a.memory);
+    for (auto & r : a.ranges) {
+        for (uint64_t p = r.first / buf->sparse_page; p < (r.first + r.second) / buf->sparse_page; ++p) buf->sparse_bound[p] = 0;
+    }
     a.memory = VK_NULL_HANDLE;
     a.where = -1;
 }

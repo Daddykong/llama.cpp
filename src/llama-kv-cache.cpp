@@ -1,4 +1,5 @@
 #include "llama-kv-cache.h"
+#include "llama-b65-place.h"
 
 #include "llama-impl.h"
 #include "llama-io.h"
@@ -221,6 +222,21 @@ llama_kv_cache::llama_kv_cache(
 
             // b65: LLAMA_KV_SYSMEM=1 keeps this layer's KV in system RAM, read by the GPU over PCIe (Vulkan only)
             static const bool kv_sysmem = getenv("LLAMA_KV_SYSMEM") != nullptr && atoi(getenv("LLAMA_KV_SYSMEM")) != 0;
+            // b65: LLAMA_KV_SPARSE=1 reserves the address range only; memory follows the used cells (sparse_ensure)
+            static const bool kv_sparse = getenv("LLAMA_KV_SPARSE") != nullptr && atoi(getenv("LLAMA_KV_SPARSE")) != 0;
+            if (kv_sparse && !kv_sysmem) {
+                ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+                auto * fn = reg ? (ggml_backend_buffer_type_t (*)(size_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_vk_sparse_buffer_type") : nullptr;
+                if (fn) {
+                    size_t dev_idx = 0;
+                    for (size_t d = 0; d < ggml_backend_reg_dev_count(reg); ++d) {
+                        if (ggml_backend_reg_dev_get(reg, d) == dev) { dev_idx = d; break; }
+                    }
+                    buft = fn(dev_idx);
+                    dev_name = "Vulkan sparse";
+                    sparse = true;
+                }
+            }
             if (kv_sysmem) {
                 ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
                 auto * fn = reg ? (ggml_backend_buffer_type_t (*)(size_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_vk_sysmem_buffer_type") : nullptr;
@@ -1116,10 +1132,96 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
     return res;
 }
 
+// b65: commit memory for cells [0, n_cells) of every layer and stream (sparse KV)
+void llama_kv_cache::sparse_ensure(uint32_t n_cells) {
+    if (!sparse || n_cells <= sparse_cells) {
+        return;
+    }
+    static const uint32_t step = getenv("LLAMA_KV_SPARSE_STEP") ? (uint32_t) ((std::max(256, atoi(getenv("LLAMA_KV_SPARSE_STEP"))) + 255) / 256 * 256) : 4096;   // whole 256-cell pads
+    static const double vram_mb = getenv("LLAMA_KV_SPARSE_VRAM_MB") ? atof(getenv("LLAMA_KV_SPARSE_VRAM_MB")) : -1.0;
+    const uint32_t kv_size = layers.empty() || !layers[0].k ? 0 : (uint32_t) layers[0].k->ne[1];
+    const uint32_t c0 = sparse_cells;
+    const uint32_t c1 = std::min(kv_size, (n_cells + step - 1) / step * step);
+    if (c1 <= c0) {
+        return;
+    }
+    typedef int (*commit_fn)(ggml_backend_buffer_t, const size_t *, const size_t *, int, int);
+    static commit_fn commit = nullptr;
+    static bool warned = false;
+    for (const auto & layer : layers) {
+        for (ggml_tensor * t : { layer.k, layer.v }) {
+            if (!t || !t->buffer) {
+                continue;
+            }
+            if (!commit) {
+                ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(t->buffer));
+                ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+                commit = reg ? (commit_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_vk_sparse_commit") : nullptr;
+                if (!commit) {
+                    return;
+                }
+            }
+            const size_t base = (size_t) ((char *) t->data - (char *) ggml_backend_buffer_get_base(t->buffer));
+            const size_t es = ggml_element_size(t);
+            std::vector<size_t> offs, sizes;
+            for (int64_t s = 0; s < t->ne[2]; ++s) {
+                if (t == layer.v && v_trans) {
+                    // transposed V: cell c of embedding row d sits at d * kv_size + c
+                    for (int64_t d = 0; d < t->ne[0]; ++d) {
+                        offs.push_back(base + s * t->nb[2] + (size_t) d * kv_size * es + (size_t) c0 * es);
+                        sizes.push_back((size_t) (c1 - c0) * es);
+                    }
+                } else {
+                    offs.push_back(base + s * t->nb[2] + (size_t) c0 * t->nb[1]);
+                    sizes.push_back((size_t) (c1 - c0) * t->nb[1]);
+                }
+            }
+            size_t want = 0;
+            for (size_t z : sizes) want += z;
+            int where = (vram_mb >= 0 && (sparse_vram + want) / 1e6 > vram_mb) ? 1 : 0;
+            // b65: with movable weights, make room in the budget by moving FFN layers out first
+            b65_place & pl = b65_place_get();
+            if (where == 0 && pl.active()) {
+                const double over = (double) (pl.vram_weights() + sparse_vram + want) - pl.budget_mb * 1e6;
+                if (over > 0 && pl.evict((size_t) over) < (size_t) over) {
+                    where = 1;
+                }
+            }
+            int h = commit(t->buffer, offs.data(), sizes.data(), (int) offs.size(), where);
+            if (h < 0 && where == 0) {
+                where = 1;
+                h = commit(t->buffer, offs.data(), sizes.data(), (int) offs.size(), where);
+            }
+            if (h < 0) {
+                if (!warned) {
+                    LLAMA_LOG_WARN("%s: sparse KV commit for cells %u..%u failed (no memory?)\n", __func__, c0, c1);
+                    warned = true;
+                }
+                continue;
+            }
+            if (where == 0) {
+                sparse_vram += want;
+            }
+        }
+    }
+    LLAMA_LOG_INFO("%s: sparse KV now holds cells [0, %u), %.1f MB of it in VRAM\n", __func__, c1, sparse_vram / 1e6);
+    sparse_cells = c1;
+}
+
 void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch) {
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;
+    }
+    // b65: before writing, make sure the cells this ubatch writes and attention reads hold memory
+    if (sparse) {
+        uint32_t need = 0;
+        for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
+            for (uint32_t i = 0; i < sinfo.size(); ++i) {
+                need = std::max(need, (uint32_t) sinfo.idxs[s][i] + 1);
+            }
+        }
+        sparse_ensure(std::max(need, get_n_kv(sinfo)));
     }
 
     // keep track of the max sequence position that we would overwrite with this ubatch

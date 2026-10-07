@@ -1,4 +1,5 @@
 #include "llama-context.h"
+#include "llama-b65-place.h"
 
 #include "ggml.h"
 #include "llama-arch.h"
@@ -481,6 +482,7 @@ llama_context::llama_context(
 }
 
 llama_context::~llama_context() {
+    b65_place_get().sync = nullptr;   // b65
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
 
@@ -639,6 +641,7 @@ void llama_context::sched_reserve() {
     gf_res_prev_active = nullptr;
 
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+    b65_place_get().sync = [this]() { ggml_backend_sched_synchronize(sched.get()); };   // b65: safe point for moving weights
 
     llama_memory_context_ptr mctx;
     if (memory) {
