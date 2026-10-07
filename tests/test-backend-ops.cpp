@@ -9396,7 +9396,8 @@ struct test_b65_sm_mm : public test_case {
         ggml_tensor * kq;
         if (with_kq) {
             ggml_tensor * k = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, d, n_kv, heads_kv);
-            ggml_tensor * q = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d, n_tok, heads);
+            // Q permuted like the model's (d, heads, tokens) -> (d, tokens, heads)
+            ggml_tensor * q = ggml_permute(ctx, ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d, heads, n_tok), 0, 2, 1, 3);
             kq = ggml_mul_mat(ctx, k, q);
         } else {
             kq = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_kv, n_tok, heads);

@@ -2479,6 +2479,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             cm1_create({GGML_TYPE_F16, GGML_TYPE_F32, false, true},  tc_mm, "matmul_f16_f32_f16acc", matmul_f16_f32_f16acc_cm1_len, matmul_f16_f32_f16acc_cm1_data, sizeof(vk_mat_mat_push_constants), 3);
             cm1_create({GGML_TYPE_F16, GGML_TYPE_F32, false, true, true}, tc_mm, "matmul_f16_f32_smf_f16acc", matmul_f16_f32_smf_f16acc_cm1_len, matmul_f16_f32_smf_f16acc_cm1_data, sizeof(vk_mat_mat_push_constants), 5);   // b65
             cm1_create({GGML_TYPE_F16, GGML_TYPE_F32, false, true, 2}, tc_mm, "matmul_f16_f32_d16_f16acc", matmul_f16_f32_d16_f16acc_cm1_len, matmul_f16_f32_d16_f16acc_cm1_data, sizeof(vk_mat_mat_push_constants), 3);   // b65
+            cm1_create({GGML_TYPE_F16, GGML_TYPE_F16, false, true, 2}, tc_mm, "matmul_f16_d16_f16acc", matmul_f16_d16_f16acc_cm1_len, matmul_f16_d16_f16acc_cm1_data, sizeof(vk_mat_mat_push_constants), 3);   // b65
             cm1_create({GGML_TYPE_F16, GGML_TYPE_F16, false, true, 3}, tc_mm, "matmul_f16_smf_f16acc", matmul_f16_smf_f16acc_cm1_len, matmul_f16_smf_f16acc_cm1_data, sizeof(vk_mat_mat_push_constants), 5);   // b65
         }
         if (device->coopmat_acc_f32_support) {
@@ -2486,6 +2487,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             cm1_create({GGML_TYPE_F16, GGML_TYPE_F32, false, false}, tc_mm, "matmul_f16_f32",  matmul_f16_f32_cm1_len,  matmul_f16_f32_cm1_data,  sizeof(vk_mat_mat_push_constants), 3);
             cm1_create({GGML_TYPE_F16, GGML_TYPE_F32, false, false, true}, tc_mm, "matmul_f16_f32_smf", matmul_f16_f32_smf_cm1_len, matmul_f16_f32_smf_cm1_data, sizeof(vk_mat_mat_push_constants), 5);   // b65
             cm1_create({GGML_TYPE_F16, GGML_TYPE_F32, false, false, 2}, tc_mm, "matmul_f16_f32_d16", matmul_f16_f32_d16_cm1_len, matmul_f16_f32_d16_cm1_data, sizeof(vk_mat_mat_push_constants), 3);   // b65
+            cm1_create({GGML_TYPE_F16, GGML_TYPE_F16, false, false, 2}, tc_mm, "matmul_f16_d16", matmul_f16_d16_cm1_len, matmul_f16_d16_cm1_data, sizeof(vk_mat_mat_push_constants), 3);   // b65
             cm1_create({GGML_TYPE_F16, GGML_TYPE_F16, false, false, 3}, tc_mm, "matmul_f16_smf", matmul_f16_smf_cm1_len, matmul_f16_smf_cm1_data, sizeof(vk_mat_mat_push_constants), 5);   // b65
         }
 #if defined(GGML_VULKAN_BFLOAT16_GLSLC_SUPPORT)
@@ -6877,7 +6879,9 @@ static bool ggml_vk_can_fuse_kq_sm_mm(ggml_backend_vk_context * ctx, const struc
     }
     const ggml_prec kq_prec = (ggml_prec)kq->op_params[0];
     const ggml_prec mm_prec = (ggml_prec)mm->op_params[0];
+    // a permuted Q (as in the model) is converted to f16 first, so the f16 x f16 output variant is needed too
     return ggml_vk_get_mul_mat_mat_pipeline_map(ctx, GGML_TYPE_F16, GGML_TYPE_F32, kq_prec, false, 2) != nullptr &&
+           ggml_vk_get_mul_mat_mat_pipeline_map(ctx, GGML_TYPE_F16, GGML_TYPE_F16, kq_prec, false, 2) != nullptr &&
            ggml_vk_get_mul_mat_mat_pipeline_map(ctx, GGML_TYPE_F16, GGML_TYPE_F16, mm_prec, false, 3) != nullptr;
 }
 
