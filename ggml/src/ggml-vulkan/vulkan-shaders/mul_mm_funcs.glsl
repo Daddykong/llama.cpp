@@ -686,12 +686,21 @@ void load_b_to_shmem(const uint pos_b, const uint row, const uint col, const uin
 #endif
     const uint idx = pos_b + col * p.stride_b + row * 2;
     const uint buf_idx = col * SHMEM_STRIDE + row;
+#ifdef SM_FUSE
+    if (idx_n < p.N && block + row * 2 + 1 < end_k) {
+        buf_b[buf_idx] = FLOAT_TYPEV2(sm_p(float(data_b_scalar[idx]), block + row * 2, idx_n),
+                                      sm_p(float(data_b_scalar[idx + 1]), block + row * 2 + 1, idx_n));
+    } else if (idx_n < p.N && block + row * 2 < end_k) {
+        buf_b[buf_idx] = FLOAT_TYPEV2(sm_p(float(data_b_scalar[idx]), block + row * 2, idx_n), 0.0f);
+    } else {
+#else
     if (idx_n < p.N && block + row * 2 + 1 < end_k) {
         buf_b[buf_idx] = FLOAT_TYPEV2(TO_FLOAT_TYPE(data_b_scalar[idx]),
                                         TO_FLOAT_TYPE(data_b_scalar[idx + 1]));
     } else if (idx_n < p.N && block + row * 2 < end_k) {
         buf_b[buf_idx] = FLOAT_TYPEV2(TO_FLOAT_TYPE(data_b_scalar[idx]), 0.0f);
     } else {
+#endif
         buf_b[buf_idx] = FLOAT_TYPEV2(0.0f);
     }
 }

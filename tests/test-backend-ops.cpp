@@ -9384,7 +9384,42 @@ static const ggml_type other_types[] = {
 
 // Test cases for evaluation: should try to cover edge cases while using small input sizes to keep the runtime low
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval();
+// b65: softmax(scores*scale + mask) followed by V x P (FA-off attention); fused on Vulkan with GGML_VK_SM_FUSE=1
+struct test_b65_sm_mm : public test_case {
+    const int64_t n_kv, n_tok, d, heads, heads_kv;
+    std::string vars() override { return VARS_TO_STR5(n_kv, n_tok, d, heads, heads_kv); }
+    test_b65_sm_mm(int64_t n_kv, int64_t n_tok, int64_t d, int64_t heads, int64_t heads_kv)
+        : n_kv(n_kv), n_tok(n_tok), d(d), heads(heads), heads_kv(heads_kv) {}
+    double max_nmse_err() override { return 1e-3; }
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * kq = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_kv, n_tok, heads);
+        ggml_tensor * mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n_kv, n_tok);
+        ggml_tensor * v = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, n_kv, d, heads_kv);
+        ggml_tensor * p = ggml_soft_max_ext(ctx, kq, mask, 0.125f, 0.0f);
+        return ggml_mul_mat(ctx, v, p);
+    }
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_F16 && ggml_n_dims(t) == 2 && t->ne[1] == n_tok) {
+                // causal-style mask: key k visible to token n when k <= n_kv - n_tok + n
+                std::vector<ggml_fp16_t> m(ggml_nelements(t));
+                for (int64_t n = 0; n < n_tok; n++) {
+                    for (int64_t k = 0; k < n_kv; k++) {
+                        m[n * n_kv + k] = ggml_fp32_to_fp16(k <= n_kv - n_tok + n ? 0.0f : -INFINITY);
+                    }
+                }
+                ggml_backend_tensor_set(t, m.data(), 0, m.size() * sizeof(ggml_fp16_t));
+            } else {
+                init_tensor_uniform(t, -4.0f, 4.0f);
+            }
+        }
+    }
+};
+
 static void add_b65_sparse_t_cases(std::vector<std::unique_ptr<test_case>> & test_cases) {
+    test_cases.emplace_back(new test_b65_sm_mm(512, 64, 128, 8, 2));
+    test_cases.emplace_back(new test_b65_sm_mm(1000, 100, 128, 6, 1));
+    test_cases.emplace_back(new test_b65_sm_mm(4096, 512, 256, 24, 4));
     // b65 chunked GDN: prompt-sized batches (incl. a partial last chunk and 2 sequences)
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 48, 128, 512, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 48, 128, 100, 1));

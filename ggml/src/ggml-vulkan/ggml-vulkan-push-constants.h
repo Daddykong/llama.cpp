@@ -519,6 +519,14 @@ struct vk_op_rms_norm_mul_rope_push_constants {
     vk_op_rope_push_constants rope;
 };
 
+struct vk_op_sm_stats_push_constants {   // b65
+    uint32_t ncols;
+    uint32_t nrows_y;
+    uint32_t mstride;
+    uint32_t nrows;
+    float scale;
+};
+
 struct vk_op_soft_max_push_constants {
     uint32_t KX;
     uint32_t KY;

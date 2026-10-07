@@ -1,0 +1,45 @@
+#version 450
+// b65: per-row softmax statistics for the fused V x P matmul: (max, 1/sum) of scores*scale + mask.
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+layout(push_constant) uniform PushConstants { uint ncols; uint nrows_y; uint mstride; uint nrows; float scale; } p;
+layout(binding = 0) readonly buffer X { float data_x[]; };
+layout(binding = 1) readonly buffer M { float16_t data_m[]; };
+layout(binding = 2) writeonly buffer S { vec2 data_s[]; };
+shared float sh_m[256];
+shared float sh_s[256];
+const float NEG_INF = uintBitsToFloat(0xff800000u);
+
+void combine(inout float m, inout float s, const float m2, const float s2) {
+    const float mm = max(m, m2);
+    if (mm == NEG_INF) { m = NEG_INF; s = 0.0; return; }
+    s = s * exp(m - mm) + s2 * exp(m2 - mm);
+    m = mm;
+}
+
+void main() {
+    const uint row = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
+    const uint tid = gl_LocalInvocationID.x;
+    if (row >= p.nrows) return;
+    const uint n = row % p.nrows_y;
+    float m = NEG_INF, s = 0.0;
+    for (uint k = tid; k < p.ncols; k += 256) {
+        const float v = data_x[row * p.ncols + k] * p.scale + float(data_m[n * p.mstride + k]);
+        combine(m, s, v, 1.0);
+    }
+    sh_m[tid] = m; sh_s[tid] = s;
+    barrier();
+    for (uint st = 128; st > 0; st >>= 1) {
+        if (tid < st) {
+            float a = sh_m[tid], b = sh_s[tid];
+            combine(a, b, sh_m[tid + st], sh_s[tid + st]);
+            sh_m[tid] = a; sh_s[tid] = b;
+        }
+        barrier();
+    }
+    if (tid == 0) {
+        data_s[1 + row] = sh_m[0] == NEG_INF ? vec2(0.0, 0.0) : vec2(sh_m[0], 1.0 / sh_s[0]);
+        if (row == 0) data_s[0] = vec2(p.scale, uintBitsToFloat(p.mstride));
+    }
+}

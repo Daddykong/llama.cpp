@@ -205,6 +205,18 @@ shared ACC_TYPE coopmat_stage[TM * TN * NUM_WARPS];
 #endif
 
 #include "mul_mm_id_funcs.glsl"
+#ifdef SM_FUSE
+// b65: softmax folded into the B load (see soft_max_stats.comp)
+layout (binding = 3) readonly buffer SMM {float16_t data_smmask[];};
+layout (binding = 4) readonly buffer SMS {vec2 data_smstats[];};
+uint sm_rowbase;
+float sm_scale;
+uint sm_mstride;
+float sm_p(const float s, const uint k, const uint n) {
+    const vec2 st = data_smstats[1 + sm_rowbase + n];
+    return exp(s * sm_scale + float(data_smmask[n * sm_mstride + k]) - st.x) * st.y;
+}
+#endif
 #include "mul_mm_funcs.glsl"
 
 #ifdef MULMAT_QUANT
@@ -234,6 +246,11 @@ void main() {
     const uint i02 = i12 / p.broadcast2;
 
     const uint batch_idx_a = i03 * p.ne02 + i02;
+#endif
+#ifdef SM_FUSE
+    sm_rowbase = batch_idx * p.N;
+    sm_scale = data_smstats[0].x;
+    sm_mstride = floatBitsToUint(data_smstats[0].y);
 #endif
 
     const uint blocks_m = (p.M + BM - 1) / BM;
