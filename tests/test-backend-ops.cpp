@@ -9425,7 +9425,24 @@ struct test_b65_sm_mm : public test_case {
     }
 };
 
+// b65: sigmoid of a strided view times a same-shaped tensor (the qwen35 attention gate, LLAMA_GATE_NOCONT=1)
+struct test_b65_gate_mul : public test_case {
+    const int64_t d, h, t;
+    std::string vars() override { return VARS_TO_STR3(d, h, t); }
+    test_b65_gate_mul(int64_t d, int64_t h, int64_t t) : d(d), h(h), t(t) {}
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "B65_GATE_MUL"; }
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * qg = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2 * d, h, t);   // query and gate interleaved per head
+        ggml_tensor * gate = ggml_view_3d(ctx, qg, d, h, t, qg->nb[1], qg->nb[2], d * ggml_element_size(qg));
+        ggml_tensor * attn = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d, h, t);
+        return ggml_mul(ctx, attn, ggml_sigmoid(ctx, gate));
+    }
+};
+
 static void add_b65_sparse_t_cases(std::vector<std::unique_ptr<test_case>> & test_cases) {
+    test_cases.emplace_back(new test_b65_gate_mul(256, 24, 1));
+    test_cases.emplace_back(new test_b65_gate_mul(256, 24, 3));
+    test_cases.emplace_back(new test_b65_gate_mul(256, 24, 512));
     // b65 q8_0 K cache on the GQA rows2 kernel (run with GGML_VK_GQA_ROWS2=1): K x Q, GQA 6, 1 and 3 tokens
     for (int nt : {1, 3}) {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 4096, nt, 256, {4, 1}, {6, 1}));

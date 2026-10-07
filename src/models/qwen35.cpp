@@ -382,13 +382,18 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
                 Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
     cb(cur, "attn_pregate", il);
 
-    ggml_tensor * gate_sigmoid = ggml_sigmoid(ctx0, gate);
     if (gate_nocont) {
-        gate_sigmoid = ggml_reshape_2d(ctx0, gate_sigmoid, n_embd_head * n_head, n_tokens);
+        // b65: 3-D multiply right after the sigmoid (fusable), flattened afterwards
+        ggml_tensor * cur3 = ggml_reshape_3d(ctx0, cur, n_embd_head, n_head, n_tokens);
+        ggml_tensor * gate_sigmoid = ggml_sigmoid(ctx0, gate);
+        cb(gate_sigmoid, "gate_sigmoid", il);
+        cur = ggml_mul(ctx0, cur3, gate_sigmoid);
+        cur = ggml_reshape_2d(ctx0, cur, n_embd_head * n_head, n_tokens);
+    } else {
+        ggml_tensor * gate_sigmoid = ggml_sigmoid(ctx0, gate);
+        cb(gate_sigmoid, "gate_sigmoid", il);
+        cur = ggml_mul(ctx0, cur, gate_sigmoid);
     }
-    cb(gate_sigmoid, "gate_sigmoid", il);
-
-    cur = ggml_mul(ctx0, cur, gate_sigmoid);
     cb(cur, "attn_gated", il);
 
     cur = build_lora_mm(model.layers[il].wo, cur, model.layers[il].wo_s);

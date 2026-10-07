@@ -14300,7 +14300,10 @@ static bool ggml_vk_can_fuse_unary_mul(const struct ggml_cgraph * cgraph, int un
     if (other == nullptr || other->type != unary->type) {
         return false;
     }
-    if (!ggml_is_contiguous_1(other) || !ggml_is_contiguous_1(unary->src[0])) {
+    // b65: a strided sigmoid input is fine when nothing broadcasts (all operands are indexed through their strides)
+    const bool strided_ok = ggml_get_unary_op(unary) == GGML_UNARY_OP_SIGMOID && ggml_are_same_shape(unary->src[0], other) &&
+                            unary->src[0]->type == unary->type;
+    if (!ggml_is_contiguous_1(other) || (!ggml_is_contiguous_1(unary->src[0]) && !strided_ok)) {
         return false;
     }
     // fastmod needs src to tile into dst
