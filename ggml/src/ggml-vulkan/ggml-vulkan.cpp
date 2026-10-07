@@ -3863,8 +3863,8 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_kv_block_minmax, "kv_block_minmax", kv_block_minmax_len, kv_block_minmax_data, "main", 4, sizeof(vk_op_kv_minmax_push_constants), {256, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_kv_quest_mask, "kv_quest_mask", kv_quest_mask_len, kv_quest_mask_data, "main", 4, sizeof(vk_op_kv_quest_push_constants), {1, 1, 1}, {}, 1, false, true, 32);
     for (uint32_t nt = 2; nt <= 4; ++nt) {   // b65 multi-token sparse down
-        ggml_vk_create_pipeline(device, device->pipeline_mul_mat_sparse_t_mt[0][nt], "mul_mat_sparse_t_mt_q4_0_" + std::to_string(nt), mul_mat_sparse_t_mt_q4_0_len, mul_mat_sparse_t_mt_q4_0_data, "main", 3, sizeof(vk_op_sparse_t_push_constants), {64, 1, 1}, {64, nt}, 1);
-        ggml_vk_create_pipeline(device, device->pipeline_mul_mat_sparse_t_mt[1][nt], "mul_mat_sparse_t_mt_q4_1_" + std::to_string(nt), mul_mat_sparse_t_mt_q4_1_len, mul_mat_sparse_t_mt_q4_1_data, "main", 3, sizeof(vk_op_sparse_t_push_constants), {64, 1, 1}, {64, nt}, 1);
+        ggml_vk_create_pipeline2(device, device->pipeline_mul_mat_sparse_t_mt[0][nt], "mul_mat_sparse_t_mt_q4_0_" + std::to_string(nt), mul_mat_sparse_t_mt_q4_0_len, mul_mat_sparse_t_mt_q4_0_data, "main", 3, sizeof(vk_op_sparse_t_push_constants), {64, 1, 1}, {64, nt}, 1);
+        ggml_vk_create_pipeline2(device, device->pipeline_mul_mat_sparse_t_mt[1][nt], "mul_mat_sparse_t_mt_q4_1_" + std::to_string(nt), mul_mat_sparse_t_mt_q4_1_len, mul_mat_sparse_t_mt_q4_1_data, "main", 3, sizeof(vk_op_sparse_t_push_constants), {64, 1, 1}, {64, nt}, 1);
     }
     ggml_vk_create_pipeline(device, device->pipeline_mul_mat_sparse_t_q4_0, "mul_mat_sparse_t_q4_0", mul_mat_sparse_t_q4_0_len, mul_mat_sparse_t_q4_0_data, "main", 3, sizeof(vk_op_sparse_t_push_constants), {64, 1, 1}, {64}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_mul_mat_sparse_t_q4_1, "mul_mat_sparse_t_q4_1", mul_mat_sparse_t_q4_1_len, mul_mat_sparse_t_q4_1_data, "main", 3, sizeof(vk_op_sparse_t_push_constants), {64, 1, 1}, {64}, 1);
@@ -10457,12 +10457,6 @@ static void ggml_vk_op_f32_wkv(ggml_backend_vk_context * ctx, vk_context& subctx
 
     vk_pipeline pipeline = ggml_vk_op_get_pipeline(ctx, dst->src[0], dst->src[1], dst->src[2], dst, dst->op);
     GGML_ASSERT(pipeline != nullptr);
-    // b65: chunked kernel for prompt batches (scalar gate, no rollback snapshots, S_v 128)
-    static const bool gdn_chunk = getenv("GGML_VK_GDN_CHUNK") != nullptr && atoi(getenv("GGML_VK_GDN_CHUNK")) != 0;
-    if (gdn_chunk && ctx->device->pipeline_gated_delta_net_chunk && n_tokens >= 64 && K == 1 && S_v == 128 &&
-        dst->src[3]->ne[0] == 1) {
-        pipeline = ctx->device->pipeline_gated_delta_net_chunk;
-    }
 
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
 
@@ -10631,6 +10625,12 @@ void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, 
 
     vk_pipeline pipeline = ggml_vk_op_get_pipeline(ctx, dst->src[0], dst->src[1], dst->src[2], dst, dst->op);
     GGML_ASSERT(pipeline != nullptr);
+    // b65: chunked kernel for prompt batches (scalar gate, no rollback snapshots, S_v 128)
+    static const bool gdn_chunk = getenv("GGML_VK_GDN_CHUNK") != nullptr && atoi(getenv("GGML_VK_GDN_CHUNK")) != 0;
+    if (gdn_chunk && ctx->device->pipeline_gated_delta_net_chunk && n_tokens >= 64 && K == 1 && S_v == 128 &&
+        dst->src[3]->ne[0] != (int64_t) S_v) {
+        pipeline = ctx->device->pipeline_gated_delta_net_chunk;
+    }
 
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
 
