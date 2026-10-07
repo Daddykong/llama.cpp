@@ -17,6 +17,19 @@ void store_a(uint m, uint k_pair, FLOAT_TYPEV2 value) {
     buf_a[a_shmem_index(m, k_pair)] = value;
 }
 
+// b65: the 16 IQ4_NL values from registers for four nibbles (one per byte, masked with 0x0F0F0F0F), as packed int8:
+// {-127,-104,-83,-65} {-49,-35,-22,-10} {1,13,25,38} {53,69,89,113}
+uint b65_iq4nl_lut4(const uint n4) {
+    uint r = 0u;
+    [[unroll]] for (uint b = 0u; b < 4u; ++b) {
+        const uint n = (n4 >> (8u * b)) & 0xFu;
+        const uint lw = (n < 8u) ? ((n < 4u) ? 0xBFAD9881u : 0xF6EADDCFu)
+                                 : ((n < 12u) ? 0x26190D01u : 0x71594535u);
+        r |= ((lw >> (8u * (n & 3u))) & 0xFFu) << (8u * b);
+    }
+    return r;
+}
+
 void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uint idx_m, const uint block, const uint end_k) {
 #if defined(DATA_A_F32) || defined(DATA_A_F16)
 #if LOAD_VEC_A == 8
@@ -382,6 +395,26 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
         store_a(col, k_pair + 1, FLOAT_TYPEV2(v0.zw));
         store_a(col, k_pair + 8, FLOAT_TYPEV2(v1.xy));
         store_a(col, k_pair + 9, FLOAT_TYPEV2(v1.zw));
+    } else if (MmTypeA == GGML_TYPE_IQ4_NLR) {
+        // row-reordered IQ4_NL: the Q4_0R layout, values from the IQ4_NL table
+        const uint idx = pos_a + col * p.stride_a / mm_load_vec_a() + row;
+        const uint k_pair = row * mm_load_vec_a() / 4;
+
+        const uint ib = idx / 4;
+        const uint iqs = idx & 0x03;
+        const uint nbpr = p.stride_a / 32;
+        const uint jb = (block + row * mm_load_vec_a()) / 32;
+        const uint rsb = ib - jb;
+
+        const float d = float(a_q4_0r_f16.data[rsb * 9 + nbpr * 8 + jb]);
+        const uint vui = a_q4_0r_u32.data[(rsb * 9) / 2 + jb * 4 + iqs];
+        const vec4 v0 = vec4(unpack8(int32_t(b65_iq4nl_lut4( vui       & 0x0F0F0F0F)))) * d;
+        const vec4 v1 = vec4(unpack8(int32_t(b65_iq4nl_lut4((vui >> 4) & 0x0F0F0F0F)))) * d;
+
+        store_a(col, k_pair, FLOAT_TYPEV2(v0.xy));
+        store_a(col, k_pair + 1, FLOAT_TYPEV2(v0.zw));
+        store_a(col, k_pair + 8, FLOAT_TYPEV2(v1.xy));
+        store_a(col, k_pair + 9, FLOAT_TYPEV2(v1.zw));
     } else if (MmTypeA == GGML_TYPE_Q4_1) {
         const uint idx = pos_a + col * p.stride_a / mm_load_vec_a() + row;
         const uint k_pair = row * mm_load_vec_a() / 4;
@@ -673,15 +706,7 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
         const float dl = unpackHalf2x16(h0).x * float(int(ls) - 32);
 
         const uint n4 = (a_q4_0r_u32.data[base + (jb * 8 + is) * 4 + w] >> (4 * hsel)) & 0x0F0F0F0F;
-        // the 16 IQ4_NL values from registers: {-127,-104,-83,-65} {-49,-35,-22,-10} {1,13,25,38} {53,69,89,113}
-        uint r = 0u;
-        [[unroll]] for (uint b = 0u; b < 4u; ++b) {
-            const uint n = (n4 >> (8u * b)) & 0xFu;
-            const uint lw = (n < 8u) ? ((n < 4u) ? 0xBFAD9881u : 0xF6EADDCFu)
-                                     : ((n < 12u) ? 0x26190D01u : 0x71594535u);
-            r |= ((lw >> (8u * (n & 3u))) & 0xFFu) << (8u * b);
-        }
-        const vec4 v = vec4(unpack8(int32_t(r))) * dl;
+        const vec4 v = vec4(unpack8(int32_t(b65_iq4nl_lut4(n4)))) * dl;
 
         store_a(col, k_pair, FLOAT_TYPEV2(v.xy));
         store_a(col, k_pair + 1, FLOAT_TYPEV2(v.zw));

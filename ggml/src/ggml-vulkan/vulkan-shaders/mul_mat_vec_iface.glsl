@@ -31,14 +31,14 @@ layout (binding = 0) readonly buffer A_R128 {uvec4 data_a_r128[];};
 layout (binding = 0) readonly buffer A_R16 {float16_t data_a_r16[];};
 #endif
 
-#if defined(DATA_A_Q5_KR) || defined(DATA_A_Q8_0R) || defined(DATA_A_IQ4_XSR)
+#if defined(DATA_A_Q5_KR) || defined(DATA_A_Q8_0R) || defined(DATA_A_IQ4_XSR) || defined(DATA_A_IQ4_NLR)
 // Row-reordered Q5_K / Q8_0 (GGML_VK_Q5_K_REPACK / GGML_VK_Q8_0_REPACK): see reorder_q5_k.comp / reorder_q8_0.comp
 layout (binding = 0) readonly buffer A_R128 {uvec4 data_a_r128[];};
 layout (binding = 0) readonly buffer A_R32 {uint data_a_r32[];};
 layout (binding = 0) readonly buffer A_R16 {float16_t data_a_r16[];};
 #endif
 
-#if (defined(DATA_A_Q4_0R) && defined(Q4_0R_K32)) || defined(DATA_A_Q5_KR) || defined(DATA_A_Q8_0R) || defined(DATA_A_IQ4_XSR)
+#if (defined(DATA_A_Q4_0R) && defined(Q4_0R_K32)) || defined(DATA_A_Q5_KR) || defined(DATA_A_Q8_0R) || defined(DATA_A_IQ4_XSR) || defined(DATA_A_IQ4_NLR)
 #define A_REORDERED_K32 1
 // q8_1_x4 blocks are 144 bytes (9 x 16): ds[4] then qs[32]
 layout (binding = 1) readonly buffer B_R128 {ivec4 data_b_r128[];};
