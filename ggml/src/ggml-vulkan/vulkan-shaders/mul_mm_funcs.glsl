@@ -653,6 +653,38 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
 
         store_a(col, k_pair, FLOAT_TYPEV2(fma(d, q.x, m), fma(d, q.y, m)));
         store_a(col, k_pair + 1, FLOAT_TYPEV2(fma(d, q.z, m), fma(d, q.w, m)));
+    } else if (MmTypeA == GGML_TYPE_IQ4_XSR) {
+        // row-reordered IQ4_XS (reorder_iq4_xs.comp): per row nb*8 16-byte quant sub-blocks, then nb 8-byte headers
+        const uint idx = pos_a + col * p.stride_a / mm_load_vec_a() + row;
+        const uint k_pair = row * mm_load_vec_a() / 2;
+
+        const uint ib = idx / 64;                  // 4 values per idx
+        const uint j = idx % 64;                   // values 4j..4j+3 of the superblock
+        const uint nb = p.stride_a / 256;
+        const uint jb = (block + row * mm_load_vec_a()) / 256;
+        const uint base = (ib - jb) * 34;          // first word of the row
+        const uint is = j / 8;                     // sub-block 0..7
+        const uint hsel = (j / 4) & 1;             // values 16..31 of the sub-block sit in the high nibbles
+        const uint w = j & 3;                      // quant word within the sub-block
+
+        const uint h0 = a_q4_0r_u32.data[base + nb * 32 + jb * 2];
+        const uint h1 = a_q4_0r_u32.data[base + nb * 32 + jb * 2 + 1];
+        const uint ls = ((h1 >> (4 * is)) & 0xF) | (((h0 >> (16 + 2 * is)) & 3) << 4);
+        const float dl = unpackHalf2x16(h0).x * float(int(ls) - 32);
+
+        const uint n4 = (a_q4_0r_u32.data[base + (jb * 8 + is) * 4 + w] >> (4 * hsel)) & 0x0F0F0F0F;
+        // the 16 IQ4_NL values from registers: {-127,-104,-83,-65} {-49,-35,-22,-10} {1,13,25,38} {53,69,89,113}
+        uint r = 0u;
+        [[unroll]] for (uint b = 0u; b < 4u; ++b) {
+            const uint n = (n4 >> (8u * b)) & 0xFu;
+            const uint lw = (n < 8u) ? ((n < 4u) ? 0xBFAD9881u : 0xF6EADDCFu)
+                                     : ((n < 12u) ? 0x26190D01u : 0x71594535u);
+            r |= ((lw >> (8u * (n & 3u))) & 0xFFu) << (8u * b);
+        }
+        const vec4 v = vec4(unpack8(int32_t(r))) * dl;
+
+        store_a(col, k_pair, FLOAT_TYPEV2(v.xy));
+        store_a(col, k_pair + 1, FLOAT_TYPEV2(v.zw));
     } else if (MmTypeA == GGML_TYPE_Q6_K) {
         const uint idx = pos_a + col * p.stride_a / mm_load_vec_a() + row;
         const uint k_pair = row * mm_load_vec_a() / 2;

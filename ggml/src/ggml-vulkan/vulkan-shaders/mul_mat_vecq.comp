@@ -12,7 +12,7 @@
 
 layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 
-#if (defined(DATA_A_Q4_0R) && defined(Q4_0R_K32)) || defined(DATA_A_Q5_KR) || defined(DATA_A_Q8_0R)
+#if (defined(DATA_A_Q4_0R) && defined(Q4_0R_K32)) || defined(DATA_A_Q5_KR) || defined(DATA_A_Q8_0R) || defined(DATA_A_IQ4_XSR)
 #define K_PER_ITER 32
 #elif defined(DATA_A_Q4_0R)
 #define K_PER_ITER 16
@@ -101,7 +101,30 @@ void iter(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const
 #endif
 #endif
 
-#if defined(DATA_A_Q5_KR)
+#if defined(DATA_A_IQ4_XSR)
+        // one 32-value sub-block per thread: 16 quant bytes (one 16-byte load) and the 8-byte superblock header
+        const uint nb = p.ncols / QUANT_K;
+        const uint js = col / 32;
+        const uint jb = js / 8;
+        const uint is = js % 8;
+        // a row is nb*34 words; nb is even, so rsb*34/4 = rsb*17/2 is exact
+        uint rsb = first_row * nb + a_offset / (QUANT_K / QUANT_K_Q8_1);
+        [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+            const uvec4 q = data_a_r128[(rsb * 17) / 2 + js];
+            const uint h0 = data_a_r32[rsb * 34 + nb * 32 + jb * 2];        // d | scales_h << 16
+            const uint h1 = data_a_r32[rsb * 34 + nb * 32 + jb * 2 + 1];    // scales_l[4]
+            rsb += nb;
+
+            int32_t q_sum = 0;
+            [[unroll]] for (uint w = 0; w < 4; ++w) {
+                q_sum += dotPacked4x8EXT(int32_t(iq4nl_lut4( q[w]       & 0x0F0F0F0Fu)), cache_b_qs[w]);
+                q_sum += dotPacked4x8EXT(int32_t(iq4nl_lut4((q[w] >> 4) & 0x0F0F0F0Fu)), cache_b_qs[w + 4]);
+            }
+            const uint ls = ((h1 >> (4 * is)) & 0xF) | (((h0 >> (16 + 2 * is)) & 3) << 4);
+            const float dl = unpackHalf2x16(h0).x * float(int(ls) - 32);
+            temp[j][n] += FLOAT_TYPE(dl * (float(q_sum) * cache_b_ds.x));
+        }
+#elif defined(DATA_A_Q5_KR)
         // one 32-value sub-block per thread: 16 quant bytes, its 32 high bits, the superblock header
         const uint nb = p.ncols / QUANT_K;
         const uint js = col / 32;

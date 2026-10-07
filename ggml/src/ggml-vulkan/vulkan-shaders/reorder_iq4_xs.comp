@@ -1,0 +1,47 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+
+// In-place row reorder of IQ4_XS weights for the row-reordered (IQ4_XSR) matvec/matmul shaders.
+// One workgroup per row of nb 136-byte superblocks (d, scales_h, scales_l[4], qs[128]). The row becomes two regions:
+//   quants : nb*8 sub-blocks x 16 bytes, copied as they are (IQ4_XS already holds a 32-value sub-block as 16 bytes,
+//            value b in the low nibble of byte b and value b+16 in the high nibble)
+//   header : nb x 8 bytes, the original d, scales_h and scales_l
+// Lossless (a permutation of bytes). Requires nb * 34 <= REORDER_MAX_WORDS.
+
+#define REORDER_MAX_WORDS 4096
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) buffer A {uint data_a[];};
+
+layout (push_constant) uniform parameter
+{
+    uint nb;
+    uint nrows;
+    uint row0;
+} p;
+
+shared uint sh[REORDER_MAX_WORDS];
+
+void main() {
+    const uint row = p.row0 + gl_WorkGroupID.x;
+    if (row >= p.nrows) {
+        return;
+    }
+    const uint tid = gl_LocalInvocationID.x;
+    const uint nw = p.nb * 34u;
+    const uint base = row * nw;
+
+    for (uint i = tid; i < nw; i += 256u) {
+        sh[i] = data_a[base + i];
+    }
+    barrier();
+
+    for (uint i = tid; i < p.nb * 32u; i += 256u) {
+        data_a[base + i] = sh[(i >> 5u) * 34u + 2u + (i & 31u)];
+    }
+    for (uint i = tid; i < p.nb * 2u; i += 256u) {
+        data_a[base + p.nb * 32u + i] = sh[(i >> 1u) * 34u + (i & 1u)];
+    }
+}

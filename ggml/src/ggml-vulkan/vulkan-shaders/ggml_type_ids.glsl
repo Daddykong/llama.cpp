@@ -11,6 +11,8 @@
 // Vulkan-internal: row-reordered Q5_K / Q8_0 (GGML_VK_Q5_K_REPACK / GGML_VK_Q8_0_REPACK), unused type slots
 #define GGML_TYPE_Q5_KR    5u
 #define GGML_TYPE_Q8_0R    31u
+// Vulkan-internal: row-reordered IQ4_XS (GGML_VK_IQ4_XS_REPACK), unused type slot
+#define GGML_TYPE_IQ4_XSR  32u
 #define GGML_TYPE_Q5_0     6u
 #define GGML_TYPE_Q5_1     7u
 #define GGML_TYPE_Q8_0     8u
