@@ -5796,6 +5796,8 @@ vk_pipeline ggml_vk_get_to_fp16(ggml_backend_vk_context * ctx, ggml_type type) {
     return ctx->device->pipeline_dequant[type];
 }
 
+static bool ggml_vk_is_reordered_a_type(ggml_type t);
+
 static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec(ggml_backend_vk_context * ctx, ggml_type a_type, ggml_type b_type, uint32_t num_cols, uint32_t m, uint32_t k) {
     VK_LOG_DEBUG("ggml_vk_get_dequantize_mul_mat_vec()");
     GGML_ASSERT(b_type == GGML_TYPE_F32 || b_type == GGML_TYPE_F16 || b_type == GGML_TYPE_Q8_1);
@@ -5903,6 +5905,12 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec(ggml_backend_vk_context * 
         }
         if (a_type == GGML_TYPE_Q4_0R_VK && getenv("GGML_VK_Q4_0R_WG_LARGE")) {
             dmmv_wg = DMMV_WG_SIZE_LARGE;  // B65 tuning knob (experiment)
+        }
+        // b65 [mtp]: GGML_VK_RK_WG_LARGE_MC=1: 4 subgroups per row for the 2-8 column matvecs of the other reordered
+        // types (Q5_KR ssm_out, Q8_0R head, Q4_1R ffn_down) in the MTP verify step (experiment)
+        static const bool rk_large_mc = getenv("GGML_VK_RK_WG_LARGE_MC") != nullptr && atoi(getenv("GGML_VK_RK_WG_LARGE_MC")) != 0;
+        if (rk_large_mc && num_cols > 1 && ggml_vk_is_reordered_a_type(a_type) && a_type != GGML_TYPE_Q4_0R_VK) {
+            dmmv_wg = DMMV_WG_SIZE_LARGE;
         }
         if ((a_type == GGML_TYPE_Q4_K || a_type == GGML_TYPE_Q5_K) && ggml_vk_kq_wide()) {
             dmmv_wg = DMMV_WG_SIZE_LARGE;
