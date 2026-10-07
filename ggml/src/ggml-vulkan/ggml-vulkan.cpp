@@ -16204,9 +16204,13 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     }
 
     if (graph_timer) {
-        // recorded into a fresh compute context that synchronize() submits (with any output copies)
+        // own submit right behind the graph, so the end stamp is not delayed until the next synchronize()
         compute_ctx = ggml_vk_get_compute_ctx(ctx);
         compute_ctx->s->buffer->buf.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, ctx->gt_pool, 1);
+        ggml_vk_ctx_end(compute_ctx);
+        ggml_vk_submit(compute_ctx, {});
+        ctx->submit_pending = true;
+        ctx->compute_ctx.reset();
         ctx->gt_t_exit = ggml_time_us();
         ctx->gt_pending = true;
     }
