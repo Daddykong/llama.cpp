@@ -805,3 +805,168 @@ vk_buffer ggml_vk_buffer_from_host_ptr(vk_device & device, void * ptr, size_t si
     return buf;
 }
 
+
+// ---- b65: sparse buffers ----
+
+vk_buffer ggml_vk_create_buffer_sparse(vk_device& device, size_t size) {
+    vk_buffer buf = std::make_shared<vk_buffer_struct>();
+    buf->device = device;
+    buf->sparse = true;
+    vk::BufferUsageFlags usage = vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eTransferDst;
+    if (device->buffer_device_address) {
+        usage |= vk::BufferUsageFlagBits::eShaderDeviceAddress;
+    }
+    vk::BufferCreateInfo bci{ vk::BufferCreateFlagBits::eSparseBinding | vk::BufferCreateFlagBits::eSparseResidency,
+                              size, usage, vk::SharingMode::eExclusive, 0, nullptr };
+    buf->buffer = device->device.createBuffer(bci);
+    const vk::MemoryRequirements req = device->device.getBufferMemoryRequirements(buf->buffer);
+    buf->sparse_page = req.alignment;
+    buf->size = size;
+    buf->memory_property_flags = vk::MemoryPropertyFlagBits::eDeviceLocal;   // never mapped: uploads go through staging
+    buf->ptr = nullptr;
+    if (device->buffer_device_address) {
+        buf->bda_addr = device->device.getBufferAddress(vk::BufferDeviceAddressInfo(buf->buffer));
+    }
+    return buf;
+}
+
+static int ggml_vk_sparse_memory_type(vk_buffer& buf, int where) {
+    const vk::MemoryRequirements req = buf->device->device.getBufferMemoryRequirements(buf->buffer);
+    const vk::PhysicalDeviceMemoryProperties mp = buf->device->physical_device.getMemoryProperties();
+    int best = -1;
+    for (uint32_t i = 0; i < mp.memoryTypeCount; ++i) {
+        if (!(req.memoryTypeBits & (1u << i))) {
+            continue;
+        }
+        const vk::MemoryPropertyFlags f = mp.memoryTypes[i].propertyFlags;
+        const bool dl = (bool)(f & vk::MemoryPropertyFlagBits::eDeviceLocal);
+        const bool hv = (bool)(f & vk::MemoryPropertyFlagBits::eHostVisible);
+        if (where == 0 && dl) {
+            if (best < 0 || !hv) best = (int)i;   // prefer VRAM that is not host-visible (no ReBAR window)
+        } else if (where == 1 && !dl && hv) {
+            if (best < 0 || (f & vk::MemoryPropertyFlagBits::eHostCached)) best = (int)i;
+        }
+    }
+    return best;
+}
+
+static void ggml_vk_sparse_bind(vk_buffer& buf, const std::vector<vk::SparseMemoryBind>& binds) {
+    vk_device& dev = buf->device;
+    vk::SparseBufferMemoryBindInfo sb{ buf->buffer, (uint32_t)binds.size(), binds.data() };
+    vk::BindSparseInfo info;
+    info.bufferBindCount = 1;
+    info.pBufferBinds = &sb;
+    vk::Fence fence = dev->device.createFence({});
+    vk_queue_handle * h = dev->compute_queue->handle.get();
+    // same order as vk_queue_handle_*::submit: device mutex, then the queue
+    if (h->device_submit_mutex) h->device_submit_mutex->lock();
+    h->lock();
+    h->queue.bindSparse(info, fence);
+    h->unlock();
+    if (h->device_submit_mutex) h->device_submit_mutex->unlock();
+    VK_CHECK(dev->device.waitForFences({ fence }, true, UINT64_MAX), "sparse bind", dev);
+    dev->device.destroyFence(fence);
+}
+
+static vk::DeviceMemory ggml_vk_sparse_alloc(vk_buffer& buf, uint64_t bytes, int where) {
+    const int mt = ggml_vk_sparse_memory_type(buf, where);
+    if (mt < 0) {
+        return VK_NULL_HANDLE;
+    }
+    vk::MemoryAllocateFlagsInfo flags{};
+    if (buf->device->buffer_device_address) {
+        flags.flags = vk::MemoryAllocateFlagBits::eDeviceAddress;
+    }
+    try {
+        return buf->device->device.allocateMemory({ bytes, (uint32_t)mt, &flags });
+    } catch (const vk::SystemError&) {
+        return VK_NULL_HANDLE;
+    }
+}
+
+int ggml_vk_sparse_commit(vk_buffer& buf, const size_t * offsets, const size_t * sizes, int n, int where) {
+    if (!buf || !buf->sparse || n <= 0) {
+        return -1;
+    }
+    const uint64_t pg = buf->sparse_page;
+    vk_buffer_struct::sparse_alloc a;
+    for (int i = 0; i < n; ++i) {
+        uint64_t b = offsets[i] / pg * pg;
+        uint64_t e = std::min<uint64_t>((offsets[i] + sizes[i] + pg - 1) / pg * pg, (buf->size + pg - 1) / pg * pg);
+        if (e <= b) continue;
+        a.ranges.push_back({ b, e - b });
+        a.bytes += e - b;
+    }
+    if (a.ranges.empty()) {
+        return -1;
+    }
+    a.memory = ggml_vk_sparse_alloc(buf, a.bytes, where);
+    if (!a.memory) {
+        return -1;
+    }
+    std::vector<vk::SparseMemoryBind> binds;
+    uint64_t mo = 0;
+    for (auto & r : a.ranges) {
+        binds.push_back(vk::SparseMemoryBind{ r.first, r.second, a.memory, mo });
+        mo += r.second;
+    }
+    ggml_vk_sparse_bind(buf, binds);
+    a.where = where;
+    buf->sparse_allocs.push_back(std::move(a));
+    return (int)buf->sparse_allocs.size() - 1;
+}
+
+bool ggml_vk_sparse_move(vk_buffer& buf, int handle, int where) {
+    if (!buf || !buf->sparse || handle < 0 || handle >= (int)buf->sparse_allocs.size()) {
+        return false;
+    }
+    auto & a = buf->sparse_allocs[handle];
+    if (a.where < 0) return false;
+    if (a.where == where) return true;
+    vk::DeviceMemory nm = ggml_vk_sparse_alloc(buf, a.bytes, where);
+    if (!nm) {
+        return false;
+    }
+    // stage through a plain buffer on the new memory: copy each range out, then rebind the ranges to it
+    vk_device& dev = buf->device;
+    vk_buffer tmp = std::make_shared<vk_buffer_struct>();
+    tmp->device = dev;
+    tmp->buffer = dev->device.createBuffer({ {}, a.bytes, vk::BufferUsageFlagBits::eTransferDst | vk::BufferUsageFlagBits::eTransferSrc, vk::SharingMode::eExclusive, 0, nullptr });
+    dev->device.bindBufferMemory(tmp->buffer, nm, 0);
+    tmp->size = a.bytes;
+    uint64_t mo = 0;
+    for (auto & r : a.ranges) {
+        ggml_vk_buffer_copy(tmp, mo, buf, r.first, r.second);
+        mo += r.second;
+    }
+    dev->device.destroyBuffer(tmp->buffer);
+    tmp->buffer = VK_NULL_HANDLE;
+    tmp->size = 0;   // the destructor must not free nm
+    std::vector<vk::SparseMemoryBind> binds;
+    mo = 0;
+    for (auto & r : a.ranges) {
+        binds.push_back(vk::SparseMemoryBind{ r.first, r.second, nm, mo });
+        mo += r.second;
+    }
+    ggml_vk_sparse_bind(buf, binds);
+    dev->device.freeMemory(a.memory);
+    a.memory = nm;
+    a.where = where;
+    return true;
+}
+
+void ggml_vk_sparse_release(vk_buffer& buf, int handle) {
+    if (!buf || !buf->sparse || handle < 0 || handle >= (int)buf->sparse_allocs.size()) {
+        return;
+    }
+    auto & a = buf->sparse_allocs[handle];
+    if (a.where < 0) return;
+    std::vector<vk::SparseMemoryBind> binds;
+    for (auto & r : a.ranges) {
+        binds.push_back(vk::SparseMemoryBind{ r.first, r.second, VK_NULL_HANDLE, 0 });
+    }
+    ggml_vk_sparse_bind(buf, binds);
+    buf->device->device.freeMemory(a.memory);
+    a.memory = VK_NULL_HANDLE;
+    a.where = -1;
+}

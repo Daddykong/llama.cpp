@@ -1058,7 +1058,8 @@ struct vk_device_struct {
     vk_buffer sync_staging;
 
     ggml_backend_buffer_type buffer_type;
-    ggml_backend_buffer_type buffer_type_sysmem; // b65: host-visible system RAM, GPU-readable
+    ggml_backend_buffer_type buffer_type_sysmem;
+    ggml_backend_buffer_type buffer_type_sparse;   // b65 // b65: host-visible system RAM, GPU-readable
 
     bool disable_fusion;
     bool disable_descriptor_reuse;
@@ -1100,7 +1101,27 @@ struct vk_buffer_struct {
 
     vk_device device;
 
+    // b65: sparse buffers hold no memory of their own; each commit is one allocation bound to a list of ranges
+    struct sparse_alloc {
+        vk::DeviceMemory memory = VK_NULL_HANDLE;
+        std::vector<std::pair<uint64_t, uint64_t>> ranges;   // (offset, size) in the buffer, page-rounded
+        uint64_t bytes = 0;
+        int where = -1;                                      // 0 VRAM, 1 system RAM, -1 released
+    };
+    bool sparse = false;
+    uint64_t sparse_page = 0;
+    std::vector<sparse_alloc> sparse_allocs;
+
     ~vk_buffer_struct() {
+        if (sparse) {
+            for (auto & a : sparse_allocs) {
+                if (a.memory) {
+                    device->device.freeMemory(a.memory);
+                }
+            }
+            device->device.destroyBuffer(buffer);
+            return;
+        }
         if (size == 0) {
             return;
         }

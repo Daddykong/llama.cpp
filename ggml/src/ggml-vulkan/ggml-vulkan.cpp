@@ -4128,6 +4128,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 }
 
 static ggml_backend_buffer_type_i ggml_backend_vk_sysmem_buffer_type_interface(); // b65 (defined with the buffer types)
+static ggml_backend_buffer_type_i ggml_backend_vk_sparse_buffer_type_interface(); // b65
 
 vk_device ggml_vk_get_device(size_t idx) {
     VK_LOG_DEBUG("ggml_vk_get_device(" << idx << ")");
@@ -5049,6 +5050,11 @@ vk_device ggml_vk_get_device(size_t idx) {
             /* .iface    = */ ggml_backend_vk_sysmem_buffer_type_interface(),
             /* .device   = */ ggml_backend_reg_dev_get(ggml_backend_vk_reg(), idx),
             /* .context  = */ new ggml_backend_vk_buffer_type_context{ device->name + "_SysMem", device },
+        };
+        device->buffer_type_sparse = {   // b65
+            /* .iface    = */ ggml_backend_vk_sparse_buffer_type_interface(),
+            /* .device   = */ ggml_backend_reg_dev_get(ggml_backend_vk_reg(), idx),
+            /* .context  = */ new ggml_backend_vk_buffer_type_context{ device->name + "_Sparse", device },
         };
 
         device->fence = device->device.createFence({});
@@ -13887,6 +13893,72 @@ static ggml_backend_buffer_type_i ggml_backend_vk_sysmem_buffer_type_interface()
     return i;
 }
 
+// b65: sparse variant - full-size address range, memory committed on demand
+static ggml_backend_buffer_t ggml_backend_vk_sparse_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
+    ggml_backend_vk_buffer_type_context * ctx = (ggml_backend_vk_buffer_type_context *) buft->context;
+    vk_buffer dev_buffer = nullptr;
+    try {
+        dev_buffer = ggml_vk_create_buffer_sparse(ctx->device, size);
+    } catch (const vk::SystemError& e) {
+        GGML_LOG_WARN("ggml_vulkan: sparse buffer of %zu bytes failed: %s\n", size, e.what());
+        return nullptr;
+    }
+    ggml_backend_vk_buffer_context * bufctx = new ggml_backend_vk_buffer_context(ctx->device, std::move(dev_buffer), ctx->name);
+    return ggml_backend_buffer_init(buft, ggml_backend_vk_buffer_interface, bufctx, size);
+}
+
+static size_t ggml_backend_vk_sparse_buffer_type_get_max_size(ggml_backend_buffer_type_t buft) {
+    ggml_backend_vk_buffer_type_context * ctx = (ggml_backend_vk_buffer_type_context *) buft->context;
+    return ctx->device->max_buffer_size;
+}
+
+static ggml_backend_buffer_type_i ggml_backend_vk_sparse_buffer_type_interface() {
+    ggml_backend_buffer_type_i i = ggml_backend_vk_buffer_type_interface;
+    i.alloc_buffer = ggml_backend_vk_sparse_buffer_type_alloc_buffer;
+    i.get_max_size = ggml_backend_vk_sparse_buffer_type_get_max_size;
+    return i;
+}
+
+static ggml_backend_buffer_type_t ggml_backend_vk_sparse_buffer_type(size_t dev_num) {   // b65
+    ggml_vk_instance_init();
+    vk_device dev = ggml_vk_get_device(dev_num);
+    return &dev->buffer_type_sparse;
+}
+
+static vk_buffer * ggml_backend_vk_sparse_buf(ggml_backend_buffer_t buffer) {
+    if (!buffer || buffer->iface.get_base != ggml_backend_vk_buffer_interface.get_base) {
+        return nullptr;
+    }
+    ggml_backend_vk_buffer_context * c = (ggml_backend_vk_buffer_context *) buffer->context;
+    return (c && c->dev_buffer && c->dev_buffer->sparse) ? &c->dev_buffer : nullptr;
+}
+
+static int ggml_backend_vk_sparse_commit(ggml_backend_buffer_t buffer, const size_t * offsets, const size_t * sizes, int n, int where) {
+    vk_buffer * b = ggml_backend_vk_sparse_buf(buffer);
+    return b ? ggml_vk_sparse_commit(*b, offsets, sizes, n, where) : -1;
+}
+
+static bool ggml_backend_vk_sparse_move(ggml_backend_buffer_t buffer, int handle, int where) {
+    vk_buffer * b = ggml_backend_vk_sparse_buf(buffer);
+    return b ? ggml_vk_sparse_move(*b, handle, where) : false;
+}
+
+static void ggml_backend_vk_sparse_release(ggml_backend_buffer_t buffer, int handle) {
+    vk_buffer * b = ggml_backend_vk_sparse_buf(buffer);
+    if (b) ggml_vk_sparse_release(*b, handle);
+}
+
+static size_t ggml_backend_vk_sparse_bytes(ggml_backend_buffer_t buffer, int where) {
+    vk_buffer * b = ggml_backend_vk_sparse_buf(buffer);
+    size_t s = 0;
+    if (b) {
+        for (auto & a : (*b)->sparse_allocs) {
+            if (a.where == where) s += a.bytes;
+        }
+    }
+    return s;
+}
+
 ggml_backend_buffer_t ggml_backend_vk_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
     VK_LOG_MEMORY("ggml_backend_vk_buffer_type_alloc_buffer(" << size << ")");
     ggml_backend_vk_buffer_type_context * ctx = (ggml_backend_vk_buffer_type_context *) buft->context;
@@ -17303,6 +17375,21 @@ static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const
     GGML_UNUSED(reg);
     if (strcmp(name, "ggml_backend_vk_sysmem_buffer_type") == 0) {
         return (void *) ggml_backend_vk_sysmem_buffer_type;
+    }
+    if (strcmp(name, "ggml_backend_vk_sparse_buffer_type") == 0) {
+        return (void *) ggml_backend_vk_sparse_buffer_type;
+    }
+    if (strcmp(name, "ggml_backend_vk_sparse_commit") == 0) {
+        return (void *) ggml_backend_vk_sparse_commit;
+    }
+    if (strcmp(name, "ggml_backend_vk_sparse_move") == 0) {
+        return (void *) ggml_backend_vk_sparse_move;
+    }
+    if (strcmp(name, "ggml_backend_vk_sparse_release") == 0) {
+        return (void *) ggml_backend_vk_sparse_release;
+    }
+    if (strcmp(name, "ggml_backend_vk_sparse_bytes") == 0) {
+        return (void *) ggml_backend_vk_sparse_bytes;
     }
     return NULL;
 }
