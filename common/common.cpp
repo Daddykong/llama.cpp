@@ -14,6 +14,9 @@
 #include "unicode.h"
 
 #include <algorithm>
+#include <deque>
+#include <set>
+#include <map>
 #include <cinttypes>
 #include <climits>
 #include <cmath>
@@ -1596,7 +1599,76 @@ void common_set_adapter_lora(struct llama_context * ctx, std::vector<common_adap
     llama_set_adapters_lora(ctx, loras.data(), loras.size(), scales.data());
 }
 
+// b65: FFN layers that do not fit LLAMA_VRAM_BUDGET_MB -> Vulkan system-RAM buffer type
+static void b65_auto_placement(common_params & params) {
+    const char * bud = getenv("LLAMA_VRAM_BUDGET_MB");
+    if (!bud || atof(bud) <= 0 || params.model.path.empty()) {
+        return;
+    }
+    ggml_backend_buffer_type_t sysmem = nullptr;
+    for (size_t i = 0; i < ggml_backend_dev_count() && !sysmem; ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+        auto * fn = reg ? (ggml_backend_buffer_type_t (*)(size_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_vk_sysmem_buffer_type") : nullptr;
+        if (fn) {
+            sysmem = fn(0);
+        }
+    }
+    if (!sysmem) {
+        LOG_WRN("%s: LLAMA_VRAM_BUDGET_MB set but no Vulkan system-RAM buffer type; ignored\n", __func__);
+        return;
+    }
+    ggml_context * meta = nullptr;
+    gguf_init_params gp = { /*.no_alloc =*/ true, /*.ctx =*/ &meta };
+    gguf_context * g = gguf_init_from_file(params.model.path.c_str(), gp);
+    if (!g) {
+        return;
+    }
+    double base = 0.0;
+    std::map<int, double> ffn;
+    for (ggml_tensor * t = ggml_get_first_tensor(meta); t; t = ggml_get_next_tensor(meta, t)) {
+        const std::string name = t->name;
+        int il = -1;
+        if (name.rfind("blk.", 0) == 0 && name.find(".ffn_") != std::string::npos) {
+            il = atoi(name.c_str() + 4);
+        }
+        if (il >= 0) ffn[il] += (double) ggml_nbytes(t); else base += (double) ggml_nbytes(t);
+    }
+    gguf_free(g);
+    ggml_free(meta);
+    if (ffn.empty()) {
+        return;
+    }
+    const int n = ffn.rbegin()->first + 1;
+    std::vector<int> order;
+    for (int i = 0; i < 3 && i < n; ++i) order.push_back(i);
+    for (int i = n - 1; i >= n - 3 && i >= 3; --i) order.push_back(i);
+    for (int i = 3; i < n - 3; ++i) order.push_back(i);
+    double left = atof(bud) * 1e6 - base;
+    std::set<int> keep;
+    for (int il : order) {
+        if (ffn.count(il) && ffn[il] <= left) { keep.insert(il); left -= ffn[il]; }
+    }
+    static std::deque<std::string> pats;   // append-only: earlier override patterns stay valid
+    std::vector<llama_model_tensor_buft_override> ov;
+    for (auto & o : params.tensor_buft_overrides) {
+        if (o.pattern) ov.push_back(o);
+    }
+    int moved = 0;
+    double moved_mb = 0;
+    for (auto & [il, bytes] : ffn) {
+        if (!keep.count(il)) { pats.push_back("^blk\\." + std::to_string(il) + "\\.ffn_"); moved++; moved_mb += bytes / 1e6; }
+    }
+    for (auto it = pats.end() - moved; it != pats.end(); ++it) ov.push_back({ it->c_str(), sysmem });
+    ov.push_back({ nullptr, nullptr });
+    params.tensor_buft_overrides = ov;
+    LOG_INF("%s: VRAM budget %.0f MB: non-FFN %.0f MB, FFN layers in VRAM %zu, in system RAM %d (%.0f MB)\n",
+            __func__, atof(bud), base / 1e6, keep.size(), moved, moved_mb);
+}
+
 struct llama_model_params common_model_params_to_llama(common_params & params) {
+    b65_auto_placement(params);
+
     auto mparams = llama_model_default_params();
 
     if (!params.devices.empty()) {
