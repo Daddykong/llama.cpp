@@ -2945,6 +2945,22 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             return (uint32_t)configs.size() - 1;
         };
         device->matmul_id_tile_selector = device->matmul_tile_selector;
+        // b65 [mtp]: on Xe2 the medium tile is ~29% cheaper than the small one for 9-32 column batches (multi-token
+        // ngram/MTP verify on the B65, Qwen3.8-27B at 4.4K: 316-326 vs 443-449 ms per graph); GGML_VK_XE2_SMALLN_MEDIUM=0 off.
+        // MUL_MAT_ID keeps the selector above.
+        const bool xe2_smalln_medium = device->architecture == INTEL_XE2 &&
+            !(getenv("GGML_VK_XE2_SMALLN_MEDIUM") && atoi(getenv("GGML_VK_XE2_SMALLN_MEDIUM")) == 0);
+        if (xe2_smalln_medium) {
+            device->matmul_tile_selector = [](uint32_t m, uint32_t n, uint32_t /*k*/, uint32_t /*shader_core_count*/,
+                                              const std::vector<vk_matmul_pipeline_pair>& configs) -> uint32_t {
+                if (configs.size() <= 1) return 0;
+                if (m <= 32) return 0;
+                if (n <= 32) return (m > 64 && n > 8) ? 1 : 0;
+                if (configs.size() == 2) return 1;
+                if (m <= 64 || n <= 64) return 1;
+                return (uint32_t)configs.size() - 1;
+            };
+        }
     }
 
     // mul mat vec
