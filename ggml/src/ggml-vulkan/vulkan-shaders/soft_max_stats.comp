@@ -4,7 +4,11 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 layout(push_constant) uniform PushConstants { uint ncols; uint nrows_y; uint mstride; uint nrows; float scale; } p;
+#ifdef X_F16
+layout(binding = 0) readonly buffer X { float16_t data_x[]; };
+#else
 layout(binding = 0) readonly buffer X { float data_x[]; };
+#endif
 layout(binding = 1) readonly buffer M { float16_t data_m[]; };
 layout(binding = 2) writeonly buffer S { vec2 data_s[]; };
 shared float sh_m[256];
@@ -25,7 +29,7 @@ void main() {
     const uint n = row % p.nrows_y;
     float m = NEG_INF, s = 0.0;
     for (uint k = tid; k < p.ncols; k += 256) {
-        const float v = data_x[row * p.ncols + k] * p.scale + float(data_m[n * p.mstride + k]);
+        const float v = float(data_x[row * p.ncols + k]) * p.scale + float(data_m[n * p.mstride + k]);
         combine(m, s, v, 1.0);
     }
     sh_m[tid] = m; sh_s[tid] = s;

@@ -280,7 +280,7 @@ struct vk_matmul_pipeline_key {
     ggml_type type_b;
     bool mul_mat_id;
     bool f16acc;
-    bool sm_fuse = false;   // b65: softmax folded into the B load
+    uint8_t sm_fuse = 0;    // b65: 1 fused-softmax B f32, 2 f16 output, 3 fused-softmax B f16
 
     bool operator<(const vk_matmul_pipeline_key & o) const {
         return std::tie(type_a, type_b, mul_mat_id, f16acc, sm_fuse)
@@ -1018,7 +1018,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_mul_mat_sparse_t_mt[2][5]; // b65: [q4_0, q4_1][ntok 2..4]
     vk_pipeline pipeline_kv_block_minmax, pipeline_kv_quest_mask; // b65 Quest
     vk_pipeline pipeline_sign_score, pipeline_mul_mat_masked_q4_0; // b65 sparse gate/up
-    vk_pipeline pipeline_soft_max_stats; // b65 softmax folded into V x P
+    vk_pipeline pipeline_soft_max_stats, pipeline_soft_max_stats_f16; // b65 softmax folded into V x P
     vk_pipeline pipeline_gated_delta_net_chunk; // b65
     vk_pipeline pipeline_ssm_conv_silu_f32;
     vk_pipeline pipeline_ssm_conv_bias_silu_f32;
@@ -1345,6 +1345,8 @@ struct ggml_backend_vk_context {
     bool fused_hc_post_gate {};
     bool fused_sm_mm {};          // b65: SOFT_MAX + MUL_MAT(V, P) fused
     bool sm_fuse_on {};
+    bool fused_kq_sm_mm {};       // b65: MUL_MAT(K,Q) + SOFT_MAX + MUL_MAT(V,P), f16 scores
+    uint8_t sm_mode {};
     vk_subbuffer sm_fuse_mask {};
     vk_subbuffer sm_fuse_stats {};
     rms_norm_mode fused_rms_norm_mode {RMS_NORM_COUNT};

@@ -2478,11 +2478,15 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             cm1_create({GGML_TYPE_F16, GGML_TYPE_F16, false, true},  tc_mm, "matmul_f16_f16acc", matmul_f16_f16acc_cm1_len, matmul_f16_f16acc_cm1_data, sizeof(vk_mat_mat_push_constants), 3);
             cm1_create({GGML_TYPE_F16, GGML_TYPE_F32, false, true},  tc_mm, "matmul_f16_f32_f16acc", matmul_f16_f32_f16acc_cm1_len, matmul_f16_f32_f16acc_cm1_data, sizeof(vk_mat_mat_push_constants), 3);
             cm1_create({GGML_TYPE_F16, GGML_TYPE_F32, false, true, true}, tc_mm, "matmul_f16_f32_smf_f16acc", matmul_f16_f32_smf_f16acc_cm1_len, matmul_f16_f32_smf_f16acc_cm1_data, sizeof(vk_mat_mat_push_constants), 5);   // b65
+            cm1_create({GGML_TYPE_F16, GGML_TYPE_F32, false, true, 2}, tc_mm, "matmul_f16_f32_d16_f16acc", matmul_f16_f32_d16_f16acc_cm1_len, matmul_f16_f32_d16_f16acc_cm1_data, sizeof(vk_mat_mat_push_constants), 3);   // b65
+            cm1_create({GGML_TYPE_F16, GGML_TYPE_F16, false, true, 3}, tc_mm, "matmul_f16_smf_f16acc", matmul_f16_smf_f16acc_cm1_len, matmul_f16_smf_f16acc_cm1_data, sizeof(vk_mat_mat_push_constants), 5);   // b65
         }
         if (device->coopmat_acc_f32_support) {
             cm1_create({GGML_TYPE_F16, GGML_TYPE_F16, false, false}, tc_mm, "matmul_f16",      matmul_f16_cm1_len,      matmul_f16_cm1_data,      sizeof(vk_mat_mat_push_constants), 3);
             cm1_create({GGML_TYPE_F16, GGML_TYPE_F32, false, false}, tc_mm, "matmul_f16_f32",  matmul_f16_f32_cm1_len,  matmul_f16_f32_cm1_data,  sizeof(vk_mat_mat_push_constants), 3);
             cm1_create({GGML_TYPE_F16, GGML_TYPE_F32, false, false, true}, tc_mm, "matmul_f16_f32_smf", matmul_f16_f32_smf_cm1_len, matmul_f16_f32_smf_cm1_data, sizeof(vk_mat_mat_push_constants), 5);   // b65
+            cm1_create({GGML_TYPE_F16, GGML_TYPE_F32, false, false, 2}, tc_mm, "matmul_f16_f32_d16", matmul_f16_f32_d16_cm1_len, matmul_f16_f32_d16_cm1_data, sizeof(vk_mat_mat_push_constants), 3);   // b65
+            cm1_create({GGML_TYPE_F16, GGML_TYPE_F16, false, false, 3}, tc_mm, "matmul_f16_smf", matmul_f16_smf_cm1_len, matmul_f16_smf_cm1_data, sizeof(vk_mat_mat_push_constants), 5);   // b65
         }
 #if defined(GGML_VULKAN_BFLOAT16_GLSLC_SUPPORT)
         if (device->coopmat_bf16_support) {
@@ -3861,6 +3865,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         ggml_vk_create_pipeline(device, device->pipeline_gated_delta_net_chunk, "gated_delta_net_chunk_f32", gated_delta_net_chunk_f32_len, gated_delta_net_chunk_f32_data, "main", 9, sizeof(vk_op_gated_delta_net_push_constants), {1, 1, 16}, {}, 1, true, true, 16);
     }
     ggml_vk_create_pipeline(device, device->pipeline_soft_max_stats, "soft_max_stats_f32", soft_max_stats_f32_len, soft_max_stats_f32_data, "main", 3, sizeof(vk_op_sm_stats_push_constants), {1, 1, 1}, {}, 1);   // b65
+    ggml_vk_create_pipeline(device, device->pipeline_soft_max_stats_f16, "soft_max_stats_f16", soft_max_stats_f16_len, soft_max_stats_f16_data, "main", 3, sizeof(vk_op_sm_stats_push_constants), {1, 1, 1}, {}, 1);   // b65
     ggml_vk_create_pipeline(device, device->pipeline_sign_score, "sign_score", sign_score_len, sign_score_data, "main", 5, sizeof(vk_op_sign_score_push_constants), {1, 1, 1}, {}, 1, false, true, 32);
     ggml_vk_create_pipeline(device, device->pipeline_mul_mat_masked_q4_0, "mul_mat_masked_q4_0", mul_mat_masked_q4_0_len, mul_mat_masked_q4_0_data, "main", 4, sizeof(vk_op_mm_masked_push_constants), {1, 1, 1}, {}, 1, false, true, 32);
     ggml_vk_create_pipeline(device, device->pipeline_kv_block_minmax, "kv_block_minmax", kv_block_minmax_len, kv_block_minmax_data, "main", 4, sizeof(vk_op_kv_minmax_push_constants), {256, 1, 1}, {}, 1);
@@ -6143,9 +6148,9 @@ static bool ggml_vk_get_mul_mat_mat_f16acc(ggml_backend_vk_context * ctx, ggml_t
 
 static const std::vector<vk_matmul_pipeline_pair>* ggml_vk_get_mul_mat_mat_pipeline_map(
         ggml_backend_vk_context * ctx, ggml_type src0_type, ggml_type src1_type, ggml_prec prec, bool mul_mat_id = false,
-        bool sm_fuse = false) {
+        uint32_t sm_fuse = 0) {
     bool f16acc = ggml_vk_get_mul_mat_mat_f16acc(ctx, src0_type, src1_type, prec);
-    vk_matmul_pipeline_key key{src0_type, src1_type, mul_mat_id, f16acc, sm_fuse};
+    vk_matmul_pipeline_key key{src0_type, src1_type, mul_mat_id, f16acc, (uint8_t)sm_fuse};
     auto it = ctx->device->pipeline_matmul.find(key);
     if (it == ctx->device->pipeline_matmul.end() || it->second.empty()) {
         // Try without f16acc
@@ -6585,7 +6590,7 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
 
     if (mmp_map == nullptr) {
         // Fall back to f16 dequant mul mat
-        mmp_map = ggml_vk_get_mul_mat_mat_pipeline_map(ctx, a_type, y_non_contig ? f16_type : src1->type, (ggml_prec)dst->op_params[0], false, ctx->sm_fuse_on);
+        mmp_map = ggml_vk_get_mul_mat_mat_pipeline_map(ctx, a_type, y_non_contig ? f16_type : src1->type, (ggml_prec)dst->op_params[0], false, ctx->sm_mode);
     }
 
     const bool qx_needs_dequant = mmp_map == nullptr || x_non_contig;
@@ -6594,7 +6599,7 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
 
     if (qx_needs_dequant) {
         // Fall back to dequant + f16 mulmat
-        mmp_map = ggml_vk_get_mul_mat_mat_pipeline_map(ctx, f16_type, y_f32_kernel ? GGML_TYPE_F32 : f16_type, (ggml_prec)dst->op_params[0], false, ctx->sm_fuse_on);
+        mmp_map = ggml_vk_get_mul_mat_mat_pipeline_map(ctx, f16_type, y_f32_kernel ? GGML_TYPE_F32 : f16_type, (ggml_prec)dst->op_params[0], false, ctx->sm_mode);
     }
 
     // Not implemented
@@ -6619,7 +6624,7 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     const uint64_t y_ne = padded_n * ne10 * ne12 * ne13;
     const uint64_t d_ne = ggml_nelements(dst);
 
-    const uint32_t split_k = ctx->sm_fuse_on ? 1 : ggml_vk_guess_split_k(ctx, ne01, ne11, ne10, disable_split_k, pipeline);
+    const uint32_t split_k = (ctx->sm_fuse_on || ctx->sm_mode) ? 1 : ggml_vk_guess_split_k(ctx, ne01, ne11, ne10, disable_split_k, pipeline);
 
     const uint64_t qx_sz = ggml_type_size(src0->type) * x_ne / ggml_blck_size(src0->type);
     const uint64_t qy_sz = ggml_type_size(src1->type) * y_ne / ggml_blck_size(src1->type);
@@ -6843,8 +6848,77 @@ static void ggml_vk_soft_max_mm_fused(ggml_backend_vk_context * ctx, vk_context&
     ctx->sm_fuse_mask = ggml_vk_tensor_subbuffer(ctx, mask);
     ctx->sm_fuse_stats = stats;
     ctx->sm_fuse_on = true;
+    ctx->sm_mode = 1;
     ggml_vk_mul_mat_q_f16(ctx, subctx, mm->src[0], scores, mm, true);
     ctx->sm_fuse_on = false;
+    ctx->sm_mode = 0;
+}
+
+// b65: MUL_MAT(K, Q) -> SOFT_MAX -> MUL_MAT(V, P) with f16 scores in the KQ tensor's memory (GGML_VK_SM_FUSE=2)
+static bool ggml_vk_can_fuse_kq_sm_mm(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    static const int level = getenv("GGML_VK_SM_FUSE") ? atoi(getenv("GGML_VK_SM_FUSE")) : 0;
+    if (level < 2 || !ctx->device->pipeline_soft_max_stats_f16 || node_idx + 2 >= cgraph->n_nodes) {
+        return false;
+    }
+    const ggml_tensor * kq = cgraph->nodes[node_idx];
+    const ggml_tensor * sm = cgraph->nodes[node_idx + 1];
+    const ggml_tensor * mm = cgraph->nodes[node_idx + 2];
+    if (kq->op != GGML_OP_MUL_MAT || sm->src[0] != kq || !ggml_vk_can_fuse_sm_mm(ctx, cgraph, node_idx + 1)) {
+        return false;
+    }
+    if (kq->src[0]->type != GGML_TYPE_F16 || kq->src[1]->type != GGML_TYPE_F32 || kq->type != GGML_TYPE_F32 ||
+        !ggml_is_contiguous(kq) || kq->src[1]->ne[1] < 32 || (kq->ne[0] % 2) != 0) {
+        return false;
+    }
+    // the fused V x P reads the scores while writing its output: they must not share memory
+    if (ggml_vk_tensors_overlap(kq, mm, false)) {
+        return false;
+    }
+    const ggml_prec kq_prec = (ggml_prec)kq->op_params[0];
+    const ggml_prec mm_prec = (ggml_prec)mm->op_params[0];
+    return ggml_vk_get_mul_mat_mat_pipeline_map(ctx, GGML_TYPE_F16, GGML_TYPE_F32, kq_prec, false, 2) != nullptr &&
+           ggml_vk_get_mul_mat_mat_pipeline_map(ctx, GGML_TYPE_F16, GGML_TYPE_F16, mm_prec, false, 3) != nullptr;
+}
+
+static void ggml_vk_kq_sm_mm_fused(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    ggml_tensor * kq = cgraph->nodes[node_idx];
+    ggml_tensor * sm = cgraph->nodes[node_idx + 1];
+    ggml_tensor * mm = cgraph->nodes[node_idx + 2];
+    const ggml_tensor * mask = sm->src[1];
+
+    // the scores as an f16 tensor in the same memory
+    ggml_tensor kq16 = *kq;
+    kq16.type = GGML_TYPE_F16;
+    kq16.nb[0] = sizeof(ggml_fp16_t);
+    kq16.nb[1] = kq16.nb[0] * kq->ne[0];
+    kq16.nb[2] = kq16.nb[1] * kq->ne[1];
+    kq16.nb[3] = kq16.nb[2] * kq->ne[2];
+
+    ctx->sm_mode = 2;
+    ggml_vk_mul_mat_q_f16(ctx, subctx, kq->src[0], kq->src[1], &kq16, true);
+    ctx->sm_mode = 0;
+    ggml_vk_sync_buffers(ctx, subctx);
+
+    const uint32_t nrows = (uint32_t)ggml_nrows(kq);
+    vk_op_sm_stats_push_constants pc = {
+        (uint32_t)kq->ne[0], (uint32_t)kq->ne[1], (uint32_t)(mask->nb[1] / mask->nb[0]), nrows,
+        ((const float *)sm->op_params)[0],
+    };
+    vk_subbuffer stats = ggml_vk_tensor_subbuffer(ctx, sm);
+    vk_pipeline pipeline = ctx->device->pipeline_soft_max_stats_f16;
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+    const uint32_t gx = std::min(nrows, 65535u);
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { ggml_vk_tensor_subbuffer(ctx, &kq16), ggml_vk_tensor_subbuffer(ctx, mask), stats },
+                              pc, { gx, CEIL_DIV(nrows, gx), 1 });
+    ggml_vk_sync_buffers(ctx, subctx);
+
+    ctx->sm_fuse_mask = ggml_vk_tensor_subbuffer(ctx, mask);
+    ctx->sm_fuse_stats = stats;
+    ctx->sm_fuse_on = true;
+    ctx->sm_mode = 3;
+    ggml_vk_mul_mat_q_f16(ctx, subctx, mm->src[0], &kq16, mm, true);
+    ctx->sm_fuse_on = false;
+    ctx->sm_mode = 0;
 }
 
 static bool ggml_vk_should_use_mmvq(const vk_device& device, uint32_t m, uint32_t n, uint32_t k, ggml_type src0_type) {
@@ -13326,7 +13400,11 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
 
         break;
     case GGML_OP_MUL_MAT:
-        ggml_vk_mul_mat(ctx, compute_ctx, cgraph, node_idx);
+        if (ctx->fused_kq_sm_mm) {
+            ggml_vk_kq_sm_mm_fused(ctx, compute_ctx, cgraph, node_idx);   // b65
+        } else {
+            ggml_vk_mul_mat(ctx, compute_ctx, cgraph, node_idx);
+        }
 
         break;
     case GGML_OP_MUL_MAT_ID:
@@ -15231,11 +15309,17 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_topk_qsa = false;
         ctx->fused_hc_post_gate = false;
         ctx->fused_sm_mm = false;
+        ctx->fused_kq_sm_mm = false;
         ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
         const char *fusion_string {};
         if (!ctx->device->disable_fusion) {
             uint32_t num_adds = ggml_vk_fuse_multi_add(ctx, cgraph, i);
-            if (ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_SOFT_MAX, GGML_OP_MUL_MAT }) && ggml_vk_can_fuse_sm_mm(ctx, cgraph, i)) {
+            if (ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_SOFT_MAX, GGML_OP_MUL_MAT }) && ggml_vk_can_fuse_kq_sm_mm(ctx, cgraph, i)) {
+                ctx->num_additional_fused_ops = 2;   // b65
+                ctx->fused_kq_sm_mm = true;
+                fusion_string = "MUL_MAT_SOFT_MAX_MUL_MAT";
+                std::fill_n(op_srcs_fused_elementwise, 3, false);
+            } else if (ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_SOFT_MAX, GGML_OP_MUL_MAT }) && ggml_vk_can_fuse_sm_mm(ctx, cgraph, i)) {
                 ctx->num_additional_fused_ops = 1;   // b65
                 ctx->fused_sm_mm = true;
                 fusion_string = "SOFT_MAX_MUL_MAT";
@@ -15479,6 +15563,8 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_topk_moe_scale = false;
                 ctx->fused_topk_qsa = false;
                 ctx->fused_hc_post_gate = false;
+                ctx->fused_sm_mm = false;
+                ctx->fused_kq_sm_mm = false;
                 ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
                 fusion_string = nullptr;
             }
