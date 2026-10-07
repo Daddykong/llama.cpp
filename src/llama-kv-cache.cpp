@@ -1149,6 +1149,19 @@ void llama_kv_cache::sparse_ensure(uint32_t n_cells) {
     static commit_fn commit = nullptr;
     static bool warned = false;
     sparse_step stp{ c0, c1, 0, {} };
+    if (c0 == 0) {   // b65: Quest block summaries, whole tensor, once
+        for (const auto & layer : layers) {
+            ggml_tensor * t = layer.kmm;
+            if (!t || !t->buffer) continue;
+            ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(t->buffer));
+            ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+            auto * cf = reg ? (commit_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_vk_sparse_commit") : nullptr;
+            if (!cf) break;
+            const size_t off = (size_t) ((char *) t->data - (char *) ggml_backend_buffer_get_base(t->buffer));
+            const size_t sz = ggml_nbytes(t);
+            if (cf(t->buffer, &off, &sz, 1, 0) < 0) cf(t->buffer, &off, &sz, 1, 1);
+        }
+    }
     for (const auto & layer : layers) {
         for (ggml_tensor * t : { layer.k, layer.v }) {
             if (!t || !t->buffer) {
