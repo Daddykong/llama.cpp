@@ -7856,7 +7856,10 @@ void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, const st
     ggml_tensor * src1 = dst->src[1];
     VK_LOG_DEBUG("ggml_vk_mul_mat(" << src0 << ", " << src1 << ", " << dst << ")");
 
-    ggml_vk_q4_0r_ensure(ctx, subctx, src0);
+    // b65: reorder only for f32 activations; the reordered matvecs need the q8_1 (MMVQ) path, which f16 B never takes
+    if (src1->type == GGML_TYPE_F32) {
+        ggml_vk_q4_0r_ensure(ctx, subctx, src0);
+    }
 
     // Handle huge A matrix by splitting the M dimensions. This works well for convolution use cases
     // where the M dimension is very large.
