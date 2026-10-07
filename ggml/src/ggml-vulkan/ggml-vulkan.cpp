@@ -8036,6 +8036,37 @@ void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, const st
         ggml_vk_q4_0r_ensure(ctx, subctx, src0);
     }
 
+    // b65 [mtp]: GGML_VK_MV_CHUNK_MAX=<N>: 9..N columns (long ngram drafts in the MTP-chain verify) as mat-vec
+    // dispatches of up to mul_mat_vec_max_cols columns each instead of one tiled matmul, whose tiles are far wider
+    // than the batch (the matmul path costs about as much as a 128-column batch there)
+    static const int64_t mv_chunk_max = getenv("GGML_VK_MV_CHUNK_MAX") ? atoll(getenv("GGML_VK_MV_CHUNK_MAX")) : 0;
+    if (mv_chunk_max > (int64_t) mul_mat_vec_max_cols && dst->ne[1] > (int64_t) mul_mat_vec_max_cols && dst->ne[1] <= mv_chunk_max &&
+        ctx->num_additional_fused_ops == 0 && dst->ne[2] == 1 && dst->ne[3] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1 &&
+        src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && ggml_is_contiguous(dst) && ggml_is_contiguous(src0) &&
+        ggml_is_quantized(src0->type) && src0->ne[2] == 1 && src0->ne[3] == 1 &&
+        ggml_nbytes(src0) <= ctx->device->properties.limits.maxStorageBufferRange) {
+        const int64_t n = dst->ne[1];
+        for (int64_t c0 = 0; c0 < n; c0 += mul_mat_vec_max_cols) {
+            const int64_t nc = std::min<int64_t>(mul_mat_vec_max_cols, n - c0);
+            ggml_tensor s1 = *src1;
+            ggml_tensor d  = *dst;
+            const size_t off1 = (size_t) c0 * src1->nb[1];
+            const size_t offd = (size_t) c0 * dst->nb[1];
+            if (s1.view_src) { s1.view_offs += off1; } else { s1.data = (char *) s1.data + off1; }
+            if (d.view_src)  { d.view_offs  += offd; } else { d.data  = (char *) d.data  + offd; }
+            s1.ne[1] = nc; s1.nb[2] = s1.nb[1] * nc; s1.nb[3] = s1.nb[2];
+            d.ne[1]  = nc; d.nb[2]  = d.nb[1]  * nc; d.nb[3]  = d.nb[2];
+            d.src[1] = &s1;
+            ggml_tensor * nodes[1] = { &d };
+            ggml_cgraph g = {};
+            g.size = 1; g.n_nodes = 1; g.nodes = nodes;
+            ctx->prealloc_y_last_tensor_used = nullptr;   // the stack copies must never match the q8_1 cache
+            ggml_vk_mul_mat_vec_q_f16(ctx, subctx, &g, 0);
+            ctx->prealloc_y_last_tensor_used = nullptr;
+        }
+        return;
+    }
+
     // Handle huge A matrix by splitting the M dimensions. This works well for convolution use cases
     // where the M dimension is very large.
     // Split_k doesn't work with M splitting.

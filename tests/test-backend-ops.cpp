@@ -9554,6 +9554,12 @@ static void add_b65_sparse_t_cases(std::vector<std::unique_ptr<test_case>> & tes
             }
         }
     }
+    // b65 [mtp]: 9-65 column batches (GGML_VK_MV_CHUNK_MAX: chunked mat-vec)
+    for (ggml_type t : {GGML_TYPE_Q4_0, GGML_TYPE_Q5_K, GGML_TYPE_Q4_1, GGML_TYPE_Q8_0}) {
+        for (int64_t n : {9, 17, 42, 65}) {
+            test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 256, n, 1024, {1, 1}, {1, 1}));
+        }
+    }
     test_cases.emplace_back(new test_b65_mm_add(GGML_TYPE_Q4_0, 5120, 3, 17408, 1));
     test_cases.emplace_back(new test_b65_mm_add(GGML_TYPE_Q5_K, 5120, 3, 6144, 1));
     // b65 row-reordered weights (GGML_VK_*_REPACK=2): model-sized k, decode (1-8 tokens) and prompt batches;
