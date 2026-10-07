@@ -1546,6 +1546,28 @@ size_t b65_place::evict(size_t need) {
     return freed;
 }
 
+size_t b65_place::restore(size_t room) {
+    std::vector<b65_place_entry *> cand;
+    for (auto & e : ffn) {
+        if (e.where == 1) cand.push_back(&e);
+    }
+    std::sort(cand.begin(), cand.end(), [](const b65_place_entry * a, const b65_place_entry * b) { return a->prio < b->prio; });
+    size_t moved = 0;
+    bool synced = false;
+    for (auto * e : cand) {
+        if (e->bytes > room - moved) break;   // keep order: do not skip ahead to smaller layers
+        static b65_move_fn move = nullptr;
+        if (!move) move = (b65_move_fn) b65_vk_proc(e->buf, "ggml_backend_vk_sparse_move");
+        if (!move) break;
+        if (!synced && sync) { sync(); synced = true; }
+        if (!move(e->buf, e->handle, 0)) break;   // VRAM full after all
+        e->where = 0;
+        moved += e->bytes;
+        LLAMA_LOG_INFO("%s: FFN of layer %d back in VRAM (%.0f MB)\n", __func__, e->il, e->bytes / 1e6);
+    }
+    return moved;
+}
+
 // commit a freshly allocated sparse weight buffer: non-FFN in VRAM, FFN per layer in keep order within the budget
 static void b65_place_commit(ggml_context * ctx, ggml_backend_buffer_t buf) {
     auto commit = (b65_commit_fn) b65_vk_proc(buf, "ggml_backend_vk_sparse_commit");

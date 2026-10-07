@@ -24,6 +24,7 @@ struct b65_place {
     bool active() const { return !ffn.empty() && budget_mb > 0; }
     size_t vram_weights() const;
     size_t evict(size_t need);   // FFN layers to system RAM until `need` bytes are freed; returns bytes freed
+    size_t restore(size_t room); // FFN layers back to VRAM (keep order) within `room` bytes; returns bytes moved
 };
 
 b65_place & b65_place_get();

@@ -324,7 +324,14 @@ private:
     bool sparse = false;
     uint32_t sparse_cells = 0;
     size_t sparse_vram = 0;
+    struct sparse_step {
+        uint32_t c0, c1;
+        size_t vram;
+        std::vector<std::pair<ggml_backend_buffer_t, int>> handles;
+    };
+    std::vector<sparse_step> sparse_steps;
     void sparse_ensure(uint32_t n_cells);
+    void sparse_shrink(uint32_t n_cells);
 
     // model layer id -> KV cache layer id
     std::unordered_map<int32_t, int32_t> map_layer_ids;

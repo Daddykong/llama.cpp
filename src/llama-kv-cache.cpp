@@ -1148,6 +1148,7 @@ void llama_kv_cache::sparse_ensure(uint32_t n_cells) {
     typedef int (*commit_fn)(ggml_backend_buffer_t, const size_t *, const size_t *, int, int);
     static commit_fn commit = nullptr;
     static bool warned = false;
+    sparse_step stp{ c0, c1, 0, {} };
     for (const auto & layer : layers) {
         for (ggml_tensor * t : { layer.k, layer.v }) {
             if (!t || !t->buffer) {
@@ -1201,11 +1202,43 @@ void llama_kv_cache::sparse_ensure(uint32_t n_cells) {
             }
             if (where == 0) {
                 sparse_vram += want;
+                stp.vram += want;
             }
+            stp.handles.push_back({ t->buffer, h });
         }
     }
+    sparse_steps.push_back(std::move(stp));
     LLAMA_LOG_INFO("%s: sparse KV now holds cells [0, %u), %.1f MB of it in VRAM\n", __func__, c1, sparse_vram / 1e6);
     sparse_cells = c1;
+}
+
+// b65: release committed steps past n_cells (cells there are unused), then give VRAM back to FFN layers
+void llama_kv_cache::sparse_shrink(uint32_t n_cells) {
+    typedef void (*release_fn)(ggml_backend_buffer_t, int);
+    static release_fn release = nullptr;
+    b65_place & pl = b65_place_get();
+    bool synced = false;
+    while (!sparse_steps.empty() && sparse_steps.back().c0 >= n_cells) {
+        sparse_step & s = sparse_steps.back();
+        for (auto & [buf, h] : s.handles) {
+            if (!release) {
+                ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(buf));
+                ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+                release = reg ? (release_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_vk_sparse_release") : nullptr;
+                if (!release) return;
+            }
+            if (!synced && pl.sync) { pl.sync(); synced = true; }
+            release(buf, h);
+        }
+        sparse_vram -= s.vram;
+        sparse_cells = s.c0;
+        sparse_steps.pop_back();
+    }
+    LLAMA_LOG_INFO("%s: sparse KV released down to cells [0, %u), %.1f MB in VRAM\n", __func__, sparse_cells, sparse_vram / 1e6);
+    if (pl.active()) {
+        const double room = pl.budget_mb * 1e6 - (double) (pl.vram_weights() + sparse_vram);
+        if (room > 0) pl.restore((size_t) room);
+    }
 }
 
 void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch) {
@@ -1221,7 +1254,11 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
                 need = std::max(need, (uint32_t) sinfo.idxs[s][i] + 1);
             }
         }
-        sparse_ensure(std::max(need, get_n_kv(sinfo)));
+        need = std::max(need, get_n_kv(sinfo));
+        if (need * 2 < sparse_cells && sparse_steps.size() > 1) {
+            sparse_shrink(need);   // hysteresis: only when under half of what is held
+        }
+        sparse_ensure(need);
     }
 
     // keep track of the max sequence position that we would overwrite with this ubatch
