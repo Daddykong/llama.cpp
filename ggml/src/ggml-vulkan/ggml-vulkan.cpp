@@ -6322,6 +6322,16 @@ static vk_pipeline ggml_vk_guess_matmul_pipeline_map(ggml_backend_vk_context * c
         uint32_t m, uint32_t n, bool aligned, bool mul_mat_id) {
     auto& selector = mul_mat_id ? ctx->device->matmul_id_tile_selector : ctx->device->matmul_tile_selector;
     uint32_t idx = selector(m, n, 0, ctx->device->shader_core_count, configs);
+    // b65 [mtp]: GGML_VK_MM_SMALLN=<nmax>:<idx> forces tile config <idx> (0 = s, 1 = m, 2 = l) for 9..nmax columns
+    // (multi-token MTP / ngram verify batches), to find the cheapest tile there (experiment)
+    static const char * smalln = getenv("GGML_VK_MM_SMALLN");
+    if (smalln && !mul_mat_id) {
+        static const uint32_t sn_max = (uint32_t)atoi(smalln);
+        static const uint32_t sn_idx = strchr(smalln, ':') ? (uint32_t)atoi(strchr(smalln, ':') + 1) : 1u;
+        if (n <= sn_max) {
+            idx = sn_idx;
+        }
+    }
     if (idx >= configs.size()) idx = (uint32_t)configs.size() - 1;
     return (aligned && configs[idx].aligned) ? configs[idx].aligned : configs[idx].unaligned;
 }
@@ -6331,6 +6341,14 @@ static uint32_t ggml_vk_guess_matmul_pipeline_align_map(ggml_backend_vk_context 
         uint32_t m, uint32_t n, bool mul_mat_id) {
     auto& selector = mul_mat_id ? ctx->device->matmul_id_tile_selector : ctx->device->matmul_tile_selector;
     uint32_t idx = selector(m, n, 0, ctx->device->shader_core_count, configs);
+    static const char * smalln = getenv("GGML_VK_MM_SMALLN");   // b65 [mtp]: keep in step with the pipeline choice
+    if (smalln && !mul_mat_id) {
+        static const uint32_t sn_max = (uint32_t)atoi(smalln);
+        static const uint32_t sn_idx = strchr(smalln, ':') ? (uint32_t)atoi(strchr(smalln, ':') + 1) : 1u;
+        if (n <= sn_max) {
+            idx = sn_idx;
+        }
+    }
     if (idx >= configs.size()) idx = (uint32_t)configs.size() - 1;
     return configs[idx].align;
 }
