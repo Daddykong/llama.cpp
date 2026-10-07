@@ -9524,7 +9524,7 @@ static void add_b65_sparse_t_cases(std::vector<std::unique_ptr<test_case>> & tes
     test_cases.emplace_back(new test_b65_sm_mm(4096, 512, 256, 24, 4, true, GGML_TYPE_F32));
     // b65 row-reordered weights (GGML_VK_*_REPACK=2): model-sized k, decode (1-8 tokens) and prompt batches;
     // k=1280 (5 IQ4_XS superblocks) is not eligible for the IQ4_XS reorder and checks the fallback
-    for (ggml_type t : {GGML_TYPE_IQ4_XS, GGML_TYPE_Q5_K, GGML_TYPE_Q8_0, GGML_TYPE_IQ4_NL, GGML_TYPE_Q6_K, GGML_TYPE_Q4_1}) {
+    for (ggml_type t : {GGML_TYPE_IQ4_XS, GGML_TYPE_Q5_K, GGML_TYPE_Q8_0, GGML_TYPE_IQ4_NL, GGML_TYPE_Q6_K, GGML_TYPE_Q4_1, GGML_TYPE_Q4_0}) {
         for (int64_t k : {1024, 5120, 1280}) {
             for (int64_t n : {1, 2, 3, 4, 8, 17, 512}) {
                 test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 64, n, k, {1, 1}, {1, 1}));
@@ -11822,6 +11822,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     }
     for (float thr : {0.0f, 0.4f, 0.5f, 0.6f}) for (int nc : {24, 48, 96}) test_cases.emplace_back(new test_mul_mat_sparse_t(GGML_TYPE_Q4_0, 5120, 17408, 1, nc, thr));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 5120, 1, 17408, {1, 1}, {1, 1}));
+    // b65 [mtp]: Qwen3.8-27B weight matvecs at 1-4 columns (MTP verify = 3); m x k as the model uses them
+    {
+        struct mshape { ggml_type t; int64_t m, k; };
+        const mshape shapes[] = {
+            {GGML_TYPE_Q4_0, 17408, 5120}, {GGML_TYPE_Q4_0, 5120, 17408}, {GGML_TYPE_Q4_0, 10240, 5120},
+            {GGML_TYPE_Q4_0, 12288, 5120}, {GGML_TYPE_Q4_0, 6144, 5120}, {GGML_TYPE_Q4_0, 5120, 6144},
+            {GGML_TYPE_Q4_0, 1024, 5120}, {GGML_TYPE_Q5_K, 5120, 6144}, {GGML_TYPE_Q4_1, 5120, 17408},
+            {GGML_TYPE_Q8_0, 248320, 5120}, {GGML_TYPE_F16, 48, 5120},
+        };
+        for (const auto & sh : shapes) {
+            for (int n : {1, 2, 3, 4}) {
+                test_cases.emplace_back(new test_mul_mat(sh.t, GGML_TYPE_F32, sh.m, n, sh.k, {1, 1}, {1, 1}));
+            }
+        }
+    }
 
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
     // note: same bytes either way, so a backend that indexes them differently shows it here

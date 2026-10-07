@@ -3095,8 +3095,18 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                     // B65 tuning knobs (experiment): 16-byte loads, rows per workgroup
                     // measured on Arc Pro B65: one 16-byte load per block and one row per workgroup is fastest
                     const bool k32 = getenv("GGML_VK_Q4_0R_K16") == nullptr;
-                    const uint32_t rows = getenv("GGML_VK_Q4_0R_ROWS") ? (uint32_t)atoi(getenv("GGML_VK_Q4_0R_ROWS")) : 1u;
-                    ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q4_0R_VK][i], "mul_mat_vec_q4_0r_q8_1_f32", k32 ? q4_0r_k32_len[reduc] : q4_0r_len[reduc], k32 ? q4_0r_k32_data[reduc] : q4_0r_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rows, 1, 1}, {wg_size_subgroup_leg, rows, i+1}, 1, true, use_subgroups, subgroup_size_leg);
+                    uint32_t rows = getenv("GGML_VK_Q4_0R_ROWS") ? (uint32_t)atoi(getenv("GGML_VK_Q4_0R_ROWS")) : 1u;
+                    // b65 [mtp]: 2-8 columns (MTP verify): GGML_VK_Q4_0R_MC=1 loads/unpacks each weight block once for all
+                    // columns; GGML_VK_Q4_0R_ROWS_MC=<r> rows per workgroup (each q8_1 load reused for r rows)
+                    static const void * const q4_0r_mc_data[3] = { mul_mat_vec_q4_0r_mc_q8_1_f32_data, mul_mat_vec_q4_0r_mc_q8_1_f32_subgroup_data, mul_mat_vec_q4_0r_mc_q8_1_f32_subgroup_no_shmem_data };
+                    static const uint64_t     q4_0r_mc_len[3]  = { mul_mat_vec_q4_0r_mc_q8_1_f32_len,  mul_mat_vec_q4_0r_mc_q8_1_f32_subgroup_len,  mul_mat_vec_q4_0r_mc_q8_1_f32_subgroup_no_shmem_len };
+                    const bool mc = i > 0 && k32 && getenv("GGML_VK_Q4_0R_MC") != nullptr && atoi(getenv("GGML_VK_Q4_0R_MC")) != 0;
+                    if (i > 0 && getenv("GGML_VK_Q4_0R_ROWS_MC")) {
+                        rows = (uint32_t)atoi(getenv("GGML_VK_Q4_0R_ROWS_MC"));
+                    }
+                    ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q4_0R_VK][i], mc ? "mul_mat_vec_q4_0r_mc_q8_1_f32" : "mul_mat_vec_q4_0r_q8_1_f32",
+                                            mc ? q4_0r_mc_len[reduc] : (k32 ? q4_0r_k32_len[reduc] : q4_0r_len[reduc]), mc ? q4_0r_mc_data[reduc] : (k32 ? q4_0r_k32_data[reduc] : q4_0r_data[reduc]),
+                                            "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rows, 1, 1}, {wg_size_subgroup_leg, rows, i+1}, 1, true, use_subgroups, subgroup_size_leg);
                 }
                 {
                     // row-reordered Q5_K / Q8_0 (GGML_VK_Q5_K_REPACK / GGML_VK_Q8_0_REPACK): one 32-value block per thread

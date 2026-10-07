@@ -46,7 +46,51 @@ void r5_scale_min(const uvec4 hdr, const uint j, out float sc, out float m) {
 }
 #endif
 
-#if defined(DATA_A_Q5_KR) || defined(DATA_A_Q8_0R) || defined(DATA_A_IQ4_XSR) || defined(DATA_A_IQ4_NLR) || defined(DATA_A_Q6_KR) || defined(DATA_A_Q4_1R)
+#if defined(DATA_A_Q4_0R) && defined(Q4_0R_K32) && defined(Q4_0R_MC)
+// b65 [mtp]: multi-column (MTP verify) Q4_0R: the q8_1 blocks of every column are loaded first, then each weight
+// block is loaded and unpacked once and used for all columns. Per-block arithmetic is the single-column formula in
+// the same order, so the result per column equals the n=1 kernel's (batch invariance kept).
+void iter(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const uint num_rows, const uint col, const uint b_qs_idx) {
+    ivec4 b0[NUM_COLS], b1[NUM_COLS];
+    vec2 bds[NUM_COLS];
+    [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+        const uint b_block_idx = (j*p.batch_stride_b + col) / QUANT_K_Q8_1 + b_offset;
+        const uint bo = b_block_idx / 4;
+        const uint bi = b_block_idx % 4;
+        bds[j] = vec2(data_b[bo].ds[bi]);
+        const uint bv = bo * 9 + 1 + bi * 2;
+        b0[j] = data_b_r128[bv];
+        b1[j] = data_b_r128[bv + 1];
+    }
+    const uint nbpr = p.ncols / QUANT_K;
+    const uint jb = col / QUANT_K;
+    uint rsb = first_row * nbpr + a_offset;
+    [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+        const uvec4 q = data_a_r128[(rsb * 9) / 8 + jb];
+        const float da = float(data_a_r16[rsb * 9 + nbpr * 8 + jb]);
+        rsb += nbpr;
+        const int32_t a0 = int32_t( q.x       & 0x0F0F0F0F);
+        const int32_t a1 = int32_t( q.y       & 0x0F0F0F0F);
+        const int32_t a2 = int32_t( q.z       & 0x0F0F0F0F);
+        const int32_t a3 = int32_t( q.w       & 0x0F0F0F0F);
+        const int32_t a4 = int32_t((q.x >> 4) & 0x0F0F0F0F);
+        const int32_t a5 = int32_t((q.y >> 4) & 0x0F0F0F0F);
+        const int32_t a6 = int32_t((q.z >> 4) & 0x0F0F0F0F);
+        const int32_t a7 = int32_t((q.w >> 4) & 0x0F0F0F0F);
+        [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+            int32_t q_sum = dotPacked4x8EXT(a0, b0[j].x);
+            q_sum += dotPacked4x8EXT(a1, b0[j].y);
+            q_sum += dotPacked4x8EXT(a2, b0[j].z);
+            q_sum += dotPacked4x8EXT(a3, b0[j].w);
+            q_sum += dotPacked4x8EXT(a4, b1[j].x);
+            q_sum += dotPacked4x8EXT(a5, b1[j].y);
+            q_sum += dotPacked4x8EXT(a6, b1[j].z);
+            q_sum += dotPacked4x8EXT(a7, b1[j].w);
+            temp[j][n] += FLOAT_TYPE(da * (float(q_sum) * bds[j].x - 8.0 * bds[j].y));
+        }
+    }
+}
+#elif defined(DATA_A_Q5_KR) || defined(DATA_A_Q8_0R) || defined(DATA_A_IQ4_XSR) || defined(DATA_A_IQ4_NLR) || defined(DATA_A_Q6_KR) || defined(DATA_A_Q4_1R)
 // b65: decode the 32-value weight block at column col of row `row` into 8 packed int8 words (a[0..3] pair with q8_1
 // ints 0..3, a[4..7] with 4..7) and coefficients c (see ir6_patch.py)
 void rk_decode(const uint row, const uint col, out int32_t a[8], out vec3 c) {

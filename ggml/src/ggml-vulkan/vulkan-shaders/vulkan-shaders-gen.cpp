@@ -840,6 +840,10 @@ void process_shaders() {
                 string_to_spv("mul_mat_vec_q4_0r_k32_q8_1_f32", "mul_mat_vecq.comp", merge_maps(base_dict, {{data_a_key, "1"}, {"DATA_A_Q4_0R", "1"}, {"Q4_0R_K32", "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"FLOAT_TYPEV2", "vec2"}, {"ACC_TYPE", "float"}}));
                 string_to_spv("mul_mat_vec_q4_0r_k32_q8_1_f32_subgroup", "mul_mat_vecq.comp", merge_maps(base_dict, {{data_a_key, "1"}, {"DATA_A_Q4_0R", "1"}, {"Q4_0R_K32", "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"FLOAT_TYPEV2", "vec2"}, {"ACC_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}}));
                 string_to_spv("mul_mat_vec_q4_0r_k32_q8_1_f32_subgroup_no_shmem", "mul_mat_vecq.comp", merge_maps(base_dict, {{data_a_key, "1"}, {"DATA_A_Q4_0R", "1"}, {"Q4_0R_K32", "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"FLOAT_TYPEV2", "vec2"}, {"ACC_TYPE", "float"}, {"USE_SUBGROUP_ADD_NO_SHMEM", "1"}}));
+                // b65 [mtp]: multi-column (MTP verify) variant: each weight block loaded and unpacked once for all columns
+                string_to_spv("mul_mat_vec_q4_0r_mc_q8_1_f32", "mul_mat_vecq.comp", merge_maps(base_dict, {{data_a_key, "1"}, {"DATA_A_Q4_0R", "1"}, {"Q4_0R_K32", "1"}, {"Q4_0R_MC", "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"FLOAT_TYPEV2", "vec2"}, {"ACC_TYPE", "float"}}));
+                string_to_spv("mul_mat_vec_q4_0r_mc_q8_1_f32_subgroup", "mul_mat_vecq.comp", merge_maps(base_dict, {{data_a_key, "1"}, {"DATA_A_Q4_0R", "1"}, {"Q4_0R_K32", "1"}, {"Q4_0R_MC", "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"FLOAT_TYPEV2", "vec2"}, {"ACC_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}}));
+                string_to_spv("mul_mat_vec_q4_0r_mc_q8_1_f32_subgroup_no_shmem", "mul_mat_vecq.comp", merge_maps(base_dict, {{data_a_key, "1"}, {"DATA_A_Q4_0R", "1"}, {"Q4_0R_K32", "1"}, {"Q4_0R_MC", "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"FLOAT_TYPEV2", "vec2"}, {"ACC_TYPE", "float"}, {"USE_SUBGROUP_ADD_NO_SHMEM", "1"}}));
             }
 
             if (tname == "q5_k" || tname == "q8_0" || tname == "iq4_xs" || tname == "q6_k" || tname == "q4_1") {
