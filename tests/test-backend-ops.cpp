@@ -9425,6 +9425,11 @@ struct test_b65_sm_mm : public test_case {
 };
 
 static void add_b65_sparse_t_cases(std::vector<std::unique_ptr<test_case>> & test_cases) {
+    // b65 q8_0 K cache on the GQA rows2 kernel (run with GGML_VK_GQA_ROWS2=1): K x Q, GQA 6, 1 and 3 tokens
+    for (int nt : {1, 3}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 4096, nt, 256, {4, 1}, {6, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 1000, nt, 128, {2, 1}, {4, 1}));
+    }
     test_cases.emplace_back(new test_b65_sm_mm(512, 64, 128, 8, 2));
     test_cases.emplace_back(new test_b65_sm_mm(1000, 100, 128, 6, 1));
     test_cases.emplace_back(new test_b65_sm_mm(4096, 512, 256, 24, 4));

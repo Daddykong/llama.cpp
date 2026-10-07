@@ -42,13 +42,26 @@ void main() {
         }
     }
 
+#if defined(DATA_A_Q8_0)
+    const uint a_base = p.a_offset + h * p.a_chan_stride + rr * p.a_row_stride;   // q8_0 blocks
+#else
     const uint a_base = (p.a_offset + h * p.a_chan_stride + rr * p.a_row_stride) / 4;
+#endif
     const uint b_base = (p.b_offset + h * GQA * p.b_chan_stride) / 4;
     const uint b_cs = p.b_chan_stride / 4;
     const uint b_ts = p.b_tok_stride / 4;
 
     for (uint k4 = j; live && k4 < p.ncols / 4; k4 += LPR) {
+#if defined(DATA_A_Q8_0)
+        const uint ib = a_base + k4 / 8;
+        const uint w = (k4 % 8) * 2;
+        const float dq = float(data_a_packed16[ib].d);
+        const uint v0 = uint(data_a_packed16[ib].qs[w]), v1 = uint(data_a_packed16[ib].qs[w + 1]);
+        const vec4 av = vec4(float(int(v0 << 24) >> 24), float(int(v0 << 16) >> 24),
+                             float(int(v1 << 24) >> 24), float(int(v1 << 16) >> 24)) * dq;
+#else
         const vec4 av = vec4(data_a_v4[a_base + k4]);
+#endif
         [[unroll]] for (uint t = 0; t < NTOK; ++t) {
             [[unroll]] for (uint c = 0; c < GQA; ++c) {
                 acc[t * GQA + c] += dot(av, data_b_v4[b_base + c * b_cs + t * b_ts + k4]);

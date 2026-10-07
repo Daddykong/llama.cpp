@@ -3349,6 +3349,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             }
             if (device->subgroup_clustered) {   // b65 rows2 (8 lanes per row)
                 ggml_vk_create_pipeline2(device, device->pipeline_mul_mat_vec_gqa_rows2_f16_f32[g][t], "mul_mat_vec_gqa_rows2_f16_f32" + sfx, mul_mat_vec_gqa_rows2_f16_f32_len, mul_mat_vec_gqa_rows2_f16_f32_data, "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_gqa_push_constants), {1, 1, 1}, {g + 1, t + 1}, 1);
+                ggml_vk_create_pipeline2(device, device->pipeline_mul_mat_vec_gqa_rows2_q8_0_f32[g][t], "mul_mat_vec_gqa_rows2_q8_0_f32" + sfx, mul_mat_vec_gqa_rows2_q8_0_f32_len, mul_mat_vec_gqa_rows2_q8_0_f32_data, "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_gqa_push_constants), {1, 1, 1}, {g + 1, t + 1}, 1);   // b65
             }
         }
     }
@@ -7361,9 +7362,24 @@ static void ggml_vk_mul_mat_vec_p021_f16_f32(ggml_backend_vk_context * ctx, vk_c
 // grouped GQA per A channel, so each row of A is read once for all of them. Any A/B row and channel
 // strides (multiples of 4 elements); dst contiguous.
 static bool ggml_vk_mul_mat_vec_gqa_ok(const ggml_backend_vk_context * ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
+    // b65: a q8_0 K cache runs on the rows2 kernel (short k only)
+    const bool q8 = src0->type == GGML_TYPE_Q8_0;
     if (!ctx->device->mul_mat_vec_gqa || !ctx->device->subgroup_arithmetic || ctx->num_additional_fused_ops != 0 ||
-        src0->type != GGML_TYPE_F16 || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+        (src0->type != GGML_TYPE_F16 && !q8) || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
         return false;
+    }
+    if (q8) {
+        const bool rows2 = ctx->device->subgroup_clustered && getenv("GGML_VK_GQA_ROWS2") != nullptr && atoi(getenv("GGML_VK_GQA_ROWS2")) != 0;
+        const size_t bs = ggml_type_size(GGML_TYPE_Q8_0);
+        if (!rows2 || src0->ne[0] > 1024 || src0->ne[0] % 32 != 0 || src0->nb[1] % bs != 0 || src0->nb[2] % bs != 0 ||
+            get_misalign_bytes(ctx, src0) % bs != 0 || src0->ne[3] != 1 || src1->ne[3] != 1 || dst->ne[3] != 1 ||
+            src1->ne[1] < 1 || src1->ne[1] > 4 || src0->ne[2] == 0 || src1->ne[2] % src0->ne[2] != 0 ||
+            src1->ne[2] / src0->ne[2] > 8 || !ggml_is_contiguous(dst) || src1->nb[0] != sizeof(float) ||
+            src1->nb[1] % (4 * sizeof(float)) != 0 || src1->nb[2] % (4 * sizeof(float)) != 0 ||
+            (get_misalign_bytes(ctx, src1) / sizeof(float)) % 4 != 0) {
+            return false;
+        }
+        return src1->ne[2] > src0->ne[2] || src1->ne[1] > 1;
     }
     if (src0->ne[3] != 1 || src1->ne[3] != 1 || dst->ne[3] != 1 || src1->ne[1] < 1 || src1->ne[1] > 4 ||
         src0->ne[2] == 0 || src1->ne[2] % src0->ne[2] != 0 || src1->ne[2] / src0->ne[2] > 8) {
@@ -7399,6 +7415,9 @@ static void ggml_vk_mul_mat_vec_gqa_f16_f32(ggml_backend_vk_context * ctx, vk_co
                                            : ctx->device->pipeline_mul_mat_vec_gqa_split_f16_f32[gqa - 1][ntok - 1])
                                  : (rows2 ? ctx->device->pipeline_mul_mat_vec_gqa_rows2_f16_f32[gqa - 1][ntok - 1]
                                           : ctx->device->pipeline_mul_mat_vec_gqa_rows_f16_f32[gqa - 1][ntok - 1]);
+    if (src0->type == GGML_TYPE_Q8_0) {   // b65: gqa_ok only lets q8_0 through for short k with rows2 on
+        pipeline = ctx->device->pipeline_mul_mat_vec_gqa_rows2_q8_0_f32[gqa - 1][ntok - 1];
+    }
     if (ggml_nbytes(src0) > ctx->device->properties.limits.maxStorageBufferRange) {
         pipeline = ggml_vk_get_64b_indexing_pipeline(ctx, pipeline);
     }
@@ -7410,7 +7429,7 @@ static void ggml_vk_mul_mat_vec_gqa_f16_f32(ggml_backend_vk_context * ctx, vk_co
 
     vk_mat_vec_gqa_push_constants pc = {
         k, rows,
-        (uint32_t)(src0->nb[1] / sizeof(ggml_fp16_t)), (uint32_t)(src0->nb[2] / sizeof(ggml_fp16_t)),
+        (uint32_t)(src0->nb[1] / ggml_type_size(src0->type)), (uint32_t)(src0->nb[2] / ggml_type_size(src0->type)),
         (uint32_t)(src1->nb[2] / sizeof(float)), (uint32_t)(src1->nb[1] / sizeof(float)),
         (uint32_t)(dst->nb[2] / sizeof(float)), (uint32_t)(dst->nb[1] / sizeof(float)),
         0, 0, 0,
