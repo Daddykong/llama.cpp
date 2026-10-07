@@ -46,6 +46,130 @@ void r5_scale_min(const uvec4 hdr, const uint j, out float sc, out float m) {
 }
 #endif
 
+#if defined(DATA_A_Q5_KR) || defined(DATA_A_Q8_0R) || defined(DATA_A_IQ4_XSR) || defined(DATA_A_IQ4_NLR) || defined(DATA_A_Q6_KR) || defined(DATA_A_Q4_1R)
+// b65: decode the 32-value weight block at column col of row `row` into 8 packed int8 words (a[0..3] pair with q8_1
+// ints 0..3, a[4..7] with 4..7) and coefficients c (see ir6_patch.py)
+void rk_decode(const uint row, const uint col, out int32_t a[8], out vec3 c) {
+#if defined(DATA_A_Q5_KR)
+    const uint nb = p.ncols / QUANT_K;
+    const uint js = col / 32;
+    const uint jb = js / 8;
+    const uint rsb = row * nb + a_offset / (QUANT_K / QUANT_K_Q8_1);
+    const uvec4 q = data_a_r128[rsb * 11 + js];
+    const uint qh = data_a_r32[rsb * 44 + nb * 32 + js];
+    const uvec4 hdr = data_a_r128[rsb * 11 + nb * 10 + jb];
+    [[unroll]] for (uint w = 0; w < 4; ++w) {
+        a[w]     = int32_t(( q[w]       & 0x0F0F0F0F) | (((qh >> w)       & 0x01010101) << 4));
+        a[w + 4] = int32_t(((q[w] >> 4) & 0x0F0F0F0F) | (((qh >> (w + 4)) & 0x01010101) << 4));
+    }
+    const vec2 dm = unpackHalf2x16(hdr.x);
+    float sc, mn;
+    r5_scale_min(hdr, js % 8, sc, mn);
+    c = vec3(dm.x * sc, dm.x * sc, -dm.y * mn);
+#elif defined(DATA_A_Q8_0R)
+    const uint nbpr = p.ncols / QUANT_K;
+    const uint jb = col / QUANT_K;
+    const uint rsb = row * nbpr + a_offset;
+    const uint q4i = (rsb * 17) / 8 + 2 * jb;
+    const uvec4 q0 = data_a_r128[q4i];
+    const uvec4 q1 = data_a_r128[q4i + 1];
+    a[0] = int32_t(q0.x); a[1] = int32_t(q0.y); a[2] = int32_t(q0.z); a[3] = int32_t(q0.w);
+    a[4] = int32_t(q1.x); a[5] = int32_t(q1.y); a[6] = int32_t(q1.z); a[7] = int32_t(q1.w);
+    const float da = float(data_a_r16[rsb * 17 + nbpr * 16 + jb]);
+    c = vec3(da, da, 0.0);
+#elif defined(DATA_A_IQ4_XSR)
+    const uint nb = p.ncols / QUANT_K;
+    const uint js = col / 32;
+    const uint jb = js / 8;
+    const uint is = js % 8;
+    const uint rsb = row * nb + a_offset / (QUANT_K / QUANT_K_Q8_1);
+    const uvec4 q = data_a_r128[(rsb * 17) / 2 + js];
+    const uint h0 = data_a_r32[rsb * 34 + nb * 32 + jb * 2];
+    const uint h1 = data_a_r32[rsb * 34 + nb * 32 + jb * 2 + 1];
+    [[unroll]] for (uint w = 0; w < 4; ++w) {
+        a[w]     = int32_t(iq4nl_lut4( q[w]       & 0x0F0F0F0Fu));
+        a[w + 4] = int32_t(iq4nl_lut4((q[w] >> 4) & 0x0F0F0F0Fu));
+    }
+    const uint ls = ((h1 >> (4 * is)) & 0xF) | (((h0 >> (16 + 2 * is)) & 3) << 4);
+    const float dl = unpackHalf2x16(h0).x * float(int(ls) - 32);
+    c = vec3(dl, dl, 0.0);
+#elif defined(DATA_A_IQ4_NLR)
+    const uint nbpr = p.ncols / QUANT_K;
+    const uint jb = col / QUANT_K;
+    const uint rsb = row * nbpr + a_offset;
+    const uvec4 q = data_a_r128[(rsb * 9) / 8 + jb];
+    [[unroll]] for (uint w = 0; w < 4; ++w) {
+        a[w]     = int32_t(iq4nl_lut4( q[w]       & 0x0F0F0F0Fu));
+        a[w + 4] = int32_t(iq4nl_lut4((q[w] >> 4) & 0x0F0F0F0Fu));
+    }
+    const float da = float(data_a_r16[rsb * 9 + nbpr * 8 + jb]);
+    c = vec3(da, da, 0.0);
+#elif defined(DATA_A_Q6_KR)
+    const uint nb = p.ncols / QUANT_K;
+    const uint js = col / 32;
+    const uint jb = js / 8;
+    const uint s = js % 8;
+    const uint rsb = row * nb + a_offset / (QUANT_K / QUANT_K_Q8_1);
+    const uint r64 = (rsb * 105) / 4;
+    const uvec2 q01 = data_a_r64[r64 + js * 2];
+    const uvec2 q23 = data_a_r64[r64 + js * 2 + 1];
+    const uvec2 h   = data_a_r64[r64 + nb * 16 + js];
+    const uint  scw = data_a_r32[(rsb * 105) / 2 + nb * 48 + jb * 4 + s / 2] >> (16 * (s & 1));
+    const float d   = float(data_a_r16[rsb * 105 + nb * 104 + jb]);
+    const uvec4 q = uvec4(q01, q23);
+    [[unroll]] for (uint w = 0; w < 4; ++w) {
+        const uint lo = ( q[w]       & 0x0F0F0F0Fu) | (((h.x >> (2 * w)) & 0x03030303u) << 4);
+        const uint hi = ((q[w] >> 4) & 0x0F0F0F0Fu) | (((h.y >> (2 * w)) & 0x03030303u) << 4);
+        a[w]     = int32_t(((lo | 0x80808080u) - 0x20202020u) ^ 0x80808080u);
+        a[w + 4] = int32_t(((hi | 0x80808080u) - 0x20202020u) ^ 0x80808080u);
+    }
+    c = vec3(d * float(int(bitfieldExtract(int(scw), 0, 8))), d * float(int(bitfieldExtract(int(scw), 8, 8))), 0.0);
+#elif defined(DATA_A_Q4_1R)
+    const uint nbpr = p.ncols / QUANT_K;
+    const uint jb = col / QUANT_K;
+    const uint rsb = row * nbpr + a_offset;
+    const uvec4 q = data_a_r128[(rsb * 5) / 4 + jb];
+    [[unroll]] for (uint w = 0; w < 4; ++w) {
+        a[w]     = int32_t( q[w]       & 0x0F0F0F0Fu);
+        a[w + 4] = int32_t((q[w] >> 4) & 0x0F0F0F0Fu);
+    }
+    const vec2 dm = unpackHalf2x16(data_a_r32[rsb * 5 + nbpr * 4 + jb]);
+    c = vec3(dm.x, dm.x, dm.y);
+#endif
+}
+
+void iter(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const uint num_rows, const uint col, const uint b_qs_idx) {
+    // q8_1 blocks of every column first (two 16-byte loads + ds each)
+    ivec4 b0[NUM_COLS], b1[NUM_COLS];
+    vec2 bds[NUM_COLS];
+    [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+        const uint b_block_idx = (j*p.batch_stride_b + col) / QUANT_K_Q8_1 + b_offset;
+        const uint bo = b_block_idx / 4;
+        const uint bi = b_block_idx % 4;
+        bds[j] = vec2(data_b[bo].ds[bi]);
+        const uint bv = bo * 9 + 1 + bi * 2;
+        b0[j] = data_b_r128[bv];
+        b1[j] = data_b_r128[bv + 1];
+    }
+    // each weight block is loaded and decoded once, then used for every column
+    [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+        int32_t a[8];
+        vec3 c;
+        rk_decode(first_row + n, col, a, c);
+        [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+            int32_t s_lo = dotPacked4x8EXT(a[0], b0[j].x);
+            s_lo += dotPacked4x8EXT(a[1], b0[j].y);
+            s_lo += dotPacked4x8EXT(a[2], b0[j].z);
+            s_lo += dotPacked4x8EXT(a[3], b0[j].w);
+            int32_t s_hi = dotPacked4x8EXT(a[4], b1[j].x);
+            s_hi += dotPacked4x8EXT(a[5], b1[j].y);
+            s_hi += dotPacked4x8EXT(a[6], b1[j].z);
+            s_hi += dotPacked4x8EXT(a[7], b1[j].w);
+            temp[j][n] += FLOAT_TYPE(bds[j].x * (c.x * float(s_lo) + c.y * float(s_hi)) + c.z * bds[j].y);
+        }
+    }
+}
+#else
 void iter(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const uint num_rows, const uint col, const uint b_qs_idx) {
     [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
         // Preload data_b block
@@ -285,6 +409,8 @@ void iter(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const
 #endif
     }
 }
+
+#endif   // b65 reordered multi-column iter
 
 void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
     const uint tid = gl_LocalInvocationID.x;
