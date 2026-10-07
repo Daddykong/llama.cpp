@@ -245,6 +245,66 @@ static std::set<std::string> b65_words(const std::string & text) {
     return out;
 }
 
+// b65: decode tokens into one sequence at consecutive positions (logits for the last one when want_logits)
+static bool b65_decode_seq(llama_context * ctx, const llama_tokens & toks, llama_pos pos0, llama_seq_id seq, bool want_logits) {
+    const int32_t nb = (int32_t) llama_n_batch(ctx);
+    for (size_t i0 = 0; i0 < toks.size(); i0 += nb) {
+        const int32_t m = (int32_t) std::min<size_t>(nb, toks.size() - i0);
+        llama_batch b = llama_batch_init(m, 0, 1);
+        b.n_tokens = m;
+        for (int32_t j = 0; j < m; ++j) {
+            b.token[j] = toks[i0 + j]; b.pos[j] = pos0 + (llama_pos) (i0 + j);
+            b.n_seq_id[j] = 1; b.seq_id[j][0] = seq;
+            b.logits[j] = want_logits && i0 + j + 1 == toks.size();
+        }
+        const int rc = llama_decode(ctx, b);
+        llama_batch_free(b);
+        if (rc != 0) return false;
+    }
+    return true;
+}
+
+// b65: write a summary of swapped tokens and give the conversation the summary's attention KV at [p0, p0 + n)
+static void b65_summarize_into(llama_context * ctx, llama_seq_id dst, llama_pos p0, const llama_tokens & part, const std::string & dir) {
+    const llama_seq_id spare = (llama_seq_id) llama_n_seq_max(ctx) - 1;
+    const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx));
+    llama_memory_t mem = llama_get_memory(ctx);
+    static const int n_sum = getenv("LLAMA_SWAP_SUMMARY_TOKENS") ? atoi(getenv("LLAMA_SWAP_SUMMARY_TOKENS")) : 160;
+    const int64_t t0 = ggml_time_us();
+    llama_memory_seq_rm(mem, spare, -1, -1);
+    const std::string ask = "<|im_start|>user\nSummarize the following earlier part of our conversation in at most 120 words. "
+                            "Keep names, numbers, decisions and code identifiers.\n\n" + common_detokenize(ctx, part, false) +
+                            "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n";
+    const llama_tokens prompt = common_tokenize(ctx, ask, false, true);
+    if (!b65_decode_seq(ctx, prompt, 0, spare, true)) { llama_memory_seq_rm(mem, spare, -1, -1); return; }
+    llama_tokens sum;
+    const int n_vocab = llama_vocab_n_tokens(vocab);
+    for (int i = 0; i < n_sum; ++i) {
+        const float * lg = llama_get_logits_ith(ctx, -1);
+        llama_token best = 0;
+        for (llama_token t = 1; t < n_vocab; ++t) if (lg[t] > lg[best]) best = t;
+        if (llama_vocab_is_eog(vocab, best)) break;
+        sum.push_back(best);
+        if (!b65_decode_seq(ctx, { best }, (llama_pos) (prompt.size() + i), spare, true)) break;
+    }
+    const std::string text = "[Earlier in this conversation: " + common_detokenize(ctx, sum, false) + "]\n";
+    // the summary's KV, computed after the conversation's own prefix, at positions inside the hole
+    llama_memory_seq_rm(mem, spare, -1, -1);
+    llama_memory_seq_cp(mem, dst, spare, 0, p0);
+    const llama_tokens stoks = common_tokenize(ctx, text, false, false);
+    const std::string path = dir + "/summary-" + std::to_string(dst) + "-" + std::to_string(p0) + ".kv";
+    bool ok = b65_decode_seq(ctx, stoks, p0, spare, false) &&
+              llama_b65_seq_range_save(ctx, spare, p0, p0 + (llama_pos) stoks.size(), path.c_str()) > 0;
+    llama_memory_seq_rm(mem, spare, -1, -1);
+    if (ok) {
+        llama_b65_seq_range_drop(ctx, dst, p0, p0 + (llama_pos) stoks.size());   // kept turn heads there
+        ok = llama_b65_seq_range_load(ctx, dst, path.c_str());
+    }
+    std::remove(path.c_str());
+    LOG_INF("b65 swap: summary of %zu tokens -> %zu tokens at %d %s in %.1f s: %s\n", part.size(), stoks.size(), p0,
+            ok ? "in place" : "FAILED", (ggml_time_us() - t0) / 1e6, text.substr(0, 200).c_str());
+}
+
 struct b65_swap_range {
     llama_pos p0, p1;
     std::string path;
@@ -636,6 +696,10 @@ struct server_slot {
                     if (dropped) {
                         llama_tokens part(toks.begin() + p0, toks.begin() + p1);
                         b65_swaps.push_back({ p0, p1, path, part, b65_words(common_detokenize(ctx_tgt, part, false)) });
+                        static const bool swap_summary = getenv("LLAMA_SWAP_SUMMARY") && atoi(getenv("LLAMA_SWAP_SUMMARY"));
+                        if (swap_summary && llama_n_seq_max(ctx_tgt) > 1) {
+                            b65_summarize_into(ctx_tgt, id, p0, part, swap_dir);
+                        }
                         SLT_INF(*this, "b65 swap: positions %d..%d (%.0f MB) out to %s in %.0f ms\n", p0, p1, bytes / 1e6, path.c_str(), (ggml_time_us() - t0) / 1e3);
                     }
                 }
