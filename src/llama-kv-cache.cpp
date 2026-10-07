@@ -1164,8 +1164,9 @@ void llama_kv_cache::sparse_ensure(uint32_t n_cells) {
             }
             const size_t base = (size_t) ((char *) t->data - (char *) ggml_backend_buffer_get_base(t->buffer));
             const size_t es = ggml_element_size(t);
+            for (int64_t s = 0; s < t->ne[2]; ++s) {   // b65: one commit per stream, so a sequence can be parked alone
             std::vector<size_t> offs, sizes;
-            for (int64_t s = 0; s < t->ne[2]; ++s) {
+            {
                 if (t == layer.v && v_trans) {
                     // transposed V: cell c of embedding row d sits at d * kv_size + c
                     for (int64_t d = 0; d < t->ne[0]; ++d) {
@@ -1177,9 +1178,13 @@ void llama_kv_cache::sparse_ensure(uint32_t n_cells) {
                     sizes.push_back((size_t) (c1 - c0) * t->nb[1]);
                 }
             }
+            if (sparse_parked.size() > (size_t) s && sparse_parked[s]) {
+                // a parked stream grows in system RAM
+            }
             size_t want = 0;
             for (size_t z : sizes) want += z;
             int where = (vram_mb >= 0 && (sparse_vram + want) / 1e6 > vram_mb) ? 1 : 0;
+            if (sparse_parked.size() > (size_t) s && sparse_parked[s]) where = 1;
             // b65: with movable weights, make room in the budget by moving FFN layers out first
             b65_place & pl = b65_place_get();
             if (where == 0 && pl.active()) {
@@ -1204,12 +1209,63 @@ void llama_kv_cache::sparse_ensure(uint32_t n_cells) {
                 sparse_vram += want;
                 stp.vram += want;
             }
-            stp.handles.push_back({ t->buffer, h });
+            stp.handles.push_back({ t->buffer, h, (uint32_t) s, want, where });
+            }
         }
     }
     sparse_steps.push_back(std::move(stp));
     LLAMA_LOG_INFO("%s: sparse KV now holds cells [0, %u), %.1f MB of it in VRAM\n", __func__, c1, sparse_vram / 1e6);
     sparse_cells = c1;
+}
+
+// b65: move one sequence's KV memory to system RAM (park) or back to VRAM (unpark)
+bool llama_kv_cache::sparse_park(llama_seq_id seq_id, bool park) {
+    if (!sparse || seq_id < 0 || (size_t) seq_id >= seq_to_stream.size()) {
+        return false;
+    }
+    const uint32_t s = seq_to_stream[seq_id];
+    if (n_stream == 1 && n_seq_max > 1) {
+        return false;   // unified cache: the stream is shared by every sequence
+    }
+    if (sparse_parked.size() <= s) sparse_parked.resize(s + 1, 0);
+    if ((bool) sparse_parked[s] == park) {
+        return true;
+    }
+    typedef bool (*move_fn)(ggml_backend_buffer_t, int, int);
+    static move_fn move = nullptr;
+    b65_place & pl = b65_place_get();
+    size_t bytes = 0;
+    for (auto & st : sparse_steps) {
+        for (auto & sh : st.handles) if (sh.stream == s && sh.where == (park ? 0 : 1)) bytes += sh.bytes;
+    }
+    if (!park && pl.active()) {   // room for it first
+        const double over = (double) (pl.vram_weights() + sparse_vram + bytes) - pl.budget_mb * 1e6;
+        if (over > 0) pl.evict((size_t) over);
+    }
+    if (pl.sync) pl.sync();
+    const int64_t t0 = ggml_time_us();
+    for (auto & st : sparse_steps) {
+        for (auto & sh : st.handles) {
+            if (sh.stream != s || sh.where == (park ? 1 : 0)) continue;
+            if (!move) {
+                ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(sh.buf));
+                ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+                move = reg ? (move_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_vk_sparse_move") : nullptr;
+                if (!move) return false;
+            }
+            if (!move(sh.buf, sh.h, park ? 1 : 0)) continue;   // VRAM full: it stays in RAM
+            sh.where = park ? 1 : 0;
+            if (park) { sparse_vram -= sh.bytes; st.vram -= sh.bytes; } else { sparse_vram += sh.bytes; st.vram += sh.bytes; }
+        }
+    }
+    sparse_parked[s] = park ? 1 : 0;
+    LLAMA_LOG_INFO("%s: seq %d %s: %.0f MB in %.1f ms, KV in VRAM now %.0f MB\n", __func__, seq_id, park ? "parked in system RAM" : "back in VRAM",
+            bytes / 1e6, (ggml_time_us() - t0) / 1e3, sparse_vram / 1e6);
+    if (park && pl.active()) {
+        const double room = pl.budget_mb * 1e6 - (double) (pl.vram_weights() + sparse_vram);
+        if (room > 0) pl.restore((size_t) room);
+    }
+    return true;
 }
 
 // b65: release committed steps past n_cells (cells there are unused), then give VRAM back to FFN layers
@@ -1220,7 +1276,9 @@ void llama_kv_cache::sparse_shrink(uint32_t n_cells) {
     bool synced = false;
     while (!sparse_steps.empty() && sparse_steps.back().c0 >= n_cells) {
         sparse_step & s = sparse_steps.back();
-        for (auto & [buf, h] : s.handles) {
+        for (auto & sh : s.handles) {
+            ggml_backend_buffer_t buf = sh.buf;
+            const int h = sh.h;
             if (!release) {
                 ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(buf));
                 ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
@@ -1232,7 +1290,7 @@ void llama_kv_cache::sparse_shrink(uint32_t n_cells) {
         }
         sparse_vram -= s.vram;
         sparse_cells = s.c0;
-        sparse_steps.pop_back();
+        sparse_steps.pop_back();   // (per-handle VRAM bytes were already folded into s.vram)
     }
     LLAMA_LOG_INFO("%s: sparse KV released down to cells [0, %u), %.1f MB in VRAM\n", __func__, sparse_cells, sparse_vram / 1e6);
     if (pl.active()) {

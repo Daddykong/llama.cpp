@@ -588,6 +588,8 @@ extern "C" {
 
     LLAMA_API const struct llama_model * llama_get_model   (const struct llama_context * ctx);
     LLAMA_API           llama_memory_t   llama_get_memory  (const struct llama_context * ctx);
+    // b65: move a sequence's sparse KV (LLAMA_KV_SPARSE=1) to system RAM (park) or back to VRAM; false if not possible
+    LLAMA_API bool llama_b65_park_seq(struct llama_context * ctx, llama_seq_id seq_id, bool park);
     LLAMA_API  enum llama_pooling_type   llama_pooling_type(const struct llama_context * ctx); // TODO: rename to llama_get_pooling_type
 
     LLAMA_API const struct llama_vocab * llama_model_get_vocab(const struct llama_model * model);

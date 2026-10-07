@@ -1,5 +1,7 @@
 #include "llama-context.h"
 #include "llama-b65-place.h"
+#include "llama-kv-cache.h"
+#include "llama-memory-hybrid.h"
 
 #include "ggml.h"
 #include "llama-arch.h"
@@ -4044,6 +4046,15 @@ void llama_set_embeddings_layer_inp(llama_context * ctx, uint32_t lid, bool valu
 
 void llama_set_nextn_layer_offset(llama_context * ctx, int32_t offset) {
     ctx->set_nextn_layer_offset(offset);
+}
+
+bool llama_b65_park_seq(struct llama_context * ctx, llama_seq_id seq_id, bool park) {   // b65
+    llama_memory_i * mem = ctx->get_memory();
+    llama_kv_cache * kv = dynamic_cast<llama_kv_cache *>(mem);
+    if (!kv) {
+        if (auto * hy = dynamic_cast<llama_memory_hybrid *>(mem)) kv = hy->get_mem_attn();
+    }
+    return kv ? kv->sparse_park(seq_id, park) : false;
 }
 
 llama_memory_t llama_get_memory(const struct llama_context * ctx) {

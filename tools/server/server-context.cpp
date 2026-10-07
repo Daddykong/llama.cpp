@@ -233,6 +233,7 @@ struct server_slot {
 
     llama_context * ctx_tgt = nullptr;
     llama_context * ctx_dft = nullptr;
+    bool b65_parked = false;   // b65: KV parked in system RAM
 
     common_memory mem;
 
@@ -570,6 +571,12 @@ struct server_slot {
             t_last_used = ggml_time_us();
 
             state = SLOT_STATE_IDLE;
+
+            // b65: idle conversations do not hold VRAM (sparse KV)
+            static const bool park_on_idle = getenv("LLAMA_PARK_ON_IDLE") != nullptr && atoi(getenv("LLAMA_PARK_ON_IDLE")) != 0;
+            if (park_on_idle && ctx_tgt && !task->is_child()) {
+                b65_parked = llama_b65_park_seq(ctx_tgt, id, true);
+            }
 
             // do not keep context of the child slots - the parent's context is enough
             if (task->is_child()) {
@@ -1772,6 +1779,10 @@ private:
     }
 
     bool launch_slot_with_task(server_slot & slot, server_task && task) {
+        if (slot.b65_parked && slot.ctx_tgt) {   // b65: bring the conversation's KV back first
+            llama_b65_park_seq(slot.ctx_tgt, slot.id, false);
+            slot.b65_parked = false;
+        }
         // process per-request lora adapters
         if (!task.params.lora.empty()) {
             auto task_loras = construct_lora_list(task.params.lora);
