@@ -9385,6 +9385,10 @@ static const ggml_type other_types[] = {
 // Test cases for evaluation: should try to cover edge cases while using small input sizes to keep the runtime low
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval();
 static void add_b65_sparse_t_cases(std::vector<std::unique_ptr<test_case>> & test_cases) {
+    // b65 chunked GDN: prompt-sized batches (incl. a partial last chunk and 2 sequences)
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 48, 128, 512, 1));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 48, 128, 100, 1));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 64, 2));
     for (int64_t T : {1, 3}) {
         test_cases.emplace_back(new test_sign_score(5120, 512, T));
         for (float thr : {-2.0f, 0.0f, 0.5f}) test_cases.emplace_back(new test_mul_mat_masked(5120, 512, T, thr));

@@ -1,0 +1,162 @@
+#version 450
+// b65: chunked GATED_DELTA_NET for prompt batches (scalar gate per head, no rollback snapshots, S_V = 128).
+// Per column c of the state (value dim), the recurrence over a chunk of CH tokens with gamma_t = exp(g_t),
+// cumulative log-decay G_t = sum_{i<=t} g_i, s0 = state at chunk start:
+//   delta = T * ( beta .* (v - exp(G) .* (K s0)) ),  T = (I + diag(beta) A)^-1,  A[t][i] = exp(G_t - G_i) k_i.k_t  (i < t)
+//   out_t = scale * ( exp(G_t) q_t.s0 + sum_{i<=t} exp(G_t - G_i) (q_t.k_i) delta_i )
+//   s_end = exp(G_last) s0 + sum_i exp(G_last - G_i) k_i delta_i
+// T and the q.k / k.k products are shared by all columns. Workgroup = (head, seq, 16 columns), 256 invocations:
+// invocation (j = tid / 16, rb = tid % 16) holds rows rb*8 .. rb*8+7 of column c0 + j in registers.
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_clustered : enable
+
+#define S_V 128
+#define CH 32
+#define NC 16
+#define RPT 8
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Parameters {
+    uint H; uint n_tokens; uint n_seqs; uint s_off;
+    uint sq1, sq2, sq3; uint sv1, sv2, sv3; uint sb1, sb2, sb3;
+    uint neq1, rq3; float scale; uint K; uint fuse; uint idx_off; uint sout_slot_stride;
+};
+layout(binding = 0) readonly  buffer QBuf     { float data_q[];     };
+layout(binding = 1) readonly  buffer KBuf     { float data_k[];     };
+layout(binding = 2) readonly  buffer VBuf     { float data_v[];     };
+layout(binding = 3) readonly  buffer GBuf     { float data_g[];     };
+layout(binding = 4) readonly  buffer BetaBuf  { float data_beta[];  };
+layout(binding = 5) readonly  buffer StateBuf { float data_state[]; };
+layout(binding = 6)           buffer DstBuf   { float data_dst[];   };
+layout(binding = 7) readonly  buffer IdxBuf   { int data_idx[];     };
+layout(binding = 8) writeonly buffer SOutBuf  { float data_sout[];  };
+
+shared float s_k[CH][S_V];
+shared float s_q[CH][S_V];
+shared float s_A[CH][CH];      // exp(G_t-G_i) k_i.k_t (i < t), later T
+shared float s_M[CH][CH];      // exp(G_t-G_i) q_t.k_i (i <= t)
+shared float s_G[CH];          // cumulative log decay
+shared float s_beta[CH];
+shared float s_ks[CH][NC];     // k_t . s0[:, c]  ->  rhs
+shared float s_qs[CH][NC];     // q_t . s0[:, c]
+shared float s_d[CH][NC];      // delta
+
+void main() {
+    const uint head_id = gl_WorkGroupID.x;
+    const uint seq_id  = gl_WorkGroupID.y;
+    const uint c0      = gl_WorkGroupID.z * NC;
+    const uint tid = gl_LocalInvocationID.x;
+    const uint j = tid / 16, rb = tid % 16;
+    const uint col = c0 + j;
+    const uint iq1 = head_id % neq1;
+    const uint iq3 = seq_id / rq3;
+    const uint state_size = S_V * S_V;
+    const uint state_in_base  = ((fuse & 1u) != 0u ? uint(data_idx[idx_off + seq_id]) * H + head_id : seq_id * H + head_id) * state_size;
+    const uint state_out_base = (seq_id * H + head_id) * state_size;
+
+    float s[RPT];
+    [[unroll]] for (uint r = 0; r < RPT; ++r) s[r] = data_state[state_in_base + col * S_V + rb * RPT + r];
+
+    for (uint t0 = 0; t0 < n_tokens; t0 += CH) {
+        const uint nt = min(CH, n_tokens - t0);
+        // 1) chunk inputs
+        for (uint e = tid; e < CH * S_V; e += 256) {
+            const uint t = e / S_V, d = e % S_V;
+            float kv = 0.0, qv = 0.0;
+            if (t < nt) {
+                const uint q_off = iq3 * sq3 + (t0 + t) * sq2 + iq1 * sq1;
+                kv = data_k[q_off + d]; qv = data_q[q_off + d];
+            }
+            s_k[t][d] = kv; s_q[t][d] = qv;
+        }
+        if (tid == 0) {
+            float G = 0.0;
+            for (uint t = 0; t < CH; ++t) {
+                if (t < nt) {
+                    const uint gb_off = seq_id * sb3 + (t0 + t) * sb2 + head_id * sb1;
+                    G += data_g[gb_off];
+                    s_beta[t] = data_beta[gb_off];
+                } else {
+                    s_beta[t] = 0.0;
+                }
+                s_G[t] = G;
+            }
+        }
+        barrier();
+        // 2) A and M (4 entries each per invocation)
+        for (uint e = tid; e < CH * CH; e += 256) {
+            const uint t = e / CH, i = e % CH;
+            float kk = 0.0, qk = 0.0;
+            if (i <= t && t < nt) {
+                for (uint d = 0; d < S_V; ++d) { kk += s_k[i][d] * s_k[t][d]; qk += s_q[t][d] * s_k[i][d]; }
+                const float w = exp(s_G[t] - s_G[i]);
+                kk *= w; qk *= w;
+            }
+            s_A[t][i] = (i < t) ? kk : 0.0;
+            s_M[t][i] = (i <= t) ? qk : 0.0;
+        }
+        // 3) K s0 and Q s0 for this invocation's column (partial over its 8 rows, clustered add over the 16 row blocks)
+        for (uint t = 0; t < CH; ++t) {
+            float pk = 0.0, pq = 0.0;
+            [[unroll]] for (uint r = 0; r < RPT; ++r) { pk += s_k[t][rb * RPT + r] * s[r]; pq += s_q[t][rb * RPT + r] * s[r]; }
+            pk = subgroupClusteredAdd(pk, 16);
+            pq = subgroupClusteredAdd(pq, 16);
+            if (rb == 0) { s_ks[t][j] = pk; s_qs[t][j] = pq; }
+        }
+        barrier();
+        // 4) T = (I + diag(beta) A)^-1 by forward substitution, one column of T per invocation (tid < CH);
+        //    written in place over A's strictly-lower part after all reads of that column: use s_M? keep separate:
+        //    compute into registers then store after a barrier.
+        float tcol[CH];
+        if (tid < CH) {
+            const uint jj = tid;
+            [[unroll]] for (uint t = 0; t < CH; ++t) tcol[t] = (t == jj) ? 1.0 : 0.0;
+            for (uint t = jj + 1; t < CH; ++t) {
+                float acc = 0.0;
+                for (uint i = jj; i < t; ++i) acc += s_A[t][i] * tcol[i];
+                tcol[t] = -s_beta[t] * acc;
+            }
+        }
+        barrier();
+        if (tid < CH) { [[unroll]] for (uint t = 0; t < CH; ++t) s_A[t][tid] = tcol[t]; }   // s_A now holds T
+        // rhs = beta .* (v - exp(G) .* (K s0))
+        for (uint e = tid; e < CH * NC; e += 256) {
+            const uint t = e / NC, jc = e % NC;
+            float v = 0.0;
+            if (t < nt) v = data_v[seq_id * sv3 + (t0 + t) * sv2 + head_id * sv1 + c0 + jc];
+            s_ks[t][jc] = s_beta[t] * (v - exp(s_G[t]) * s_ks[t][jc]);
+        }
+        barrier();
+        // 5) delta = T rhs
+        for (uint e = tid; e < CH * NC; e += 256) {
+            const uint t = e / NC, jc = e % NC;
+            float acc = 0.0;
+            for (uint i = 0; i <= t; ++i) acc += s_A[t][i] * s_ks[i][jc];
+            s_d[t][jc] = acc;
+        }
+        barrier();
+        // 6) outputs
+        for (uint e = tid; e < CH * NC; e += 256) {
+            const uint t = e / NC, jc = e % NC;
+            if (t < nt) {
+                float acc = exp(s_G[t]) * s_qs[t][jc];
+                for (uint i = 0; i <= t; ++i) acc += s_M[t][i] * s_d[i][jc];
+                data_dst[(seq_id * n_tokens * H + head_id) * S_V + (t0 + t) * S_V * H + c0 + jc] = acc * scale;
+            }
+        }
+        // 7) state update for this invocation's rows
+        const float Gl = s_G[CH - 1];
+        [[unroll]] for (uint r = 0; r < RPT; ++r) {
+            float acc = exp(Gl) * s[r];
+            for (uint i = 0; i < nt; ++i) acc += exp(Gl - s_G[i]) * s_k[i][rb * RPT + r] * s_d[i][j];
+            s[r] = acc;
+        }
+        barrier();
+    }
+    if ((fuse & 2u) != 0u) {
+        [[unroll]] for (uint r = 0; r < RPT; ++r) data_sout[state_out_base + col * S_V + rb * RPT + r] = s[r];
+    } else {
+        [[unroll]] for (uint r = 0; r < RPT; ++r) data_dst[s_off + state_out_base + col * S_V + rb * RPT + r] = s[r];
+    }
+}

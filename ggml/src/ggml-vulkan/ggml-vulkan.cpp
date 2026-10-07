@@ -3855,6 +3855,9 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         ggml_vk_create_pipeline(device, device->pipeline_ssm_scan_f32_d256, "ssm_scan_256_f32", ssm_scan_f32_len, ssm_scan_f32_data, "main", 8, sizeof(vk_op_ssm_scan_push_constants), {1, 1, 1}, {256, device->subgroup_size, 16}, 1, true, true);
     }
 
+    if (device->subgroup_clustered && device->subgroup_size_control) {   // b65 chunked GDN for prompts
+        ggml_vk_create_pipeline(device, device->pipeline_gated_delta_net_chunk, "gated_delta_net_chunk_f32", gated_delta_net_chunk_f32_len, gated_delta_net_chunk_f32_data, "main", 9, sizeof(vk_op_gated_delta_net_push_constants), {1, 1, 16}, {}, 1, true, true, 16);
+    }
     ggml_vk_create_pipeline(device, device->pipeline_sign_score, "sign_score", sign_score_len, sign_score_data, "main", 5, sizeof(vk_op_sign_score_push_constants), {1, 1, 1}, {}, 1, false, true, 32);
     ggml_vk_create_pipeline(device, device->pipeline_mul_mat_masked_q4_0, "mul_mat_masked_q4_0", mul_mat_masked_q4_0_len, mul_mat_masked_q4_0_data, "main", 4, sizeof(vk_op_mm_masked_push_constants), {1, 1, 1}, {}, 1, false, true, 32);
     ggml_vk_create_pipeline(device, device->pipeline_kv_block_minmax, "kv_block_minmax", kv_block_minmax_len, kv_block_minmax_data, "main", 4, sizeof(vk_op_kv_minmax_push_constants), {256, 1, 1}, {}, 1);
@@ -10454,6 +10457,12 @@ static void ggml_vk_op_f32_wkv(ggml_backend_vk_context * ctx, vk_context& subctx
 
     vk_pipeline pipeline = ggml_vk_op_get_pipeline(ctx, dst->src[0], dst->src[1], dst->src[2], dst, dst->op);
     GGML_ASSERT(pipeline != nullptr);
+    // b65: chunked kernel for prompt batches (scalar gate, no rollback snapshots, S_v 128)
+    static const bool gdn_chunk = getenv("GGML_VK_GDN_CHUNK") != nullptr && atoi(getenv("GGML_VK_GDN_CHUNK")) != 0;
+    if (gdn_chunk && ctx->device->pipeline_gated_delta_net_chunk && n_tokens >= 64 && K == 1 && S_v == 128 &&
+        dst->src[3]->ne[0] == 1) {
+        pipeline = ctx->device->pipeline_gated_delta_net_chunk;
+    }
 
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
 
