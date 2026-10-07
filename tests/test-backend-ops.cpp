@@ -9456,6 +9456,30 @@ struct test_b65_sm_mm : public test_case {
     }
 };
 
+// b65 [mtp]: weight matvec + residual add (+ second add), as in the qwen35 o_proj / ffn_down / ssm_out of a
+// 1-4 token decode step: Vulkan fuses these into the mat-vec shader (MUL_MAT_ADD / MUL_MAT_ADD_ADD)
+struct test_b65_mm_add : public test_case {
+    const ggml_type type;
+    const int64_t m, n, k;
+    const int n_add;
+    test_b65_mm_add(ggml_type type, int64_t m, int64_t n, int64_t k, int n_add) : type(type), m(m), n(n), k(k), n_add(n_add) {}
+    std::string vars() override { return VARS_TO_STR5(type, m, n, k, n_add); }
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "MUL_MAT_ADD"; }
+    bool run_whole_graph() override { return true; }
+    double max_nmse_err() override { return 5e-4; }
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * w = ggml_new_tensor_2d(ctx, type, k, m);
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_tensor * r = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, m, n);
+        ggml_tensor * out = ggml_add(ctx, ggml_mul_mat(ctx, w, x), r);
+        if (n_add == 2) {
+            ggml_tensor * r2 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, m, n);
+            out = ggml_add(ctx, out, r2);
+        }
+        return out;
+    }
+};
+
 // b65: K x Q on one layer of a quantized K cache with flash attention off: K is a view of a [kv_heads*d, n_kv] cache
 // (row stride = all heads, channel stride = one head), Q is permuted like the model's
 struct test_b65_kq_quant : public test_case {
@@ -9522,6 +9546,16 @@ static void add_b65_sparse_t_cases(std::vector<std::unique_ptr<test_case>> & tes
     test_cases.emplace_back(new test_b65_sm_mm(512, 64, 128, 8, 2, true, GGML_TYPE_F32));
     test_cases.emplace_back(new test_b65_sm_mm(1000, 100, 128, 6, 1, true, GGML_TYPE_F32));
     test_cases.emplace_back(new test_b65_sm_mm(4096, 512, 256, 24, 4, true, GGML_TYPE_F32));
+    // b65 [mtp]: fused matvec + residual add at 1-8 columns
+    for (ggml_type t : {GGML_TYPE_Q4_0, GGML_TYPE_Q5_K, GGML_TYPE_Q4_1, GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
+        for (int64_t n : {1, 2, 3, 4, 8}) {
+            for (int na : {1, 2}) {
+                test_cases.emplace_back(new test_b65_mm_add(t, 256, n, 1024, na));
+            }
+        }
+    }
+    test_cases.emplace_back(new test_b65_mm_add(GGML_TYPE_Q4_0, 5120, 3, 17408, 1));
+    test_cases.emplace_back(new test_b65_mm_add(GGML_TYPE_Q5_K, 5120, 3, 6144, 1));
     // b65 row-reordered weights (GGML_VK_*_REPACK=2): model-sized k, decode (1-8 tokens) and prompt batches;
     // k=1280 (5 IQ4_XS superblocks) is not eligible for the IQ4_XS reorder and checks the fallback
     for (ggml_type t : {GGML_TYPE_IQ4_XS, GGML_TYPE_Q5_K, GGML_TYPE_Q8_0, GGML_TYPE_IQ4_NL, GGML_TYPE_Q6_K, GGML_TYPE_Q4_1, GGML_TYPE_Q4_0}) {

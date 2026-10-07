@@ -14896,8 +14896,12 @@ bool ggml_vk_can_fuse(const ggml_backend_vk_context * ctx, const struct ggml_cgr
     auto const &mm_add_ok = [&](const ggml_tensor *mul, const ggml_tensor *add) {
         const ggml_tensor *bias = add->src[0] == mul ? add->src[1] : add->src[0];
 
-        // mat-vec only
-        if (ggml_nrows(mul) != 1) {
+        // mat-vec only: one row, or (b65 [mtp]) 2..mul_mat_vec_max_cols columns without batch dims, which
+        // ggml_vk_mul_mat also sends to the mat-vec shaders; they index the bias like D (column j at j*stride_d)
+        const bool mv_cols = mul->op == GGML_OP_MUL_MAT && mul->ne[1] <= mul_mat_vec_max_cols && mul->ne[2] == 1 && mul->ne[3] == 1 &&
+                             mul->src[1] && mul->src[1]->ne[2] == 1 && mul->src[1]->ne[3] == 1 && ggml_is_contiguous(mul);
+        static const bool mc_add_off = getenv("GGML_VK_DISABLE_MC_ADD_FUSION") != nullptr;
+        if (ggml_nrows(mul) != 1 && (mc_add_off || !mv_cols)) {
             return false;
         }
         // shaders assume the types match
