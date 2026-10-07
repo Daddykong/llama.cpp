@@ -3081,7 +3081,9 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                                       device->subgroup_size_control && device->subgroup_min_size <= 32 && device->subgroup_max_size >= 32;
                 // b65: GGML_VK_BATCH_INVARIANT=1 keeps one subgroup size for every column count
                 static const bool batch_inv = getenv("GGML_VK_BATCH_INVARIANT") != nullptr && atoi(getenv("GGML_VK_BATCH_INVARIANT")) != 0;
-                const uint32_t subgroup_size_leg = (xe2_sg32 && i == 0 && !batch_inv) ? 32u : subgroup_size_int;
+                // b65 [mtp]: GGML_VK_SG32_MC=1 also uses SIMD32 for 2-8 columns (experiment; with the multi-column variants)
+                static const bool sg32_mc = getenv("GGML_VK_SG32_MC") != nullptr && atoi(getenv("GGML_VK_SG32_MC")) != 0;
+                const uint32_t subgroup_size_leg = (xe2_sg32 && (i == 0 || sg32_mc) && !batch_inv) ? 32u : subgroup_size_int;
                 const uint32_t wg_size_subgroup_leg = (w == DMMV_WG_SIZE_SUBGROUP) ? subgroup_size_leg : (subgroup_size_leg * 4);
 
                 ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q2_0][i], "mul_mat_vec_q2_0_q8_1_f32", arr_dmmv_q2_0_q8_1_f32_len[reduc], arr_dmmv_q2_0_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_int_n(2*rm_kq_int, i), 1, 1}, {wg_size_subgroup_int, rm_int_n(2*rm_kq_int, i), i+1}, 1, true, use_subgroups, subgroup_size_int);
