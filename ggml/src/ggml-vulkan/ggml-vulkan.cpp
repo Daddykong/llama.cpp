@@ -3609,12 +3609,57 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 ggml_vk_create_pipeline2(device, device->pipeline_mul_mat_vec_gqa_split2_f16_f32[g][t], "mul_mat_vec_gqa_split2_f16_f32" + sfx, mul_mat_vec_gqa_split2_f16_f32_len, mul_mat_vec_gqa_split2_f16_f32_data, "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_gqa_push_constants), {1, 1, 1}, {g + 1, t + 1, r2}, 1, false, true, 32);
                 device->mul_mat_vec_gqa_split2_rows[g][t] = r2 * 8;
             }
+            {   // b65 V x P k-sliced (GGML_VK_GQA_VXP=1): one invocation per row, no cross-lane reduction, so any
+                // subgroup size gives the same result; Intel defaults to SIMD16 (more registers per lane)
+                uint32_t blk = 128;
+                if (const char * e = getenv("GGML_VK_VXP_BLOCK")) blk = (uint32_t)atoi(e);
+                uint32_t sg = (device->vendor_id == VK_VENDOR_ID_INTEL && device->subgroup_size_control &&
+                               device->subgroup_min_size <= 16 && device->subgroup_max_size >= 16) ? 16u : 0u;
+                if (const char * e = getenv("GGML_VK_VXP_SG")) sg = (uint32_t)atoi(e);
+                if (sg != 0 && (!device->subgroup_size_control || sg < device->subgroup_min_size || sg > device->subgroup_max_size)) sg = 0;
+                device->mul_mat_vec_gqa_vxp_block = blk;
+                ggml_vk_create_pipeline2(device, device->pipeline_mul_mat_vec_gqa_vxp_f16_f32[g][t], "mul_mat_vec_gqa_vxp_f16_f32" + sfx, mul_mat_vec_gqa_vxp_f16_f32_len, mul_mat_vec_gqa_vxp_f16_f32_data, "main", 3, sizeof(vk_mat_vec_vxp_push_constants), {1, 1, 1}, {blk, g + 1, t + 1}, 1, true, false, sg);
+                uint32_t kc = 64;
+                if (const char * e = getenv("GGML_VK_VXP_KC")) kc = std::max(8u, (uint32_t)atoi(e) / 8 * 8);
+                uint32_t rpt = 1;
+                if (const char * e = getenv("GGML_VK_VXP_RPT")) rpt = std::max(1u, std::min(4u, (uint32_t)atoi(e)));
+                // shared-memory tile BLOCK*RPT x (KC/8 + 1) uvec4 must fit
+                const uint32_t shmem = device->properties.limits.maxComputeSharedMemorySize;
+                while (rpt > 1 && blk * rpt * (kc / 8 + 1) * 16 > shmem) rpt--;
+                while (kc > 8 && blk * rpt * (kc / 8 + 1) * 16 > shmem) kc /= 2;
+                device->mul_mat_vec_gqa_vxps_rpt = rpt;
+                ggml_vk_create_pipeline2(device, device->pipeline_mul_mat_vec_gqa_vxps_f16_f32[g][t], "mul_mat_vec_gqa_vxps_f16_f32" + sfx, mul_mat_vec_gqa_vxps_f16_f32_len, mul_mat_vec_gqa_vxps_f16_f32_data, "main", 3, sizeof(vk_mat_vec_vxp_push_constants), {1, 1, 1}, {blk, g + 1, t + 1, kc, rpt}, 1, true, false, sg);
+                {   // mode 4: + B tile (GQA*NTOK*KC floats) in shared memory
+                    uint32_t kcl = kc, rptl = rpt;
+                    auto lsz = [&](uint32_t c, uint32_t r) { return blk * r * (c / 8 + 1) * 16 + (g + 1) * 4 * c * 4; };   // sized for 4 tokens: same tiling for every token count
+                    while (rptl > 1 && lsz(kcl, rptl) > shmem) rptl--;
+                    while (kcl > 8 && lsz(kcl, rptl) > shmem) kcl /= 2;
+                    device->mul_mat_vec_gqa_vxpl_rpt[g][t] = rptl;
+                    ggml_vk_create_pipeline2(device, device->pipeline_mul_mat_vec_gqa_vxpl_f16_f32[g][t], "mul_mat_vec_gqa_vxpl_f16_f32" + sfx, mul_mat_vec_gqa_vxpl_f16_f32_len, mul_mat_vec_gqa_vxpl_f16_f32_data, "main", 3, sizeof(vk_mat_vec_vxp_push_constants), {1, 1, 1}, {blk, g + 1, t + 1, kcl, rptl}, 1, true, false, sg);
+                }
+                // vxpb needs a known subgroup size of 16 or 32 (full subgroups)
+                uint32_t sgb = 0;
+                if (device->subgroup_shuffle) {
+                    if (device->subgroup_size_control) {
+                        const uint32_t want = sg ? sg : (device->subgroup_min_size <= 16 && device->subgroup_max_size >= 16 ? 16u : 32u);
+                        if ((want == 16 || want == 32) && device->subgroup_min_size <= want && want <= device->subgroup_max_size) sgb = want;
+                    } else if (device->subgroup_size == 16 || device->subgroup_size == 32) {
+                        sgb = device->subgroup_size;
+                    }
+                }
+                device->mul_mat_vec_gqa_vxpb_sg = (sgb && blk % sgb == 0 && blk * 9 * 16 <= shmem) ? sgb : 0;
+                if (device->mul_mat_vec_gqa_vxpb_sg) {
+                    ggml_vk_create_pipeline2(device, device->pipeline_mul_mat_vec_gqa_vxpb_f16_f32[g][t], "mul_mat_vec_gqa_vxpb_f16_f32" + sfx, mul_mat_vec_gqa_vxpb_f16_f32_len, mul_mat_vec_gqa_vxpb_f16_f32_data, "main", 3, sizeof(vk_mat_vec_vxp_push_constants), {1, 1, 1}, {blk, g + 1, t + 1, sgb}, 1, true, true, device->subgroup_size_control ? sgb : 0);
+                }
+            }
             if (device->subgroup_clustered) {   // b65 rows2 (8 lanes per row)
                 ggml_vk_create_pipeline2(device, device->pipeline_mul_mat_vec_gqa_rows2_f16_f32[g][t], "mul_mat_vec_gqa_rows2_f16_f32" + sfx, mul_mat_vec_gqa_rows2_f16_f32_len, mul_mat_vec_gqa_rows2_f16_f32_data, "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_gqa_push_constants), {1, 1, 1}, {g + 1, t + 1}, 1);
                 ggml_vk_create_pipeline2(device, device->pipeline_mul_mat_vec_gqa_rows2_q8_0_f32[g][t], "mul_mat_vec_gqa_rows2_q8_0_f32" + sfx, mul_mat_vec_gqa_rows2_q8_0_f32_len, mul_mat_vec_gqa_rows2_q8_0_f32_data, "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_gqa_push_constants), {1, 1, 1}, {g + 1, t + 1}, 1);   // b65
             }
         }
     }
+
+    ggml_vk_create_pipeline(device, device->pipeline_mul_mat_vec_gqa_vxp_reduce, "mul_mat_vec_gqa_vxp_reduce", mul_mat_vec_gqa_vxp_reduce_len, mul_mat_vec_gqa_vxp_reduce_data, "main", 2, sizeof(vk_mat_vec_vxp_reduce_push_constants), {256, 1, 1}, {}, 1);   // b65
 
     ggml_vk_create_pipeline(device, device->pipeline_norm_f32, "norm_f32", norm_f32_len, norm_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {1, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_group_norm_f32, "group_norm_f32", group_norm_f32_len, group_norm_f32_data, "main", 2, sizeof(vk_op_push_constants), {1, 1, 1}, {}, 1);
@@ -7846,6 +7891,101 @@ static bool ggml_vk_mul_mat_vec_gqa_ok(const ggml_backend_vk_context * ctx, cons
     return src1->ne[2] > src0->ne[2] || (src1->ne[1] > 1 && !batch_inv_gqa_ok);
 }
 
+// b65 V x P k-sliced (GGML_VK_GQA_VXP=1): pass 1 writes one partial per (k-slice, B channel, token, row) into the
+// split-k scratch, pass 2 sums the slices in order. The slice length depends only on k, the A channel count and the
+// row count (never on the token count), so 1-4 token steps give bit-identical results.
+// GGML_VK_GQA_VXP: 0 off, 1 direct row loads, 2 A staged through shared memory, 3 + B by subgroup shuffles,
+// 4 A and B staged through shared memory
+static int ggml_vk_gqa_vxp_mode() {
+    static const int mode = getenv("GGML_VK_GQA_VXP") != nullptr ? atoi(getenv("GGML_VK_GQA_VXP")) : 0;
+    return mode;
+}
+
+static bool ggml_vk_gqa_vxp_ok(const ggml_backend_vk_context * ctx, const ggml_tensor * src0, const ggml_tensor * src1) {
+    if (src0->type != GGML_TYPE_F16 || src0->ne[0] % 8 != 0 ||
+        (src0->nb[1] / sizeof(ggml_fp16_t)) % 8 != 0 || (src0->nb[2] / sizeof(ggml_fp16_t)) % 8 != 0 ||
+        (get_misalign_bytes(ctx, src0) / sizeof(ggml_fp16_t)) % 8 != 0) {
+        return false;
+    }
+    GGML_UNUSED(src1);  // B alignment (4 floats) is already required by ggml_vk_mul_mat_vec_gqa_ok
+    return true;
+}
+
+static void ggml_vk_mul_mat_vec_gqa_vxp(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    const uint32_t gqa   = (uint32_t)(src1->ne[2] / src0->ne[2]);
+    const uint32_t ntok  = (uint32_t)src1->ne[1];
+    const uint32_t k     = (uint32_t)src0->ne[0];
+    const uint32_t rows  = (uint32_t)src0->ne[1];
+    const uint32_t nch_a = (uint32_t)src0->ne[2];
+    const uint32_t nch_b = (uint32_t)src1->ne[2];
+    const int mode = (ggml_vk_gqa_vxp_mode() == 3 && !ctx->device->mul_mat_vec_gqa_vxpb_sg) ? 2 : ggml_vk_gqa_vxp_mode();
+    const uint32_t blk   = ctx->device->mul_mat_vec_gqa_vxp_block;
+    // rows per workgroup (mode 4 uses the 4-token RPT for every token count, so the slicing never depends on it)
+    const uint32_t rpw   = blk * (mode == 2 ? ctx->device->mul_mat_vec_gqa_vxps_rpt : mode == 4 ? ctx->device->mul_mat_vec_gqa_vxpl_rpt[gqa - 1][3] : 1u);
+    const uint32_t rblocks = CEIL_DIV(rows, rpw);
+
+    static const uint32_t target_wgs = getenv("GGML_VK_VXP_WGS") ? (uint32_t)atoi(getenv("GGML_VK_VXP_WGS")) : 512u;
+    static const uint32_t min_slice  = getenv("GGML_VK_VXP_MIN_SLICE") ? (uint32_t)atoi(getenv("GGML_VK_VXP_MIN_SLICE")) : 256u;
+    static const uint32_t env_slice  = getenv("GGML_VK_VXP_SLICE") ? (uint32_t)atoi(getenv("GGML_VK_VXP_SLICE")) : 0u;
+    uint32_t slice;
+    if (env_slice) {
+        slice = ROUNDUP_POW2(env_slice, 64);
+    } else {
+        const uint32_t ns = std::max(1u, target_wgs / (nch_a * rblocks));
+        slice = std::max(ROUNDUP_POW2(CEIL_DIV(k, ns), 64), ROUNDUP_POW2(min_slice, 64));
+    }
+    const uint32_t nslices = CEIL_DIV(k, slice);
+
+    vk_pipeline pipeline  = mode == 4 ? ctx->device->pipeline_mul_mat_vec_gqa_vxpl_f16_f32[gqa - 1][ntok - 1]
+                          : mode == 3 ? ctx->device->pipeline_mul_mat_vec_gqa_vxpb_f16_f32[gqa - 1][ntok - 1]
+                          : mode == 2 ? ctx->device->pipeline_mul_mat_vec_gqa_vxps_f16_f32[gqa - 1][ntok - 1]
+                                      : ctx->device->pipeline_mul_mat_vec_gqa_vxp_f16_f32[gqa - 1][ntok - 1];
+    vk_pipeline pipeline2 = ctx->device->pipeline_mul_mat_vec_gqa_vxp_reduce;
+    if (ggml_nbytes(src0) > ctx->device->properties.limits.maxStorageBufferRange) {
+        pipeline = ggml_vk_get_64b_indexing_pipeline(ctx, pipeline);
+    }
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline2, 1);
+
+    const size_t part_size = sizeof(float) * (size_t)nslices * nch_b * ntok * rows;
+    if (ctx->prealloc_size_split_k < part_size) {
+        ctx->prealloc_size_split_k = part_size;
+        ggml_vk_preallocate_buffers(ctx, subctx);
+    }
+
+    vk_subbuffer d_D  = ggml_vk_tensor_subbuffer(ctx, dst, true);
+    vk_subbuffer d_Qx = ggml_vk_tensor_subbuffer(ctx, src0);
+    vk_subbuffer d_Qy = ggml_vk_tensor_subbuffer(ctx, src1, true);
+    vk_subbuffer d_P  = ggml_vk_subbuffer(ctx, ctx->prealloc_split_k, 0);
+
+    const vk_mat_vec_vxp_push_constants pc = {
+        k, rows,
+        (uint32_t)(src0->nb[1] / sizeof(ggml_fp16_t)), (uint32_t)(src0->nb[2] / sizeof(ggml_fp16_t)),
+        (uint32_t)(src1->nb[2] / sizeof(float)), (uint32_t)(src1->nb[1] / sizeof(float)),
+        (uint32_t)(get_misalign_bytes(ctx, src0) / sizeof(ggml_fp16_t)), (uint32_t)(get_misalign_bytes(ctx, src1) / sizeof(float)),
+        slice, nch_b,
+    };
+    const vk_mat_vec_vxp_reduce_push_constants pc2 = {
+        rows, ntok, nch_b, nslices,
+        (uint32_t)(dst->nb[2] / sizeof(float)), (uint32_t)(dst->nb[1] / sizeof(float)),
+        (uint32_t)(get_misalign_bytes(ctx, dst) / sizeof(float)),
+    };
+
+    if (ctx->prealloc_split_k_need_sync) {
+        ggml_vk_sync_buffers(ctx, subctx);
+    }
+    static bool logged = false;
+    if (!logged) {
+        logged = true;
+        GGML_LOG_INFO("ggml_vulkan: b65 V x P k-sliced (mode %d): k %u, slice %u, %u slices, %u workgroups of %u rows\n",
+                      mode, k, slice, nslices, nslices * nch_a * rblocks, rpw);
+    }
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { d_Qx, d_Qy, d_P }, pc, { nslices, nch_a, rblocks });
+    ggml_vk_sync_buffers(ctx, subctx);
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline2, { d_P, d_D }, pc2, { nch_b * ntok * rows, 1, 1 });
+    ctx->prealloc_split_k_need_sync = true;
+}
+
 static void ggml_vk_mul_mat_vec_gqa_f16_f32(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
     ggml_tensor * dst = cgraph->nodes[node_idx];
     const ggml_tensor * src0 = dst->src[0];
@@ -7908,6 +8048,11 @@ static void ggml_vk_mul_mat_vec_gqa_f16_f32(ggml_backend_vk_context * ctx, vk_co
         const std::array<uint32_t, 3> pc2 = { ne, nchunks, pcg.d_offset };
         ggml_vk_dispatch_pipeline(ctx, subctx, ctx->device->pipeline_mul_mat_vec_gqa_splitk_reduce, { d_P, d_D }, pc2, { ne, 1, 1 });
         ctx->prealloc_split_k_need_sync = true;
+        return;
+    }
+    static const bool mask_skip_env = getenv("GGML_VK_ATTN_MASK_SKIP") != nullptr && atoi(getenv("GGML_VK_ATTN_MASK_SKIP")) != 0;
+    if (split && ggml_vk_gqa_vxp_mode() != 0 && !mask_skip_env && ggml_vk_gqa_vxp_ok(ctx, src0, src1)) {   // b65
+        ggml_vk_mul_mat_vec_gqa_vxp(ctx, subctx, src0, src1, dst);
         return;
     }
     static const bool split2 = getenv("GGML_VK_GQA_SPLIT2") != nullptr && atoi(getenv("GGML_VK_GQA_SPLIT2")) != 0;  // b65

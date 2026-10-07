@@ -1,0 +1,126 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_shuffle : enable
+
+// b65 V x P for decode attention with a long k (GGML_VK_GQA_VXP=3), pass 1 of 2; same math and the same
+// per-output fma order as mul_mat_vec_gqa_vxp.comp (so all three modes give identical results).
+//   part[s, h*GQA + c, t, i] = sum_{k in slice s} A[k, i, h] * B[k, t, h*GQA + c]
+// One invocation per row i of a BLOCK-row tile of one KV head, k walked in chunks of KC = BW * SG:
+//  - A: the BLOCK x KC f16 tile is copied to shared memory with coalesced 16-byte loads, then each
+//    invocation reads its own row back (64 values) and keeps it unpacked in registers;
+//  - B: one coalesced load per (channel, token) gives every lane BW consecutive probabilities, and the
+//    fma for position k takes it from lane k / BW with a constant-index subgroupBroadcast (an operand
+//    region on Intel, a shuffle elsewhere) instead of a per-k load.
+// The subgroup size must be SG (required at pipeline creation).
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout(constant_id = 0) const uint BLOCK = 128;  // rows per workgroup
+layout(constant_id = 1) const uint GQA = 1;      // B channels per A channel, 1..8
+layout(constant_id = 2) const uint NTOK = 1;     // columns of B, 1..4
+layout(constant_id = 3) const uint SG = 16;      // subgroup size (16 or 32)
+
+#define BW (64 / SG)        // probabilities per lane per load: 4 (SIMD16) or 2 (SIMD32)
+#define KC 64               // k per chunk
+#define KQ (KC / 8)         // uvec4 per row per chunk
+#define KQP (KQ + 1)        // padded shared-memory row pitch
+
+layout (binding = 0) readonly buffer A {uvec4 data_a[];};   // 8 f16 per element
+layout (binding = 1) readonly buffer B {float data_b[];};
+layout (binding = 1) readonly buffer B4 {vec4 data_b4[];};
+layout (binding = 1) readonly buffer B2 {vec2 data_b2[];};
+layout (binding = 2) writeonly buffer D {float data_d[];};
+
+layout (push_constant) uniform parameter
+{
+    uint ncols;          // k, multiple of 8
+    uint nrows;          // rows of A per channel
+    uint a_row_stride;   // in f16 elements, multiples of 8 (as are a_chan_stride and a_offset)
+    uint a_chan_stride;
+    uint b_chan_stride;  // in f32 elements, multiples of 4 (as are b_tok_stride and b_offset)
+    uint b_tok_stride;
+    uint a_offset;
+    uint b_offset;
+    uint slice;          // k per slice, multiple of 64 except where it ends at ncols
+    uint nchan_b;        // B channels (= A channels * GQA)
+} p;
+
+shared uvec4 tile[BLOCK * KQP];
+
+void main() {
+    const uint tid   = gl_LocalInvocationID.x;
+    const uint lane  = gl_SubgroupInvocationID;
+    const uint row0  = gl_WorkGroupID.z * BLOCK;
+    const uint row_l = row0 + tid;
+    const uint s     = gl_WorkGroupID.x;
+    const uint h     = gl_WorkGroupID.y;
+
+    const uint k0 = s * p.slice;
+    const uint k1 = min(k0 + p.slice, p.ncols);
+
+    float acc[GQA * NTOK];
+    [[unroll]] for (uint i = 0; i < GQA * NTOK; ++i) acc[i] = 0.0;
+
+    uint b_base[GQA * NTOK];
+    [[unroll]] for (uint c = 0; c < GQA; ++c) {
+        [[unroll]] for (uint t = 0; t < NTOK; ++t) {
+            b_base[c * NTOK + t] = p.b_offset + (h * GQA + c) * p.b_chan_stride + t * p.b_tok_stride;
+        }
+    }
+
+    const uint a_chan = (p.a_offset + h * p.a_chan_stride) / 8;
+    const uint a_rs   = p.a_row_stride / 8;
+    const uint e8     = k1 / 8;
+
+    for (uint kc = k0; kc < k1; kc += KC) {
+        // A tile -> shared memory (entry e = j*BLOCK + tid is row e / KQ, column e % KQ)
+        barrier();
+        [[unroll]] for (uint j = 0; j < KQ; ++j) {
+            const uint e = j * BLOCK + tid;
+            const uint r = min(row0 + e / KQ, p.nrows - 1);
+            const uint q = kc / 8 + e % KQ;
+            tile[(e / KQ) * KQP + e % KQ] = q < e8 ? data_a[a_chan + r * a_rs + q] : uvec4(0);
+        }
+        barrier();
+
+        float a[KC];
+        [[unroll]] for (uint q = 0; q < KQ; ++q) {
+            const uvec4 ar = tile[tid * KQP + q];
+            const vec2 a01 = unpackHalf2x16(ar.x);
+            const vec2 a23 = unpackHalf2x16(ar.y);
+            const vec2 a45 = unpackHalf2x16(ar.z);
+            const vec2 a67 = unpackHalf2x16(ar.w);
+            a[8 * q + 0] = a01.x; a[8 * q + 1] = a01.y; a[8 * q + 2] = a23.x; a[8 * q + 3] = a23.y;
+            a[8 * q + 4] = a45.x; a[8 * q + 5] = a45.y; a[8 * q + 6] = a67.x; a[8 * q + 7] = a67.y;
+        }
+
+        const uint kl = kc + lane * BW;   // this lane's first probability
+        [[unroll]] for (uint i = 0; i < GQA * NTOK; ++i) {
+            // k1 and kl are multiples of BW, so a lane's BW values are all in range or all out
+            float bv[BW];
+            if (BW == 4) {
+                const vec4 v = kl < k1 ? data_b4[(b_base[i] + kl) / 4] : vec4(0.0);
+                bv[0] = v.x; bv[1] = v.y; bv[2] = v.z; bv[3] = v.w;
+            } else {
+                const vec2 v = kl < k1 ? data_b2[(b_base[i] + kl) / 2] : vec2(0.0);
+                bv[0] = v.x; bv[1] = v.y;
+            }
+            float x = acc[i];
+            [[unroll]] for (uint kk = 0; kk < KC; ++kk) {
+                x = fma(a[kk], subgroupShuffle(bv[kk % BW], kk / BW), x);
+            }
+            acc[i] = x;
+        }
+    }
+
+    if (row_l < p.nrows) {
+        // part[s][h*GQA + c][t][row]
+        [[unroll]] for (uint c = 0; c < GQA; ++c) {
+            [[unroll]] for (uint t = 0; t < NTOK; ++t) {
+                data_d[((s * p.nchan_b + h * GQA + c) * NTOK + t) * p.nrows + row_l] = acc[c * NTOK + t];
+            }
+        }
+    }
+}

@@ -1,0 +1,229 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+
+// b65 V x P for decode attention with a long k (GGML_VK_GQA_VXP=1), pass 1 of 2.
+//   part[s, h*GQA + c, t, i] = sum_{k in slice s} A[k, i, h] * B[k, t, h*GQA + c]
+// A is the transposed f16 V cache (row i = one head-dim element, contiguous along k), B the f32 softmax.
+// One invocation per row i: a workgroup takes BLOCK rows of one KV head and one k-slice, so every A
+// cache line is read by exactly one invocation (64 bytes per step) and every B value is the same for
+// all invocations of the workgroup (a uniform load, broadcast to the FMAs by the compiler). There are
+// no cross-invocation reductions, so the result does not depend on the subgroup size, the token count
+// or the workgroup size: each output is a fixed-order fma chain over its slice, then a fixed-order sum
+// over the slices in pass 2 (mul_mat_vec_gqa_vxp_reduce.comp).
+// STAGED (GGML_VK_GQA_VXP=2): the workgroup first copies a BLOCK x KC tile of A into shared memory with
+// coalesced 16-byte loads (consecutive invocations read consecutive bytes of a row), then each invocation
+// reads its own row back from shared memory; the next tile's global loads are in flight meanwhile.
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout(constant_id = 0) const uint BLOCK = 128;  // rows per workgroup
+layout(constant_id = 1) const uint GQA = 1;      // B channels per A channel, 1..8
+layout(constant_id = 2) const uint NTOK = 1;     // columns of B, 1..4
+layout(constant_id = 3) const uint KC = 64;      // STAGED: k per shared-memory tile, multiple of 8
+layout(constant_id = 4) const uint RPT = 1;      // STAGED: rows per invocation (rows tid, tid + BLOCK, ...)
+
+layout (binding = 0) readonly buffer A {uvec4 data_a[];};   // 8 f16 per element
+layout (binding = 1) readonly buffer B {vec4 data_b[];};
+layout (binding = 2) writeonly buffer D {float data_d[];};
+
+layout (push_constant) uniform parameter
+{
+    uint ncols;          // k, multiple of 8
+    uint nrows;          // rows of A per channel
+    uint a_row_stride;   // in f16 elements, multiples of 8 (as are a_chan_stride and a_offset)
+    uint a_chan_stride;
+    uint b_chan_stride;  // in f32 elements, multiples of 4 (as are b_tok_stride and b_offset)
+    uint b_tok_stride;
+    uint a_offset;
+    uint b_offset;
+    uint slice;          // k per slice, multiple of 8
+    uint nchan_b;        // B channels (= A channels * GQA)
+} p;
+
+#define FMA8(I, AR, K8)                                         \
+    {                                                           \
+        const vec4 b0 = data_b[b_base[I] + 2 * (K8)];           \
+        const vec4 b1 = data_b[b_base[I] + 2 * (K8) + 1];       \
+        float a = acc[I];                                       \
+        a = fma(a01.x, b0.x, a);                                \
+        a = fma(a01.y, b0.y, a);                                \
+        a = fma(a23.x, b0.z, a);                                \
+        a = fma(a23.y, b0.w, a);                                \
+        a = fma(a45.x, b1.x, a);                                \
+        a = fma(a45.y, b1.y, a);                                \
+        a = fma(a67.x, b1.z, a);                                \
+        a = fma(a67.y, b1.w, a);                                \
+        acc[I] = a;                                             \
+    }
+
+#define UNPACK8(AR)                                             \
+    const vec2 a01 = unpackHalf2x16((AR).x);                    \
+    const vec2 a23 = unpackHalf2x16((AR).y);                    \
+    const vec2 a45 = unpackHalf2x16((AR).z);                    \
+    const vec2 a67 = unpackHalf2x16((AR).w);
+
+#ifdef STAGED
+const uint KQ  = KC / 8;        // uvec4 per row per tile
+const uint KQP = KQ + 1;        // padded row pitch in shared memory
+shared uvec4 tile[BLOCK * RPT * KQP];
+#ifdef BSLM
+// BSLM (GGML_VK_GQA_VXP=4): the tile's probabilities too, so every B read is a uniform shared-memory load
+shared vec4 btile[GQA * NTOK * KC / 4];
+#endif
+
+// one k8 step of the staged path: A of the RPT rows unpacked once, each B load used for all RPT rows
+uint bb[GQA * NTOK];
+float accr[RPT * GQA * NTOK];
+void step8(const uint q, const uint k8) {
+    const uint tid = gl_LocalInvocationID.x;
+    float av[RPT * 8];
+    [[unroll]] for (uint r = 0; r < RPT; ++r) {
+        const uvec4 ar = tile[(tid + r * BLOCK) * KQP + q];
+        const vec2 a01 = unpackHalf2x16(ar.x);
+        const vec2 a23 = unpackHalf2x16(ar.y);
+        const vec2 a45 = unpackHalf2x16(ar.z);
+        const vec2 a67 = unpackHalf2x16(ar.w);
+        av[r * 8 + 0] = a01.x; av[r * 8 + 1] = a01.y; av[r * 8 + 2] = a23.x; av[r * 8 + 3] = a23.y;
+        av[r * 8 + 4] = a45.x; av[r * 8 + 5] = a45.y; av[r * 8 + 6] = a67.x; av[r * 8 + 7] = a67.y;
+    }
+    [[unroll]] for (uint i = 0; i < GQA * NTOK; ++i) {
+#ifdef BSLM
+        const vec4 b0 = btile[i * (KC / 4) + 2 * q];
+        const vec4 b1 = btile[i * (KC / 4) + 2 * q + 1];
+#else
+        const vec4 b0 = data_b[bb[i] + 2 * k8];
+        const vec4 b1 = data_b[bb[i] + 2 * k8 + 1];
+#endif
+        [[unroll]] for (uint r = 0; r < RPT; ++r) {
+            float a = accr[r * GQA * NTOK + i];
+            a = fma(av[r * 8 + 0], b0.x, a);
+            a = fma(av[r * 8 + 1], b0.y, a);
+            a = fma(av[r * 8 + 2], b0.z, a);
+            a = fma(av[r * 8 + 3], b0.w, a);
+            a = fma(av[r * 8 + 4], b1.x, a);
+            a = fma(av[r * 8 + 5], b1.y, a);
+            a = fma(av[r * 8 + 6], b1.z, a);
+            a = fma(av[r * 8 + 7], b1.w, a);
+            accr[r * GQA * NTOK + i] = a;
+        }
+    }
+}
+#endif
+
+void main() {
+    const uint tid   = gl_LocalInvocationID.x;
+    const uint row0  = gl_WorkGroupID.z * BLOCK;
+    const uint row_l = row0 + tid;
+    const uint row   = min(row_l, p.nrows - 1);
+    const uint s     = gl_WorkGroupID.x;
+    const uint h     = gl_WorkGroupID.y;
+
+    const uint k0 = s * p.slice;
+    const uint k1 = min(k0 + p.slice, p.ncols);
+
+    float acc[GQA * NTOK];
+    [[unroll]] for (uint i = 0; i < GQA * NTOK; ++i) acc[i] = 0.0;
+
+    uint b_base[GQA * NTOK];
+    [[unroll]] for (uint c = 0; c < GQA; ++c) {
+        [[unroll]] for (uint t = 0; t < NTOK; ++t) {
+            b_base[c * NTOK + t] = (p.b_offset + (h * GQA + c) * p.b_chan_stride + t * p.b_tok_stride) / 4;
+        }
+    }
+
+#ifndef STAGED
+    const uint a_base = (p.a_offset + h * p.a_chan_stride + row * p.a_row_stride) / 8;
+    uint k8 = k0 / 8;
+    const uint e8 = k1 / 8;
+
+    // 4 x 16 bytes of A per step (one 64-byte line when the row is 64-byte aligned)
+    for (; k8 + 4 <= e8; k8 += 4) {
+        uvec4 ar[4];
+        [[unroll]] for (uint j = 0; j < 4; ++j) ar[j] = data_a[a_base + k8 + j];
+        [[unroll]] for (uint j = 0; j < 4; ++j) {
+            UNPACK8(ar[j])
+            [[unroll]] for (uint i = 0; i < GQA * NTOK; ++i) FMA8(i, ar[j], k8 + j)
+        }
+    }
+    for (; k8 < e8; ++k8) {
+        const uvec4 ar = data_a[a_base + k8];
+        UNPACK8(ar)
+        [[unroll]] for (uint i = 0; i < GQA * NTOK; ++i) FMA8(i, ar, k8)
+    }
+#else
+    // A tile (BLOCK * RPT rows x KC) through shared memory: element j of this invocation is tile entry
+    // e = j*BLOCK + tid -> (row e / KQ, column e % KQ), so consecutive invocations read consecutive bytes
+    const uint NR = BLOCK * RPT;
+    const uint a_chan = (p.a_offset + h * p.a_chan_stride) / 8;
+    const uint a_rs   = p.a_row_stride / 8;
+    const uint rw0    = gl_WorkGroupID.z * NR;
+    uvec4 pre[KQ * RPT];
+    const uint ntiles = (k1 - k0 + KC - 1) / KC;
+    {
+        const uint kc0 = k0 / 8;
+        [[unroll]] for (uint j = 0; j < KQ * RPT; ++j) {
+            const uint e = j * BLOCK + tid;
+            const uint r = min(rw0 + e / KQ, p.nrows - 1);
+            const uint q = kc0 + e % KQ;
+            pre[j] = q < k1 / 8 ? data_a[a_chan + r * a_rs + q] : uvec4(0);
+        }
+    }
+    [[unroll]] for (uint i = 0; i < RPT * GQA * NTOK; ++i) accr[i] = 0.0;
+    [[unroll]] for (uint i = 0; i < GQA * NTOK; ++i) bb[i] = b_base[i];
+    for (uint tI = 0; tI < ntiles; ++tI) {
+        barrier();
+        [[unroll]] for (uint j = 0; j < KQ * RPT; ++j) {
+            const uint e = j * BLOCK + tid;
+            tile[(e / KQ) * KQP + e % KQ] = pre[j];
+        }
+#ifdef BSLM
+        {
+            const uint kb0 = (k0 + tI * KC) / 4;   // first vec4 of this tile's probabilities
+            for (uint e = tid; e < GQA * NTOK * (KC / 4); e += BLOCK) {
+                const uint i = e / (KC / 4);
+                const uint w = e % (KC / 4);
+                btile[e] = 4 * (kb0 + w) < k1 ? data_b[bb[i] + kb0 + w] : vec4(0.0);
+            }
+        }
+#endif
+        barrier();
+        const uint kc0 = k0 / 8 + tI * KQ;   // first uvec4 column of this tile
+        if (tI + 1 < ntiles) {
+            const uint kn0 = kc0 + KQ;
+            [[unroll]] for (uint j = 0; j < KQ * RPT; ++j) {
+                const uint e = j * BLOCK + tid;
+                const uint r = min(rw0 + e / KQ, p.nrows - 1);
+                const uint q = kn0 + e % KQ;
+                pre[j] = q < k1 / 8 ? data_a[a_chan + r * a_rs + q] : uvec4(0);
+            }
+        }
+        const uint nq = min(KQ, k1 / 8 - kc0);
+        if (nq == KQ) {
+            [[unroll]] for (uint q = 0; q < KQ; ++q) step8(q, kc0 + q);
+        } else {
+            for (uint q = 0; q < nq; ++q) step8(q, kc0 + q);
+        }
+    }
+    [[unroll]] for (uint r = 0; r < RPT; ++r) {
+        const uint rr = rw0 + tid + r * BLOCK;
+        if (rr < p.nrows) {
+            [[unroll]] for (uint c = 0; c < GQA; ++c) {
+                [[unroll]] for (uint t = 0; t < NTOK; ++t) {
+                    data_d[((s * p.nchan_b + h * GQA + c) * NTOK + t) * p.nrows + rr] = accr[r * GQA * NTOK + c * NTOK + t];
+                }
+            }
+        }
+    }
+    return;
+#endif
+
+    if (row_l < p.nrows) {
+        // part[s][h*GQA + c][t][row]
+        [[unroll]] for (uint c = 0; c < GQA; ++c) {
+            [[unroll]] for (uint t = 0; t < NTOK; ++t) {
+                data_d[((s * p.nchan_b + h * GQA + c) * NTOK + t) * p.nrows + row_l] = acc[c * NTOK + t];
+            }
+        }
+    }
+}

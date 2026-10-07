@@ -46,6 +46,29 @@ struct vk_mat_vec_p021_push_constants {
     uint32_t stride_d_tok;
 };
 
+// b65 V x P k-sliced (mul_mat_vec_gqa_vxp.comp) and its slice reduction
+struct vk_mat_vec_vxp_push_constants {
+    uint32_t ncols;
+    uint32_t nrows;
+    uint32_t a_row_stride;
+    uint32_t a_chan_stride;
+    uint32_t b_chan_stride;
+    uint32_t b_tok_stride;
+    uint32_t a_offset;
+    uint32_t b_offset;
+    uint32_t slice;
+    uint32_t nchan_b;
+};
+struct vk_mat_vec_vxp_reduce_push_constants {
+    uint32_t nrows;
+    uint32_t ntok;
+    uint32_t nchan_b;
+    uint32_t nslices;
+    uint32_t d_chan_stride;
+    uint32_t d_tok_stride;
+    uint32_t d_offset;
+};
+
 struct vk_mat_vec_gqa_push_constants {
     uint32_t ncols;
     uint32_t nrows;

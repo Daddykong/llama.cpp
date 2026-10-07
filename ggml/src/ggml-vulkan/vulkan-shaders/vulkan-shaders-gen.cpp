@@ -906,6 +906,11 @@ void process_shaders() {
     string_to_spv("mul_mat_vec_gqa_split_f16_f32", "mul_mat_vec_gqa_split.comp", {{"A_TYPE", "float16_t"}, {"A_TYPEV4", "f16vec4"}, {"B_TYPE", "float"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}});
     string_to_spv("mul_mat_vec_gqa_splitk_f16_f32", "mul_mat_vec_gqa_splitk.comp", {{"A_TYPE", "float16_t"}, {"A_TYPEV4", "f16vec4"}, {"B_TYPE", "float"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}});   // b65 [mtp]
     string_to_spv("mul_mat_vec_gqa_splitk_reduce", "mul_mat_vec_gqa_splitk_reduce.comp", {});   // b65 [mtp]
+    string_to_spv("mul_mat_vec_gqa_vxp_f16_f32", "mul_mat_vec_gqa_vxp.comp", {});   // b65 V x P, k-sliced
+    string_to_spv("mul_mat_vec_gqa_vxps_f16_f32", "mul_mat_vec_gqa_vxp.comp", {{"STAGED", "1"}});   // b65 V x P, k-sliced, A staged in shared memory
+    string_to_spv("mul_mat_vec_gqa_vxpl_f16_f32", "mul_mat_vec_gqa_vxp.comp", {{"STAGED", "1"}, {"BSLM", "1"}});   // b65 V x P, k-sliced, A and B staged in shared memory
+    string_to_spv("mul_mat_vec_gqa_vxpb_f16_f32", "mul_mat_vec_gqa_vxpb.comp", {});   // b65 V x P, k-sliced, A staged, B broadcast by subgroup shuffles
+    string_to_spv("mul_mat_vec_gqa_vxp_reduce", "mul_mat_vec_gqa_vxp_reduce.comp", {});   // b65
 
     // Norms
     string_to_spv("norm_f32", "norm.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));

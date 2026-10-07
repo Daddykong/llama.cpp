@@ -9626,6 +9626,17 @@ static void add_b65_sparse_t_cases(std::vector<std::unique_ptr<test_case>> & tes
             test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 256, n, ctx, {4, 1}, {6, 1}, {0, 1, 2, 3}, 131072));
         }
     }
+    // b65 V x P exact decode shapes (Qwen3.8-27B, FA off: transposed f16 V, 4 KV heads x 6): llama-bench (contiguous,
+    // k_v 0), server ctx 40960, 128K; plus odd shapes for the k-sliced kernel (k % 32 != 0, rows % 128 != 0, GQA 3)
+    for (int n : {1, 2, 3, 4}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 256, n, 4096,   {4, 1}, {6, 1}, {0, 1, 2, 3}, 40960));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 256, n, 33024,  {4, 1}, {6, 1}, {0, 1, 2, 3}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 256, n, 33024,  {4, 1}, {6, 1}, {0, 1, 2, 3}, 40960));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 256, n, 131072, {4, 1}, {6, 1}, {0, 1, 2, 3}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 72,  n, 1032,   {2, 1}, {3, 1}, {0, 1, 2, 3}, 1040));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 200, n, 5000,   {3, 1}, {8, 1}, {0, 1, 2, 3}, 5008));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 256, n, 1028,   {4, 1}, {6, 1}, {0, 1, 2, 3}, 1036));
+    }
 }
 
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
@@ -11904,6 +11915,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 17408, 512, 5120, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 5120, 512, 17408, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 5120, 512, 5120, {1, 1}, {1, 1}));
+    // b65 V x P exact decode shapes (see the eval list)
+    for (int n : {1, 2, 3, 4}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 256, n, 4096,   {4, 1}, {6, 1}, {0, 1, 2, 3}, 40960));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 256, n, 33024,  {4, 1}, {6, 1}, {0, 1, 2, 3}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 256, n, 33024,  {4, 1}, {6, 1}, {0, 1, 2, 3}, 40960));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 256, n, 131072, {4, 1}, {6, 1}, {0, 1, 2, 3}));
+    }
     for (float thr : {0.0f, 0.4f, 0.5f, 0.6f}) for (int nc : {24, 48, 96}) test_cases.emplace_back(new test_mul_mat_sparse_t(GGML_TYPE_Q4_0, 5120, 17408, 1, nc, thr));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 5120, 1, 17408, {1, 1}, {1, 1}));
     // b65 [mtp]: Qwen3.8-27B weight matvecs at 1-4 columns (MTP verify = 3); m x k as the model uses them

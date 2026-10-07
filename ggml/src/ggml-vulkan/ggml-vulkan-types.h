@@ -868,6 +868,15 @@ struct vk_device_struct {
     vk_pipeline pipeline_mul_mat_vec_gqa_rows2_f16_f32[8][4]; // b65
     vk_pipeline pipeline_mul_mat_vec_gqa_rows2_q8_0_f32[8][4]; // b65 q8_0 K cache
     uint32_t mul_mat_vec_gqa_split2_rows[8][4]; // b65
+    vk_pipeline pipeline_mul_mat_vec_gqa_vxp_f16_f32[8][4]; // b65 V x P k-sliced (GGML_VK_GQA_VXP=1)
+    vk_pipeline pipeline_mul_mat_vec_gqa_vxps_f16_f32[8][4]; // b65 V x P k-sliced, A staged in shared memory (GGML_VK_GQA_VXP=2)
+    vk_pipeline pipeline_mul_mat_vec_gqa_vxpl_f16_f32[8][4]; // b65 V x P k-sliced, A and B staged in shared memory (GGML_VK_GQA_VXP=4)
+    vk_pipeline pipeline_mul_mat_vec_gqa_vxpb_f16_f32[8][4]; // b65 V x P k-sliced, A staged, B by subgroup shuffles (GGML_VK_GQA_VXP=3)
+    uint32_t mul_mat_vec_gqa_vxpb_sg; // b65 subgroup size of the vxpb pipelines, 0 = not available
+    vk_pipeline pipeline_mul_mat_vec_gqa_vxp_reduce; // b65
+    uint32_t mul_mat_vec_gqa_vxp_block; // b65 rows per workgroup
+    uint32_t mul_mat_vec_gqa_vxps_rpt; // b65 rows per invocation of the staged kernel
+    uint32_t mul_mat_vec_gqa_vxpl_rpt[8][4]; // b65 rows per invocation of the mode-4 kernel
     uint32_t mul_mat_vec_gqa_split_rows[8][4];
     bool mul_mat_vec_gqa;
     vk_pipeline pipeline_get_rows[GGML_TYPE_COUNT];

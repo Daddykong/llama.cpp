@@ -1,0 +1,35 @@
+#version 450
+
+// b65 V x P (GGML_VK_GQA_VXP=1), pass 2: dst[i, t, hq] = sum over slices s (in order) of part[s, hq, t, i]
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer P {float data_p[];};
+layout (binding = 1) writeonly buffer D {float data_d[];};
+
+layout (push_constant) uniform parameter
+{
+    uint nrows;
+    uint ntok;
+    uint nchan_b;
+    uint nslices;
+    uint d_chan_stride;
+    uint d_tok_stride;
+    uint d_offset;
+} p;
+
+void main() {
+    const uint idx = gl_GlobalInvocationID.x;   // (hq * ntok + t) * nrows + i
+    const uint per_slice = p.nchan_b * p.ntok * p.nrows;
+    if (idx >= per_slice) {
+        return;
+    }
+    float s = 0.0;
+    for (uint j = 0; j < p.nslices; ++j) {
+        s += data_p[j * per_slice + idx];
+    }
+    const uint i  = idx % p.nrows;
+    const uint t  = (idx / p.nrows) % p.ntok;
+    const uint hq = idx / (p.nrows * p.ntok);
+    data_d[p.d_offset + hq * p.d_chan_stride + t * p.d_tok_stride + i] = s;
+}
