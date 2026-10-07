@@ -1226,6 +1226,7 @@ struct vk_context_struct {
     std::vector<std::string> debug_labels;
 
     vk_command_pool * p {};
+    bool transfer_since_sync = true;   // b65: a fill/copy was recorded since the last barrier (start conservative)
 };
 
 typedef std::shared_ptr<vk_context_struct> vk_context;

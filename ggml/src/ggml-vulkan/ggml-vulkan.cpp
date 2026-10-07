@@ -1155,13 +1155,24 @@ void ggml_vk_sync_buffers(ggml_backend_vk_context* ctx, vk_context& subctx) {
         ctx->prealloc_x_need_sync = ctx->prealloc_y_need_sync = ctx->prealloc_split_k_need_sync = false;
     }
 
+    // b65: GGML_VK_SYNC_STORAGE_ONLY=1 - no transfer bits on the source side unless a fill/copy was recorded since the
+    // last barrier (on the render engine a TRANSFER_WRITE source also flushes the render-target and depth caches)
+    static const bool storage_only = getenv("GGML_VK_SYNC_STORAGE_ONLY") != nullptr && atoi(getenv("GGML_VK_SYNC_STORAGE_ONLY")) != 0;
+    const vk::AccessFlags all_rw = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite;
+    const vk::AccessFlags xfer_rw = vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite;
+    vk::AccessFlags src = !transfer_queue ? all_rw : xfer_rw;
+    if (storage_only && !transfer_queue && !subctx->transfer_since_sync) {
+        src = vk::AccessFlagBits::eShaderWrite;
+    }
+    subctx->transfer_since_sync = false;
+
     subctx->s->buffer->buf.pipelineBarrier(
         subctx->p->q->stage_flags,
         subctx->p->q->stage_flags,
         {},
         { {
-          { !transfer_queue ? (vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite) : (vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite) },
-          { !transfer_queue ? (vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite) : (vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite) }
+          { src },
+          { !transfer_queue ? all_rw : xfer_rw }
         } },
         {},
         {}
@@ -8240,6 +8251,7 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
                 GGML_ASSERT(y_sz % 4 == 0);
                 // Zero B padding because clamping only A can produce 0 * Inf or NaN.
                 subctx->s->buffer->buf.fillBuffer(d_Y->buffer, 0, y_sz, 0);
+                subctx->transfer_since_sync = true;   // b65
                 ggml_vk_sync_buffers(ctx, subctx);
                 const ggml_tensor y_staged_dst = make_y_staged_dst();
                 const uint32_t y_staged_dst_type_size = ggml_type_size(y_staged_dst.type);
@@ -14320,6 +14332,7 @@ static void ggml_backend_vk_set_tensor_2d_async(ggml_backend_t backend, ggml_ten
         }
 
         cpy_ctx->s->buffer->buf.copyBuffer(ctx->sync_staging->buffer, buf->buffer, slices);
+        cpy_ctx->transfer_since_sync = true;   // b65
 
         if (size == stride_data) {
             deferred_memcpy(ctx->sync_staging->ptr, data, staging_size, &cpy_ctx->in_memcpys);
@@ -14376,6 +14389,7 @@ static void ggml_backend_vk_get_tensor_2d_async(ggml_backend_t backend, const gg
         }
 
         compute_ctx->s->buffer->buf.copyBuffer(buf->buffer, ctx->sync_staging->buffer, slices);
+        compute_ctx->transfer_since_sync = true;   // b65
 
         if (size == stride_data) {
             deferred_memcpy(data, ctx->sync_staging->ptr, staging_size, &compute_ctx->out_memcpys);
