@@ -38,7 +38,14 @@ layout (binding = 0) readonly buffer A_R32 {uint data_a_r32[];};
 layout (binding = 0) readonly buffer A_R16 {float16_t data_a_r16[];};
 #endif
 
-#if (defined(DATA_A_Q4_0R) && defined(Q4_0R_K32)) || defined(DATA_A_Q5_KR) || defined(DATA_A_Q8_0R) || defined(DATA_A_IQ4_XSR) || defined(DATA_A_IQ4_NLR)
+#if defined(DATA_A_Q6_KR)
+// Row-reordered Q6_K (GGML_VK_Q6_K_REPACK): see reorder_q6_k.comp; rows are 8-byte aligned
+layout (binding = 0) readonly buffer A_R64 {uvec2 data_a_r64[];};
+layout (binding = 0) readonly buffer A_R32 {uint data_a_r32[];};
+layout (binding = 0) readonly buffer A_R16 {float16_t data_a_r16[];};
+#endif
+
+#if (defined(DATA_A_Q4_0R) && defined(Q4_0R_K32)) || defined(DATA_A_Q5_KR) || defined(DATA_A_Q8_0R) || defined(DATA_A_IQ4_XSR) || defined(DATA_A_IQ4_NLR) || defined(DATA_A_Q6_KR)
 #define A_REORDERED_K32 1
 // q8_1_x4 blocks are 144 bytes (9 x 16): ds[4] then qs[32]
 layout (binding = 1) readonly buffer B_R128 {ivec4 data_b_r128[];};

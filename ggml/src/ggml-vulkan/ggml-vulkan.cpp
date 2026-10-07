@@ -2211,7 +2211,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     static const ggml_type non_lut_quant_types[] = {
         GGML_TYPE_Q1_0, GGML_TYPE_Q2_0, GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0,
         GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_TQ1_0, GGML_TYPE_TQ2_0,
-        GGML_TYPE_Q4_0R_VK, GGML_TYPE_Q5_KR_VK, GGML_TYPE_Q8_0R_VK, GGML_TYPE_IQ4_XSR_VK, GGML_TYPE_IQ4_NLR_VK,
+        GGML_TYPE_Q4_0R_VK, GGML_TYPE_Q5_KR_VK, GGML_TYPE_Q8_0R_VK, GGML_TYPE_IQ4_XSR_VK, GGML_TYPE_IQ4_NLR_VK, GGML_TYPE_Q6_KR_VK,
     };
     // The row-reordered Q4_0 pipelines use the Q4_0 tile/shared-memory limits
     device->mul_mat_s[GGML_TYPE_Q4_0R_VK]        = device->mul_mat_s[GGML_TYPE_Q4_0];
@@ -2228,7 +2228,8 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     device->mul_mat_id_l_int[GGML_TYPE_Q4_0R_VK] = device->mul_mat_id_l_int[GGML_TYPE_Q4_0];
     // ... and the row-reordered Q5_K / Q8_0 ones those of Q5_K / Q8_0
     for (const auto & rt : { std::make_pair(GGML_TYPE_Q5_KR_VK, GGML_TYPE_Q5_K), std::make_pair(GGML_TYPE_Q8_0R_VK, GGML_TYPE_Q8_0),
-                             std::make_pair(GGML_TYPE_IQ4_XSR_VK, GGML_TYPE_IQ4_XS), std::make_pair(GGML_TYPE_IQ4_NLR_VK, GGML_TYPE_IQ4_NL) }) {
+                             std::make_pair(GGML_TYPE_IQ4_XSR_VK, GGML_TYPE_IQ4_XS), std::make_pair(GGML_TYPE_IQ4_NLR_VK, GGML_TYPE_IQ4_NL),
+                             std::make_pair(GGML_TYPE_Q6_KR_VK, GGML_TYPE_Q6_K) }) {
         device->mul_mat_s[rt.first]        = device->mul_mat_s[rt.second];
         device->mul_mat_m[rt.first]        = device->mul_mat_m[rt.second];
         device->mul_mat_l[rt.first]        = device->mul_mat_l[rt.second];
@@ -2355,7 +2356,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         }
 #endif
         for (const auto type : non_lut_quant_types) {
-            if (type == GGML_TYPE_Q4_0R_VK || type == GGML_TYPE_Q5_KR_VK || type == GGML_TYPE_Q8_0R_VK || type == GGML_TYPE_IQ4_XSR_VK || type == GGML_TYPE_IQ4_NLR_VK) continue;  // coopmat2 shaders do not handle the reordered layouts
+            if (type == GGML_TYPE_Q4_0R_VK || type == GGML_TYPE_Q5_KR_VK || type == GGML_TYPE_Q8_0R_VK || type == GGML_TYPE_IQ4_XSR_VK || type == GGML_TYPE_IQ4_NLR_VK || type == GGML_TYPE_Q6_KR_VK) continue;  // coopmat2 shaders do not handle the reordered layouts
             // regression in unified shader on Ampere
             if (type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K) {
                 continue;
@@ -2403,7 +2404,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         }
 #endif
         for (const auto type : non_lut_quant_types) {
-            if (type == GGML_TYPE_Q4_0R_VK || type == GGML_TYPE_Q5_KR_VK || type == GGML_TYPE_Q8_0R_VK || type == GGML_TYPE_IQ4_XSR_VK || type == GGML_TYPE_IQ4_NLR_VK) continue;  // coopmat2 shaders do not handle the reordered layouts
+            if (type == GGML_TYPE_Q4_0R_VK || type == GGML_TYPE_Q5_KR_VK || type == GGML_TYPE_Q8_0R_VK || type == GGML_TYPE_IQ4_XSR_VK || type == GGML_TYPE_IQ4_NLR_VK || type == GGML_TYPE_Q6_KR_VK) continue;  // coopmat2 shaders do not handle the reordered layouts
             if (type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K) {
                 continue;
             }
@@ -3101,6 +3102,10 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                     static const void * const iq4_nlr_data[3] = { mul_mat_vec_iq4_nlr_q8_1_f32_data, mul_mat_vec_iq4_nlr_q8_1_f32_subgroup_data, mul_mat_vec_iq4_nlr_q8_1_f32_subgroup_no_shmem_data };
                     static const uint64_t     iq4_nlr_len[3]  = { mul_mat_vec_iq4_nlr_q8_1_f32_len,  mul_mat_vec_iq4_nlr_q8_1_f32_subgroup_len,  mul_mat_vec_iq4_nlr_q8_1_f32_subgroup_no_shmem_len };
                     ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_IQ4_NLR_VK][i], "mul_mat_vec_iq4_nlr_q8_1_f32", iq4_nlr_len[reduc], iq4_nlr_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {1, 1, 1}, {wg_size_subgroup_int, 1, i+1}, 1, true, use_subgroups, subgroup_size_int);
+                    // row-reordered Q6_K (GGML_VK_Q6_K_REPACK): one 32-value sub-block per thread
+                    static const void * const q6_kr_data[3] = { mul_mat_vec_q6_kr_q8_1_f32_data, mul_mat_vec_q6_kr_q8_1_f32_subgroup_data, mul_mat_vec_q6_kr_q8_1_f32_subgroup_no_shmem_data };
+                    static const uint64_t     q6_kr_len[3]  = { mul_mat_vec_q6_kr_q8_1_f32_len,  mul_mat_vec_q6_kr_q8_1_f32_subgroup_len,  mul_mat_vec_q6_kr_q8_1_f32_subgroup_no_shmem_len };
+                    ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q6_KR_VK][i], "mul_mat_vec_q6_kr_q8_1_f32", q6_kr_len[reduc], q6_kr_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {1, 1, 1}, {wg_size_subgroup_int, 1, i+1}, 1, true, use_subgroups, subgroup_size_int);
                 }
                 ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q4_1][i], "mul_mat_vec_q4_1_q8_1_f32", arr_dmmv_q4_1_q8_1_f32_len[reduc], arr_dmmv_q4_1_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_int_n(1*rm_stdq_int, i), 1, 1}, {wg_size_subgroup_leg, rm_int_n(1*rm_stdq_int, i), i+1}, 1, true, use_subgroups, subgroup_size_leg);
                 ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q5_0][i], "mul_mat_vec_q5_0_q8_1_f32", arr_dmmv_q5_0_q8_1_f32_len[reduc], arr_dmmv_q5_0_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_int_n(1*rm_stdq_int, i), 1, 1}, {wg_size_subgroup_int, rm_int_n(1*rm_stdq_int, i), i+1}, 1, true, use_subgroups, subgroup_size_int);
@@ -3351,6 +3356,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_reorder_q5_k, "reorder_q5_k", reorder_q5_k_len, reorder_q5_k_data, "main", 1, 3 * sizeof(uint32_t), {1, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_reorder_q8_0, "reorder_q8_0", reorder_q8_0_len, reorder_q8_0_data, "main", 1, 3 * sizeof(uint32_t), {1, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_reorder_iq4_xs, "reorder_iq4_xs", reorder_iq4_xs_len, reorder_iq4_xs_data, "main", 1, 3 * sizeof(uint32_t), {1, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_reorder_q6_k, "reorder_q6_k", reorder_q6_k_len, reorder_q6_k_data, "main", 1, 3 * sizeof(uint32_t), {1, 1, 1}, {}, 1);
 
     if (device->subgroup_clustered && device->subgroup_require_full_support) {
         ggml_vk_create_pipeline(device, device->pipeline_quantize_q8_1_x4, "quantize_q8_1_x4", quantize_q8_1_x4_subgroup_len, quantize_q8_1_x4_subgroup_data, "main", 2, sizeof(vk_quantize_q8_1_push_constants), {32 * device->subgroup_size / 8, 1, 1}, { device->subgroup_size }, 1, true, true);
@@ -5132,6 +5138,10 @@ vk_device ggml_vk_get_device(size_t idx) {
         if (const char * r = getenv("GGML_VK_IQ4_NL_REPACK")) {
             device->iq4_nl_repack = device->integer_dot_product ? atoi(r) : 0;
         }
+        device->q6_k_repack = 0;
+        if (const char * r = getenv("GGML_VK_Q6_K_REPACK")) {
+            device->q6_k_repack = device->integer_dot_product ? atoi(r) : 0;
+        }
 
         device->mmvq_mode = 0;
         if (getenv("GGML_VK_DISABLE_MMVQ")) {
@@ -5743,6 +5753,7 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec(ggml_backend_vk_context * 
             case GGML_TYPE_Q8_0R_VK:
             case GGML_TYPE_IQ4_XSR_VK:
             case GGML_TYPE_IQ4_NLR_VK:
+            case GGML_TYPE_Q6_KR_VK:
             case GGML_TYPE_Q4_1:
             case GGML_TYPE_Q5_0:
             case GGML_TYPE_Q5_1:
@@ -5774,6 +5785,7 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec(ggml_backend_vk_context * 
         case GGML_TYPE_Q8_0R_VK:
         case GGML_TYPE_IQ4_XSR_VK:
         case GGML_TYPE_IQ4_NLR_VK:
+        case GGML_TYPE_Q6_KR_VK:
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q5_0:
         case GGML_TYPE_Q5_1:
@@ -6530,12 +6542,13 @@ static ggml_type ggml_vk_reordered_type(ggml_type t) {
         case GGML_TYPE_Q8_0: return GGML_TYPE_Q8_0R_VK;
         case GGML_TYPE_IQ4_XS: return GGML_TYPE_IQ4_XSR_VK;
         case GGML_TYPE_IQ4_NL: return GGML_TYPE_IQ4_NLR_VK;
+        case GGML_TYPE_Q6_K: return GGML_TYPE_Q6_KR_VK;
         default:             return GGML_TYPE_COUNT;
     }
 }
 
 static bool ggml_vk_is_reordered_a_type(ggml_type t) {
-    return t == GGML_TYPE_Q4_0R_VK || t == GGML_TYPE_Q5_KR_VK || t == GGML_TYPE_Q8_0R_VK || t == GGML_TYPE_IQ4_XSR_VK || t == GGML_TYPE_IQ4_NLR_VK;
+    return t == GGML_TYPE_Q4_0R_VK || t == GGML_TYPE_Q5_KR_VK || t == GGML_TYPE_Q8_0R_VK || t == GGML_TYPE_IQ4_XSR_VK || t == GGML_TYPE_IQ4_NLR_VK || t == GGML_TYPE_Q6_KR_VK;
 }
 
 static bool ggml_vk_q4_0r_is(const ggml_tensor * t) {
@@ -6562,7 +6575,8 @@ static bool ggml_vk_q4_0r_ensure(ggml_backend_vk_context * ctx, vk_context& subc
     const int32_t mode = t->type == GGML_TYPE_Q4_0 ? ctx->device->q4_0_repack :
                          t->type == GGML_TYPE_Q5_K ? ctx->device->q5_k_repack :
                          t->type == GGML_TYPE_IQ4_XS ? ctx->device->iq4_xs_repack :
-                         t->type == GGML_TYPE_IQ4_NL ? ctx->device->iq4_nl_repack : ctx->device->q8_0_repack;
+                         t->type == GGML_TYPE_IQ4_NL ? ctx->device->iq4_nl_repack :
+                         t->type == GGML_TYPE_Q6_K ? ctx->device->q6_k_repack : ctx->device->q8_0_repack;
     if (mode == 0) {
         return false;
     }
@@ -6584,6 +6598,8 @@ static bool ggml_vk_q4_0r_ensure(ggml_backend_vk_context * ctx, vk_context& subc
         case GGML_TYPE_IQ4_XS: nbpr = t->ne[0] / 256; fits = nbpr * 136 <= 4096 * 4 && nbpr % 2 == 0; reorder = ctx->device->pipeline_reorder_iq4_xs; break;
         // IQ4_NL: block_iq4_nl has block_q4_0's layout, so the Q4_0 reorder applies as it is
         case GGML_TYPE_IQ4_NL: nbpr = t->ne[0] / 32; fits = nbpr * 18 <= 4096 * 4; reorder = ctx->device->pipeline_reorder_q4_0; break;
+        // Q6_K: 210-byte superblocks; nb % 4 == 0 keeps rows 8-byte aligned for the matvec's 8-byte loads
+        case GGML_TYPE_Q6_K: nbpr = t->ne[0] / 256; fits = nbpr * 210 <= 4096 * 4 && nbpr % 4 == 0; reorder = ctx->device->pipeline_reorder_q6_k; break;
         default:             nbpr = t->ne[0] / 32;  fits = nbpr * 34  <= 4096 * 4; reorder = ctx->device->pipeline_reorder_q8_0; break;
     }
     if (t->view_src != nullptr || !ggml_is_contiguous(t) || t->ne[0] % 256 != 0 || !fits ||
@@ -13923,6 +13939,28 @@ void ggml_backend_vk_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_
                 for (size_t j = 0; j < nbpr; j++) {
                     memcpy(rp + j * 34,     row.data() + nbpr * 32 + j * 2, 2);
                     memcpy(rp + j * 34 + 2, row.data() + j * 32, 32);
+                }
+            } else if (tensor->type == GGML_TYPE_Q6_K) {
+                // block_q6_K: ql[128], qh[64], scales[16], d; see reorder_q6_k.comp for the layout
+                const size_t nb = tensor->ne[0] / 256;
+                for (size_t b = 0; b < nb; b++) {
+                    uint8_t * blk = rp + b * 210;
+                    memset(blk, 0, 192);
+                    memcpy(blk + 192, row.data() + nb * 192 + b * 16, 16);
+                    memcpy(blk + 208, row.data() + nb * 208 + b * 2, 2);
+                    for (size_t s = 0; s < 8; s++) {
+                        const uint8_t * q = row.data() + (b * 8 + s) * 16;
+                        uint32_t h[2];
+                        memcpy(h, row.data() + nb * 128 + (b * 8 + s) * 8, 8);
+                        const size_t n = s / 4, qtr = s % 4;
+                        for (size_t l = 0; l < 32; l++) {
+                            const uint32_t lo = l < 16 ? (q[l] & 0xF) : (q[l - 16] >> 4);
+                            const size_t v = l & 15;
+                            const uint32_t hb = (h[l / 16] >> (8 * (v & 3) + 2 * (v >> 2))) & 3;
+                            blk[64 * n + l + 32 * (qtr & 1)] |= (uint8_t)(lo << (4 * (qtr >> 1)));
+                            blk[128 + 32 * n + l] |= (uint8_t)(hb << (2 * qtr));
+                        }
+                    }
                 }
             } else if (tensor->type == GGML_TYPE_IQ4_XS) {
                 // block_iq4_xs: d, scales_h, scales_l[4], qs[128]; reordered: nb*128 quant bytes, then nb 8-byte headers

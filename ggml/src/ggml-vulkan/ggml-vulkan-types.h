@@ -391,6 +391,8 @@ static constexpr ggml_type GGML_TYPE_Q8_0R_VK = (ggml_type)31;
 static constexpr ggml_type GGML_TYPE_IQ4_XSR_VK = (ggml_type)32;
 // ... and for row-reordered IQ4_NL weights (unused type slot 33; same layout as Q4_0R)
 static constexpr ggml_type GGML_TYPE_IQ4_NLR_VK = (ggml_type)33;
+// ... and for row-reordered Q6_K weights (unused type slot 36)
+static constexpr ggml_type GGML_TYPE_Q6_KR_VK = (ggml_type)36;
 
 static constexpr uint32_t p021_max_gqa_ratio = 8;
 
@@ -761,6 +763,8 @@ struct vk_device_struct {
     // GGML_VK_IQ4_XS_REPACK: same for IQ4_XS weights
     int32_t iq4_xs_repack;
     int32_t iq4_nl_repack;   // GGML_VK_IQ4_NL_REPACK (uses pipeline_reorder_q4_0)
+    int32_t q6_k_repack;     // GGML_VK_Q6_K_REPACK
+    vk_pipeline pipeline_reorder_q6_k;
     vk_pipeline pipeline_reorder_iq4_xs;
 
     bool subgroup_size_control;

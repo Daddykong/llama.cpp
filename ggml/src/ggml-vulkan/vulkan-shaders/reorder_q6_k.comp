@@ -1,0 +1,90 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+
+// In-place row reorder of Q6_K weights for the row-reordered (Q6_KR) matvec/matmul shaders.
+// One workgroup per row of nb 210-byte superblocks (ql[128], qh[64], scales[16], d). The row becomes four regions:
+//   Q : nb*8 sub-blocks x 16 bytes; byte b of sub-block s holds the 4 low bits of value 32s+b (low nibble) and of
+//       value 32s+16+b (high nibble)
+//   H : nb*8 x 2 words; word 2s holds the 2 high bits of values 32s..32s+15, word 2s+1 those of 32s+16..32s+31, value
+//       4w+b (of that half) at bit 8b+2w
+//   S : nb x 16 int8 scales, as they were
+//   D : nb x fp16 d
+// Lossless (a permutation of bits). Requires nb % 2 == 0 (whole words per row) and nb * 210 <= 4 * REORDER_MAX_WORDS.
+
+#define REORDER_MAX_WORDS 4096
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) buffer A {uint data_a[];};
+
+layout (push_constant) uniform parameter
+{
+    uint nb;
+    uint nrows;
+    uint row0;
+} p;
+
+shared uint sh[REORDER_MAX_WORDS];
+
+uint getb(uint i) {
+    return (sh[i >> 2] >> ((i & 3u) * 8u)) & 0xFFu;
+}
+
+// value v (0..31) of sub-block s of superblock sb: its 4 low bits and its 2 high bits
+uint lo4(uint sb, uint s, uint v) {
+    const uint n = s >> 2u, qtr = s & 3u;
+    return (getb(sb * 210u + 64u * n + v + 32u * (qtr & 1u)) >> (4u * (qtr >> 1u))) & 0xFu;
+}
+uint hi2(uint sb, uint s, uint v) {
+    const uint n = s >> 2u, qtr = s & 3u;
+    return (getb(sb * 210u + 128u + 32u * n + v) >> (2u * qtr)) & 3u;
+}
+
+void main() {
+    const uint row = p.row0 + gl_WorkGroupID.x;
+    if (row >= p.nrows) {
+        return;
+    }
+    const uint tid = gl_LocalInvocationID.x;
+    const uint nw = (p.nb * 210u) / 4u;
+    const uint base = row * nw;
+
+    for (uint i = tid; i < nw; i += 256u) {
+        sh[i] = data_a[base + i];
+    }
+    barrier();
+
+    // Q words: sub-block js = sb*8+s, word w holds bytes 4w..4w+3
+    for (uint i = tid; i < p.nb * 32u; i += 256u) {
+        const uint js = i >> 2u, w = i & 3u;
+        const uint sb = js >> 3u, s = js & 7u;
+        uint word = 0u;
+        [[unroll]] for (uint b = 0u; b < 4u; ++b) {
+            const uint v = 4u * w + b;
+            word |= (lo4(sb, s, v) | (lo4(sb, s, v + 16u) << 4u)) << (8u * b);
+        }
+        data_a[base + i] = word;
+    }
+    // H words
+    for (uint i = tid; i < p.nb * 16u; i += 256u) {
+        const uint js = i >> 1u, half_ = i & 1u;
+        const uint sb = js >> 3u, s = js & 7u;
+        uint word = 0u;
+        [[unroll]] for (uint v = 0u; v < 16u; ++v) {
+            word |= hi2(sb, s, v + 16u * half_) << (8u * (v & 3u) + 2u * (v >> 2u));
+        }
+        data_a[base + p.nb * 32u + i] = word;
+    }
+    // S words
+    for (uint i = tid; i < p.nb * 4u; i += 256u) {
+        const uint sb = i >> 2u, k = i & 3u;
+        const uint o = sb * 210u + 192u + 4u * k;
+        data_a[base + p.nb * 48u + i] = getb(o) | (getb(o + 1u) << 8u) | (getb(o + 2u) << 16u) | (getb(o + 3u) << 24u);
+    }
+    // D words: two fp16 per word
+    for (uint i = tid; i < p.nb / 2u; i += 256u) {
+        const uint o0 = (2u * i) * 210u + 208u, o1 = (2u * i + 1u) * 210u + 208u;
+        data_a[base + p.nb * 52u + i] = getb(o0) | (getb(o0 + 1u) << 8u) | (getb(o1) << 16u) | (getb(o1 + 1u) << 24u);
+    }
+}

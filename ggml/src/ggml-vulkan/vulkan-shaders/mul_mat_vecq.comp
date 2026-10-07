@@ -12,7 +12,7 @@
 
 layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 
-#if (defined(DATA_A_Q4_0R) && defined(Q4_0R_K32)) || defined(DATA_A_Q5_KR) || defined(DATA_A_Q8_0R) || defined(DATA_A_IQ4_XSR) || defined(DATA_A_IQ4_NLR)
+#if (defined(DATA_A_Q4_0R) && defined(Q4_0R_K32)) || defined(DATA_A_Q5_KR) || defined(DATA_A_Q8_0R) || defined(DATA_A_IQ4_XSR) || defined(DATA_A_IQ4_NLR) || defined(DATA_A_Q6_KR)
 #define K_PER_ITER 32
 #elif defined(DATA_A_Q4_0R)
 #define K_PER_ITER 16
@@ -123,6 +123,36 @@ void iter(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const
             const uint ls = ((h1 >> (4 * is)) & 0xF) | (((h0 >> (16 + 2 * is)) & 3) << 4);
             const float dl = unpackHalf2x16(h0).x * float(int(ls) - 32);
             temp[j][n] += FLOAT_TYPE(dl * (float(q_sum) * cache_b_ds.x));
+        }
+#elif defined(DATA_A_Q6_KR)
+        // one 32-value sub-block per thread: 16 quant bytes and 8 bytes of high bits (8-byte loads), two int8 scales
+        const uint nb = p.ncols / QUANT_K;
+        const uint js = col / 32;
+        const uint jb = js / 8;
+        const uint s = js % 8;
+        // rows are nb*210 bytes and nb % 4 == 0, so rsb*105/4 (8-byte units) and rsb*105/2 (words) are exact
+        uint rsb = first_row * nb + a_offset / (QUANT_K / QUANT_K_Q8_1);
+        [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+            const uint r64 = (rsb * 105) / 4;
+            const uvec2 q01 = data_a_r64[r64 + js * 2];
+            const uvec2 q23 = data_a_r64[r64 + js * 2 + 1];
+            const uvec2 h   = data_a_r64[r64 + nb * 16 + js];
+            const uint  scw = data_a_r32[(rsb * 105) / 2 + nb * 48 + jb * 4 + s / 2] >> (16 * (s & 1));
+            const float d   = float(data_a_r16[rsb * 105 + nb * 104 + jb]);
+            rsb += nb;
+            const uvec4 q = uvec4(q01, q23);
+
+            int32_t sum_lo = 0, sum_hi = 0;
+            [[unroll]] for (uint w = 0; w < 4; ++w) {
+                // 6-bit values 0..63 per byte; minus 32 per byte without borrows between bytes
+                const uint lo = ( q[w]       & 0x0F0F0F0Fu) | (((h.x >> (2 * w)) & 0x03030303u) << 4);
+                const uint hi = ((q[w] >> 4) & 0x0F0F0F0Fu) | (((h.y >> (2 * w)) & 0x03030303u) << 4);
+                sum_lo += dotPacked4x8EXT(int32_t(((lo | 0x80808080u) - 0x20202020u) ^ 0x80808080u), cache_b_qs[w]);
+                sum_hi += dotPacked4x8EXT(int32_t(((hi | 0x80808080u) - 0x20202020u) ^ 0x80808080u), cache_b_qs[w + 4]);
+            }
+            const float sc0 = float(int(bitfieldExtract(int(scw), 0, 8)));
+            const float sc1 = float(int(bitfieldExtract(int(scw), 8, 8)));
+            temp[j][n] += FLOAT_TYPE(d * cache_b_ds.x * (sc0 * float(sum_lo) + sc1 * float(sum_hi)));
         }
 #elif defined(DATA_A_IQ4_NLR)
         // one 32-value block per thread (Q4_0R layout): one 16-byte load, the fp16 scale, the register table

@@ -710,6 +710,31 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
 
         store_a(col, k_pair, FLOAT_TYPEV2(v.xy));
         store_a(col, k_pair + 1, FLOAT_TYPEV2(v.zw));
+    } else if (MmTypeA == GGML_TYPE_Q6_KR) {
+        // row-reordered Q6_K (reorder_q6_k.comp): per row Q nb*8 x 16 bytes, H nb*8 x 8 bytes, S nb x 16, D nb x 2
+        const uint idx = pos_a + col * p.stride_a / mm_load_vec_a() + row;
+        const uint k_pair = row * mm_load_vec_a() / 2;
+
+        const uint ib = idx / 64;                  // 4 values per idx
+        const uint j = idx % 64;                   // values 4j..4j+3 of the superblock
+        const uint nb = p.stride_a / 256;
+        const uint jb = (block + row * mm_load_vec_a()) / 256;
+        const uint rsb = ib - jb;                  // first superblock of the row (a multiple of 4)
+        const uint rw = (rsb * 105) / 2;           // first word of the row
+        const uint is = j / 8;                     // sub-block 0..7
+        const uint hsel = (j / 4) & 1;             // values 16..31 of the sub-block: high nibbles, H word y
+        const uint w = j & 3;                      // quant word within the sub-block
+        const uint g = 2 * is + hsel;              // scale group (16 values)
+
+        const float d = float(a_q4_0r_f16.data[rsb * 105 + nb * 104 + jb]);
+        const float sc = float(int(bitfieldExtract(int(a_q4_0r_u32.data[rw + nb * 48 + jb * 4 + g / 4]), int(8 * (g % 4)), 8)));
+
+        const uint qs = (a_q4_0r_u32.data[rw + (jb * 8 + is) * 4 + w] >> (4 * hsel)) & 0x0F0F0F0F;
+        const uint qh = ((a_q4_0r_u32.data[rw + nb * 32 + (jb * 8 + is) * 2 + hsel] >> (2 * w)) & 0x03030303) << 4;
+        const vec4 v = (vec4(unpack8(qs | qh)) - 32.0f) * (d * sc);
+
+        store_a(col, k_pair, FLOAT_TYPEV2(v.xy));
+        store_a(col, k_pair + 1, FLOAT_TYPEV2(v.zw));
     } else if (MmTypeA == GGML_TYPE_Q6_K) {
         const uint idx = pos_a + col * p.stride_a / mm_load_vec_a() + row;
         const uint k_pair = row * mm_load_vec_a() / 2;

@@ -69,6 +69,7 @@ uint mm_load_vec_a() {
     case GGML_TYPE_Q5_K:
     case GGML_TYPE_Q5_KR:
     case GGML_TYPE_IQ4_XSR:
+    case GGML_TYPE_Q6_KR:
         return 4u;
     default:
         return 2u;
