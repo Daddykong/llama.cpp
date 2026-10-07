@@ -156,6 +156,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(test-unicode.cpp)
     llama_build(test-b65-sparse.cpp)   # b65 sparse Vulkan buffers
     llama_build(test-b65-slice.cpp)    # b65 attention-KV range save/drop/restore
+    llama_build(test-b65-batchinv.cpp) # b65 batch invariance of decode kernels (1 vs 2-4 tokens)
     llama_build_and_test(test-sampling.cpp)
     llama_build_and_test(test-reasoning-budget.cpp)
     llama_build_and_test(test-grammar-parser.cpp)

@@ -3079,7 +3079,9 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 // makes those up to 1.7x slower.
                 const bool xe2_sg32 = device->vendor_id == VK_VENDOR_ID_INTEL && device->architecture == INTEL_XE2 &&
                                       device->subgroup_size_control && device->subgroup_min_size <= 32 && device->subgroup_max_size >= 32;
-                const uint32_t subgroup_size_leg = (xe2_sg32 && i == 0) ? 32u : subgroup_size_int;
+                // b65: GGML_VK_BATCH_INVARIANT=1 keeps one subgroup size for every column count
+                static const bool batch_inv = getenv("GGML_VK_BATCH_INVARIANT") != nullptr && atoi(getenv("GGML_VK_BATCH_INVARIANT")) != 0;
+                const uint32_t subgroup_size_leg = (xe2_sg32 && i == 0 && !batch_inv) ? 32u : subgroup_size_int;
                 const uint32_t wg_size_subgroup_leg = (w == DMMV_WG_SIZE_SUBGROUP) ? subgroup_size_leg : (subgroup_size_leg * 4);
 
                 ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q2_0][i], "mul_mat_vec_q2_0_q8_1_f32", arr_dmmv_q2_0_q8_1_f32_len[reduc], arr_dmmv_q2_0_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_int_n(2*rm_kq_int, i), 1, 1}, {wg_size_subgroup_int, rm_int_n(2*rm_kq_int, i), i+1}, 1, true, use_subgroups, subgroup_size_int);
@@ -3393,17 +3395,21 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             const std::string sfx = "_" + std::to_string(g + 1) + "_" + std::to_string(t + 1);
             ggml_vk_create_pipeline2(device, device->pipeline_mul_mat_vec_gqa_rows_f16_f32[g][t],  "mul_mat_vec_gqa_rows_f16_f32" + sfx,  mul_mat_vec_gqa_rows_f16_f32_len,  mul_mat_vec_gqa_rows_f16_f32_data,  "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_gqa_push_constants), {1, 1, 1}, {g + 1, t + 1}, 1);
             // rows of A per workgroup for the long-k kernel: B loads are reused across them (env override for tuning)
-            uint32_t nrows = (t == 0) ? 8 : 4;
+            // b65: GGML_VK_BATCH_INVARIANT=1 uses the 4-token row counts for every token count, so each row's k sum is
+            // cut into the same slices whether 1 or 4 tokens are verified
+            static const bool batch_inv_gqa = getenv("GGML_VK_BATCH_INVARIANT") != nullptr && atoi(getenv("GGML_VK_BATCH_INVARIANT")) != 0;
+            const uint32_t tt = batch_inv_gqa ? 3u : t;
+            uint32_t nrows = (tt == 0) ? 8 : 4;
             if (const char * e = getenv("GGML_VK_MUL_MAT_VEC_GQA_ROWS")) {
                 nrows = (uint32_t)atoi(e);
             }
-            while (nrows > 1 && nrows * (g + 1) * (t + 1) > 128) {
+            while (nrows > 1 && nrows * (g + 1) * (tt + 1) > 128) {
                 nrows /= 2;
             }
             ggml_vk_create_pipeline2(device, device->pipeline_mul_mat_vec_gqa_split_f16_f32[g][t], "mul_mat_vec_gqa_split_f16_f32" + sfx, mul_mat_vec_gqa_split_f16_f32_len, mul_mat_vec_gqa_split_f16_f32_data, "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_gqa_push_constants), {1, 1, 1}, {g + 1, t + 1, nrows}, 1);
             device->mul_mat_vec_gqa_split_rows[g][t] = nrows;
             {   // b65 split2: rows per subgroup, accumulators per lane kept <= 64 so the shader stays SIMD32
-                uint32_t r2 = std::max(1u, std::min(4u, 64u / ((g + 1) * (t + 1))));
+                uint32_t r2 = std::max(1u, std::min(4u, 64u / ((g + 1) * (tt + 1))));
                 if (const char * e = getenv("GGML_VK_GQA_SPLIT2_ROWS")) r2 = (uint32_t)atoi(e);
                 ggml_vk_create_pipeline2(device, device->pipeline_mul_mat_vec_gqa_split2_f16_f32[g][t], "mul_mat_vec_gqa_split2_f16_f32" + sfx, mul_mat_vec_gqa_split2_f16_f32_len, mul_mat_vec_gqa_split2_f16_f32_data, "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_gqa_push_constants), {1, 1, 1}, {g + 1, t + 1, r2}, 1, false, true, 32);
                 device->mul_mat_vec_gqa_split2_rows[g][t] = r2 * 8;
@@ -5859,7 +5865,9 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec(ggml_backend_vk_context * 
         // Xe2: long rows (k >= 16384, e.g. ffn_down) are faster with 4 subgroups per row
         // b65: GGML_VK_Q4_0R_LONG_NCOLS=N extends this to steps of up to N tokens (MTP verify = 3); default 1 = unchanged
         static const uint32_t q40r_long_ncols = getenv("GGML_VK_Q4_0R_LONG_NCOLS") ? (uint32_t)atoi(getenv("GGML_VK_Q4_0R_LONG_NCOLS")) : 1u;
-        if (a_type == GGML_TYPE_Q4_0R_VK && num_cols <= q40r_long_ncols && k >= 16384 && ctx->device->architecture == INTEL_XE2) {
+        // b65: GGML_VK_BATCH_INVARIANT=1 uses the single-token workgroup for every column count
+        static const bool batch_inv_wg = getenv("GGML_VK_BATCH_INVARIANT") != nullptr && atoi(getenv("GGML_VK_BATCH_INVARIANT")) != 0;
+        if (a_type == GGML_TYPE_Q4_0R_VK && (num_cols <= q40r_long_ncols || batch_inv_wg) && k >= 16384 && ctx->device->architecture == INTEL_XE2) {
             dmmv_wg = DMMV_WG_SIZE_LARGE;
         }
         if (a_type == GGML_TYPE_Q4_0R_VK && getenv("GGML_VK_Q4_0R_WG_LARGE")) {
@@ -7087,7 +7095,10 @@ static bool ggml_vk_should_use_mmvq(const vk_device& device, uint32_t m, uint32_
     }
 
     // MMVQ is generally good for batches
-    if (n > 1) {
+    // b65: GGML_VK_BATCH_INVARIANT=1 decides as for one token, so 1 and 2-8 token steps take the same path (MMVQ
+    // quantizes the activations to q8_1, the float path does not)
+    static const bool batch_inv = getenv("GGML_VK_BATCH_INVARIANT") != nullptr && atoi(getenv("GGML_VK_BATCH_INVARIANT")) != 0;
+    if (n > 1 && !batch_inv) {
         return true;
     }
 
