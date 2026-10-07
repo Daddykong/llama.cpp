@@ -1,4 +1,6 @@
 #include "server-context.h"
+#include <set>
+#include <cstdio>
 #include "server-chat.h"
 #include "server-common.h"
 #include "server-decision.h"
@@ -228,8 +230,31 @@ struct server_batch {
     }
 };
 
+// b65: words of 5+ letters, lower-cased (turn swap relevance)
+static std::set<std::string> b65_words(const std::string & text) {
+    std::set<std::string> out;
+    std::string w;
+    for (char c : text + " ") {
+        if (isalnum((unsigned char) c)) {
+            w += (char) tolower((unsigned char) c);
+        } else {
+            if (w.size() >= 5) out.insert(w);
+            w.clear();
+        }
+    }
+    return out;
+}
+
+struct b65_swap_range {
+    llama_pos p0, p1;
+    std::string path;
+    llama_tokens toks;
+    std::set<std::string> words;
+};
+
 struct server_slot {
     int id;
+    std::vector<b65_swap_range> b65_swaps;   // b65: old turns swapped out to disk
 
     llama_context * ctx_tgt = nullptr;
     llama_context * ctx_dft = nullptr;
@@ -576,6 +601,44 @@ struct server_slot {
             static const bool park_on_idle = getenv("LLAMA_PARK_ON_IDLE") != nullptr && atoi(getenv("LLAMA_PARK_ON_IDLE")) != 0;
             if (park_on_idle && ctx_tgt && !task->is_child()) {
                 b65_parked = llama_b65_park_seq(ctx_tgt, id, true);
+            }
+
+            // b65: swap the older middle of a long conversation out to disk
+            static const int swap_keep = getenv("LLAMA_SWAP_KEEP") ? atoi(getenv("LLAMA_SWAP_KEEP")) : 0;
+            if (swap_keep > 0 && ctx_tgt && !task->is_child() && mctx == nullptr) {
+                static const int swap_head = getenv("LLAMA_SWAP_HEAD") ? atoi(getenv("LLAMA_SWAP_HEAD")) : 1024;
+                static const std::string swap_dir = getenv("LLAMA_SWAP_DIR") ? getenv("LLAMA_SWAP_DIR") : "/mnt/1TB/llm/swap";
+                const llama_tokens toks = prompt.tokens.get_text_tokens();
+                const llama_pos p0 = b65_swaps.empty() ? swap_head : std::max<llama_pos>(swap_head, b65_swaps.back().p1);
+                const llama_pos p1 = (llama_pos) toks.size() - swap_keep;
+                if (p1 - p0 >= 2048) {
+                    const std::string path = swap_dir + "/slot" + std::to_string(id) + "-" + std::to_string(p0) + "-" + std::to_string(p1) + ".kv";
+                    const int64_t t0 = ggml_time_us();
+                    const size_t bytes = llama_b65_seq_range_save(ctx_tgt, id, p0, p1, path.c_str());
+                    // b65: drop the range except the first turn_head tokens of every turn (from each <|im_start|>)
+                    static const int turn_head = getenv("LLAMA_SWAP_TURN_HEAD") ? atoi(getenv("LLAMA_SWAP_TURN_HEAD")) : 64;
+                    static llama_token tok_turn = LLAMA_TOKEN_NULL;
+                    if (tok_turn == LLAMA_TOKEN_NULL) {
+                        const llama_tokens tt = common_tokenize(ctx_tgt, "<|im_start|>", false, true);
+                        if (tt.size() == 1) tok_turn = tt[0];
+                    }
+                    bool dropped = bytes > 0;
+                    if (dropped) {
+                        llama_pos q = p0;
+                        for (llama_pos i = p0; i <= p1 && dropped; ++i) {
+                            const bool head_start = i < p1 && turn_head > 0 && tok_turn != LLAMA_TOKEN_NULL && toks[i] == tok_turn;
+                            if (head_start || i == p1) {
+                                if (i > q) dropped = llama_b65_seq_range_drop(ctx_tgt, id, q, i);
+                                if (head_start) { q = std::min<llama_pos>(p1, i + turn_head); i = q - 1; }
+                            }
+                        }
+                    }
+                    if (dropped) {
+                        llama_tokens part(toks.begin() + p0, toks.begin() + p1);
+                        b65_swaps.push_back({ p0, p1, path, part, b65_words(common_detokenize(ctx_tgt, part, false)) });
+                        SLT_INF(*this, "b65 swap: positions %d..%d (%.0f MB) out to %s in %.0f ms\n", p0, p1, bytes / 1e6, path.c_str(), (ggml_time_us() - t0) / 1e3);
+                    }
+                }
             }
 
             // do not keep context of the child slots - the parent's context is enough
@@ -1782,6 +1845,32 @@ private:
         if (slot.b65_parked && slot.ctx_tgt) {   // b65: bring the conversation's KV back first
             llama_b65_park_seq(slot.ctx_tgt, slot.id, false);
             slot.b65_parked = false;
+        }
+        if (!slot.b65_swaps.empty() && slot.ctx_tgt) {   // b65: swap relevant old turns back in
+            static const int min_hits = getenv("LLAMA_SWAP_MIN_HITS") ? atoi(getenv("LLAMA_SWAP_MIN_HITS")) : 3;
+            const llama_tokens nt = task.tokens.get_text_tokens();
+            const size_t from = nt.size() > 512 ? nt.size() - 512 : 0;
+            const std::set<std::string> qw = b65_words(common_detokenize(slot.ctx_tgt, llama_tokens(nt.begin() + from, nt.end()), false));
+            for (auto it = slot.b65_swaps.begin(); it != slot.b65_swaps.end(); ) {
+                const bool same = (size_t) it->p1 <= nt.size() && std::equal(it->toks.begin(), it->toks.end(), nt.begin() + it->p0);
+                if (!same) {   // the history changed: the saved turns are no longer part of this conversation
+                    std::remove(it->path.c_str());
+                    it = slot.b65_swaps.erase(it);
+                    continue;
+                }
+                int hits = 0;
+                for (const auto & w : qw) hits += it->words.count(w) ? 1 : 0;
+                if (hits >= min_hits) {
+                    const int64_t t0 = ggml_time_us();
+                    llama_b65_seq_range_drop(slot.ctx_tgt, slot.id, it->p0, it->p1);   // kept turn heads, before the full range returns
+                    const bool ok = llama_b65_seq_range_load(slot.ctx_tgt, slot.id, it->path.c_str());
+                    SLT_INF(slot, "b65 swap: positions %d..%d back in (%d shared words) %s in %.0f ms\n", it->p0, it->p1, hits, ok ? "ok" : "FAILED", (ggml_time_us() - t0) / 1e3);
+                    std::remove(it->path.c_str());
+                    it = slot.b65_swaps.erase(it);
+                } else {
+                    ++it;
+                }
+            }
         }
         // process per-request lora adapters
         if (!task.params.lora.empty()) {
