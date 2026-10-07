@@ -13,7 +13,7 @@ layout(binding = 1) readonly buffer M { uint data_m[]; };   // f16 or f32 mask (
 layout(binding = 2) writeonly buffer S { vec2 data_s[]; };
 shared float sh_m[256];
 shared float sh_s[256];
-const float NEG_INF = uintBitsToFloat(0xff800000u);
+#define NEG_INF uintBitsToFloat(0xff800000u)   // a macro: older glslc rejects non-constant global initializers
 
 void combine(inout float m, inout float s, const float m2, const float s2) {
     const float mm = max(m, m2);

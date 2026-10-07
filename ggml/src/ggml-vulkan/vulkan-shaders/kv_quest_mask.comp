@@ -23,7 +23,7 @@ shared float s_bound[NB_MAX];
 shared uint s_sel[NB_MAX / 32];
 shared int s_red[WG / 8];
 shared uint s_cnt;
-const float NEG_INF = uintBitsToFloat(0xFF800000u);
+#define NEG_INF uintBitsToFloat(0xFF800000u)   // a macro: older glslc rejects non-constant global initializers
 
 int wg_max_i(int v) {
     v = subgroupMax(v);
