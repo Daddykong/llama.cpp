@@ -1,0 +1,26 @@
+#version 450
+
+// b65 [mtp]: sums the per-chunk partials of mul_mat_vec_gqa_splitk into dst, chunks in order (deterministic)
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer P {float data_p[];};
+layout (binding = 1) writeonly buffer D {float data_d[];};
+
+layout (push_constant) uniform parameter {
+    uint ne;
+    uint nchunks;
+    uint d_offset;
+} p;
+
+void main() {
+    const uint idx = gl_GlobalInvocationID.x;
+    if (idx >= p.ne) {
+        return;
+    }
+    float s = 0.0;
+    for (uint c = 0; c < p.nchunks; ++c) {
+        s += data_p[c * p.ne + idx];
+    }
+    data_d[p.d_offset + idx] = s;
+}

@@ -856,6 +856,8 @@ struct vk_device_struct {
     // f16 x f32 matvecs for decode attention: [GQA - 1][tokens - 1]
     vk_pipeline pipeline_mul_mat_vec_gqa_rows_f16_f32[8][4];
     vk_pipeline pipeline_mul_mat_vec_gqa_split_f16_f32[8][4];
+    vk_pipeline pipeline_mul_mat_vec_gqa_splitk_f16_f32[8][4];   // b65 [mtp]
+    vk_pipeline pipeline_mul_mat_vec_gqa_splitk_reduce;
     vk_pipeline pipeline_mul_mat_vec_gqa_split2_f16_f32[8][4]; // b65
     vk_pipeline pipeline_mul_mat_vec_gqa_rows2_f16_f32[8][4]; // b65
     vk_pipeline pipeline_mul_mat_vec_gqa_rows2_q8_0_f32[8][4]; // b65 q8_0 K cache

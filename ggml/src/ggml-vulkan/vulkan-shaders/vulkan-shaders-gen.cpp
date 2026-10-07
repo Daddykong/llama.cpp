@@ -899,6 +899,8 @@ void process_shaders() {
     string_to_spv("mul_mat_vec_gqa_rows2_q8_0_f32", "mul_mat_vec_gqa_rows2.comp", {{"DATA_A_Q8_0", "1"}, {"FLOAT_TYPE", "float"}, {"B_TYPE", "float"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}});   // b65
     string_to_spv("mul_mat_vec_gqa_split2_f16_f32", "mul_mat_vec_gqa_split2.comp", {{"A_TYPE", "float16_t"}, {"A_TYPEV4", "f16vec4"}, {"B_TYPE", "float"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}});
     string_to_spv("mul_mat_vec_gqa_split_f16_f32", "mul_mat_vec_gqa_split.comp", {{"A_TYPE", "float16_t"}, {"A_TYPEV4", "f16vec4"}, {"B_TYPE", "float"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}});
+    string_to_spv("mul_mat_vec_gqa_splitk_f16_f32", "mul_mat_vec_gqa_splitk.comp", {{"A_TYPE", "float16_t"}, {"A_TYPEV4", "f16vec4"}, {"B_TYPE", "float"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}});   // b65 [mtp]
+    string_to_spv("mul_mat_vec_gqa_splitk_reduce", "mul_mat_vec_gqa_splitk_reduce.comp", {});   // b65 [mtp]
 
     // Norms
     string_to_spv("norm_f32", "norm.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));

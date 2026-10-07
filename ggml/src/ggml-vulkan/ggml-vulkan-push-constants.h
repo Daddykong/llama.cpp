@@ -64,6 +64,23 @@ struct vk_mat_vec_gqa_push_constants {
     uint32_t flags;             // 1 = rows: skip fully masked rows, 2 = split: skip zero-probability positions
 };
 
+// b65 [mtp]: split-k V x softmax(KQ) (mul_mat_vec_gqa_splitk.comp)
+struct vk_mat_vec_gqa_splitk_push_constants {
+    uint32_t ncols;
+    uint32_t nrows;
+    uint32_t a_row_stride;
+    uint32_t a_chan_stride;
+    uint32_t b_chan_stride;
+    uint32_t b_tok_stride;
+    uint32_t d_chan_stride;
+    uint32_t d_tok_stride;
+    uint32_t a_offset;
+    uint32_t b_offset;
+    uint32_t d_offset;
+    uint32_t chunk;
+    uint32_t ne;
+};
+
 struct vk_mat_vec_nc_push_constants {
     uint32_t ncols_x;
     uint32_t nrows_x;

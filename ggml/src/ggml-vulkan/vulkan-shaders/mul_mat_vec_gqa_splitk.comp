@@ -1,0 +1,110 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+
+// b65 [mtp]: split-k ("flash-decoding") form of mul_mat_vec_gqa_split for V x softmax(KQ) in decode attention:
+//   part[chunk][ (h*GQA + c)*d_chan + t*d_tok + i ] = sum_{k in chunk} A[k, i, h] * B[k, t, h*GQA + c]
+// Workgroup (chunk, h, row block of 64 rows): the B slice of the chunk (all GQA*NTOK columns) is staged in shared
+// memory 256 positions at a time and shared by all 64 rows; each subgroup owns R consecutive rows and walks k with
+// its lanes (coalesced A loads), keeping R*GQA*NTOK partial sums per lane. So B is read 4x per channel (once per
+// row block) instead of once per 4 rows, and A once. The chunk partials are summed in order by
+// mul_mat_vec_gqa_splitk_reduce (deterministic; same chunking for 1-4 tokens). R = 64 / number of subgroups.
+
+#define BLOCK_SIZE 256
+#define SUB 256
+#define ROWS_PER_WG 64
+
+layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+#include "mul_mat_vec_iface.glsl"
+
+layout(constant_id = 0) const uint GQA = 1;    // B channels per A channel, 1..8
+layout(constant_id = 1) const uint NTOK = 1;   // columns of B, 1..4
+layout(constant_id = 2) const uint R = 4;      // rows per subgroup = ROWS_PER_WG * subgroup size / BLOCK_SIZE
+
+layout (push_constant) uniform parameter
+{
+    uint ncols;          // k (KV positions), multiple of 4
+    uint nrows;          // rows of A per channel (head dim)
+    uint a_row_stride;   // in elements, multiples of 4
+    uint a_chan_stride;
+    uint b_chan_stride;
+    uint b_tok_stride;
+    uint d_chan_stride;
+    uint d_tok_stride;
+    uint a_offset;
+    uint b_offset;
+    uint d_offset;       // unused: partials start at 0
+    uint chunk;          // k per workgroup, multiple of SUB
+    uint ne;             // elements of dst (stride between chunk partials)
+} p;
+
+shared vec4 sb[GQA * NTOK][SUB / 4];
+
+void main() {
+    const uint tid  = gl_LocalInvocationID.x;
+    const uint lane = gl_SubgroupInvocationID;
+    const uint S    = gl_SubgroupSize;
+    const uint ch   = gl_WorkGroupID.x;
+    const uint h    = gl_WorkGroupID.y;
+    const uint row0 = gl_WorkGroupID.z * ROWS_PER_WG + gl_SubgroupID * R;
+    const uint k0   = ch * p.chunk;
+    const uint k1   = min(k0 + p.chunk, p.ncols);
+
+    float acc[R * GQA * NTOK];
+    [[unroll]] for (uint i = 0; i < R * GQA * NTOK; ++i) {
+        acc[i] = 0.0;
+    }
+
+    uint a_base[R];
+    [[unroll]] for (uint r = 0; r < R; ++r) {
+        a_base[r] = (p.a_offset + h * p.a_chan_stride + min(row0 + r, p.nrows - 1) * p.a_row_stride) / 4;
+    }
+    const uint b_base = (p.b_offset + h * GQA * p.b_chan_stride) / 4;
+    const uint b_cs   = p.b_chan_stride / 4;
+    const uint b_ts   = p.b_tok_stride / 4;
+
+    for (uint s0 = k0; s0 < k1; s0 += SUB) {
+        const uint n4 = (min(s0 + SUB, k1) - s0) / 4;
+        barrier();
+        for (uint e = tid; e < GQA * NTOK * (SUB / 4); e += BLOCK_SIZE) {
+            const uint col = e / (SUB / 4);
+            const uint j   = e % (SUB / 4);
+            const uint t   = col / GQA;
+            const uint c   = col % GQA;
+            sb[col][j] = j < n4 ? data_b_v4[b_base + c * b_cs + t * b_ts + s0 / 4 + j] : vec4(0.0);
+        }
+        barrier();
+        const uint as = s0 / 4;
+        for (uint j = lane; j < n4; j += S) {
+            vec4 av[R];
+            [[unroll]] for (uint r = 0; r < R; ++r) {
+                av[r] = vec4(data_a_v4[a_base[r] + as + j]);
+            }
+            [[unroll]] for (uint i = 0; i < GQA * NTOK; ++i) {
+                const vec4 bv = sb[i][j];
+                [[unroll]] for (uint r = 0; r < R; ++r) {
+                    acc[r * GQA * NTOK + i] += dot(av[r], bv);
+                }
+            }
+        }
+    }
+
+    [[unroll]] for (uint i = 0; i < R * GQA * NTOK; ++i) {
+        acc[i] = subgroupAdd(acc[i]);
+    }
+    if (lane == 0) {
+        [[unroll]] for (uint r = 0; r < R; ++r) {
+            if (row0 + r < p.nrows) {
+                [[unroll]] for (uint i = 0; i < GQA * NTOK; ++i) {
+                    const uint t = i / GQA;
+                    const uint c = i % GQA;
+                    data_d[ch * p.ne + (h * GQA + c) * p.d_chan_stride + t * p.d_tok_stride + row0 + r] = acc[r * GQA * NTOK + i];
+                }
+            }
+        }
+    }
+}
