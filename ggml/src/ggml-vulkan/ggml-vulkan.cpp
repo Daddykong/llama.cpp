@@ -15926,6 +15926,58 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
             first_unused++;
         }
     }
+    // b65: optional dependency-level reorder (GGML_VK_GRAPH_LEVELS=1), fusion-preserving
+    static const bool graph_levels = getenv("GGML_VK_GRAPH_LEVELS") != nullptr && atoi(getenv("GGML_VK_GRAPH_LEVELS")) != 0;
+    if (graph_levels && (int) new_order.size() == graph->n_nodes) {
+        const int n = graph->n_nodes;
+        auto const &base = [](const ggml_tensor * t) { return t->view_src ? t->view_src : t; };
+        std::vector<int> grp(n);
+        std::vector<std::vector<int>> members;
+        for (int i = 0; i < n; ++i) {
+            ggml_tensor * node = new_order[i];
+            bool glue = false;
+            if (i > 0) {
+                const ggml_tensor * prev = new_order[i - 1];
+                for (int s = 0; s < GGML_MAX_SRC && !glue; ++s) {
+                    if (node->src[s] && (node->src[s] == prev || base(node->src[s]) == base(prev))) glue = true;
+                }
+                if (base(node) == base(prev) || is_empty(node) || is_empty(prev)) glue = true;
+            }
+            if (glue) { grp[i] = grp[i - 1]; members[grp[i]].push_back(i); }
+            else      { grp[i] = (int) members.size(); members.push_back({ i }); }
+        }
+        const int ng = (int) members.size();
+        std::vector<std::vector<int>> deps(ng);
+        std::unordered_map<const ggml_tensor *, int> last_writer;
+        std::unordered_map<const ggml_tensor *, std::vector<int>> touched;
+        for (int i = 0; i < n; ++i) {
+            ggml_tensor * node = new_order[i];
+            const int g = grp[i];
+            for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                if (!node->src[s]) continue;
+                const ggml_tensor * b = base(node->src[s]);
+                auto w = last_writer.find(b);
+                if (w != last_writer.end() && w->second != g) deps[g].push_back(w->second);
+                touched[b].push_back(g);
+            }
+            const ggml_tensor * b = base(node);
+            auto w = last_writer.find(b);
+            if (w != last_writer.end() && w->second != g) deps[g].push_back(w->second);
+            for (int h : touched[b]) if (h != g) deps[g].push_back(h);
+            last_writer[b] = g;
+            touched[b].assign(1, g);
+        }
+        std::vector<int> level(ng, 0);
+        for (int g = 0; g < ng; ++g) for (int h : deps[g]) level[g] = std::max(level[g], level[h] + 1);
+        std::vector<int> gorder(ng);
+        for (int g = 0; g < ng; ++g) gorder[g] = g;
+        std::stable_sort(gorder.begin(), gorder.end(), [&](int a, int b) { return level[a] < level[b]; });
+        int k = 0;
+        for (int g : gorder) for (int i : members[g]) graph->nodes[k++] = new_order[i];
+        GGML_ASSERT(k == n);
+        return;
+    }
+
     // Replace the graph with the new order.
     for (int i = 0; i < graph->n_nodes; ++i) {
         graph->nodes[i] = new_order[i];
