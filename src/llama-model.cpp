@@ -1576,23 +1576,28 @@ static void b65_place_commit(ggml_context * ctx, ggml_backend_buffer_t buf) {
     }
     b65_place & pl = b65_place_get();
     if (const char * b = getenv("LLAMA_VRAM_BUDGET_MB")) pl.budget_mb = atof(b);
-    char * base = (char *) ggml_backend_buffer_get_base(buf);
-    std::vector<size_t> bo, bs;
-    std::map<int, std::pair<std::vector<size_t>, std::vector<size_t>>> lay;
+    // tensors grouped by the Vulkan buffer they live in: a large model is several buffers (maxBufferSize) behind a
+    // multi-buffer wrapper, and each must be committed itself; offsets are relative to that buffer's base
+    struct grp { std::vector<size_t> off, sz; };
+    std::map<ggml_backend_buffer_t, grp> fixed_g;
+    std::map<int, std::map<ggml_backend_buffer_t, grp>> lay;
     for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
-        const size_t off = (size_t) ((char *) t->data - base), sz = ggml_nbytes(t);
+        ggml_backend_buffer_t tb = t->buffer ? t->buffer : buf;
+        const size_t off = (size_t) ((char *) t->data - (char *) ggml_backend_buffer_get_base(tb)), sz = ggml_nbytes(t);
         int il = -1;
         if (strncmp(t->name, "blk.", 4) == 0 && strstr(t->name, ".ffn_")) il = atoi(t->name + 4);
-        if (il >= 0) { lay[il].first.push_back(off); lay[il].second.push_back(sz); }
-        else { bo.push_back(off); bs.push_back(sz); }
+        grp & g = il >= 0 ? lay[il][tb] : fixed_g[tb];
+        g.off.push_back(off); g.sz.push_back(sz);
     }
     size_t fixed = 0;
-    for (size_t z : bs) fixed += z;
-    if (!bo.empty()) {
-        int h = commit(buf, bo.data(), bs.data(), (int) bo.size(), 0);
-        if (h < 0) h = commit(buf, bo.data(), bs.data(), (int) bo.size(), 1);
-        else pl.vram_fixed += fixed;
+    for (auto & [tb, g] : fixed_g) {
+        size_t bytes = 0;
+        for (size_t z : g.sz) bytes += z;
+        int h = commit(tb, g.off.data(), g.sz.data(), (int) g.off.size(), 0);
+        if (h < 0) h = commit(tb, g.off.data(), g.sz.data(), (int) g.off.size(), 1);
+        else pl.vram_fixed += bytes;
         if (h < 0) throw std::runtime_error("b65: could not commit the non-FFN weights");
+        fixed += bytes;
     }
     if (lay.empty()) {
         return;
@@ -1609,13 +1614,19 @@ static void b65_place_commit(ggml_context * ctx, ggml_backend_buffer_t buf) {
         auto it = lay.find(order[p]);
         if (it == lay.end()) continue;
         size_t bytes = 0;
-        for (size_t z : it->second.second) bytes += z;
+        for (auto & [tb, g] : it->second) for (size_t z : g.sz) bytes += z;
         int where = (double) bytes <= left ? 0 : 1;
-        int h = commit(buf, it->second.first.data(), it->second.second.data(), (int) it->second.first.size(), where);
-        if (h < 0 && where == 0) { where = 1; h = commit(buf, it->second.first.data(), it->second.second.data(), (int) it->second.first.size(), 1); }
-        if (h < 0) throw std::runtime_error("b65: could not commit FFN weights");
+        for (auto & [tb, g] : it->second) {
+            size_t gb = 0;
+            for (size_t z : g.sz) gb += z;
+            int w = where;
+            int h = commit(tb, g.off.data(), g.sz.data(), (int) g.off.size(), w);
+            if (h < 0 && w == 0) { w = 1; h = commit(tb, g.off.data(), g.sz.data(), (int) g.off.size(), 1); }
+            if (h < 0) throw std::runtime_error("b65: could not commit FFN weights");
+            pl.ffn.push_back({ order[p], tb, h, gb, w, p });
+            if (w == 1) where = 1;
+        }
         if (where == 0) { left -= (double) bytes; ++n_vram; } else { ram += bytes; }
-        pl.ffn.push_back({ order[p], buf, h, bytes, where, p });
     }
     LLAMA_LOG_INFO("%s: movable weights: non-FFN %.0f MB in VRAM, FFN layers %d in VRAM, %d in system RAM (%.0f MB)\n",
             __func__, fixed / 1e6, n_vram, (int) lay.size() - n_vram, ram / 1e6);
