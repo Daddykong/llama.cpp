@@ -7602,7 +7602,8 @@ static bool ggml_vk_mul_mat_vec_gqa_ok(const ggml_backend_vk_context * ctx, cons
             (get_misalign_bytes(ctx, src1) / sizeof(float)) % 4 != 0) {
             return false;
         }
-        return src1->ne[2] > src0->ne[2] || src1->ne[1] > 1;
+        static const bool batch_inv_q8 = getenv("GGML_VK_BATCH_INVARIANT") != nullptr && atoi(getenv("GGML_VK_BATCH_INVARIANT")) != 0;
+        return src1->ne[2] > src0->ne[2] || (src1->ne[1] > 1 && !batch_inv_q8);
     }
     if (src0->ne[3] != 1 || src1->ne[3] != 1 || dst->ne[3] != 1 || src1->ne[1] < 1 || src1->ne[1] > 4 ||
         src0->ne[2] == 0 || src1->ne[2] % src0->ne[2] != 0 || src1->ne[2] / src0->ne[2] > 8) {
@@ -7617,7 +7618,9 @@ static bool ggml_vk_mul_mat_vec_gqa_ok(const ggml_backend_vk_context * ctx, cons
         return false;
     }
     // only worth it when B channels share A channels or there are several tokens
-    return src1->ne[2] > src0->ne[2] || src1->ne[1] > 1;
+    // b65: GGML_VK_BATCH_INVARIANT=1: only real GQA, so 1 and 2-4 tokens take the same kernel
+    static const bool batch_inv_gqa_ok = getenv("GGML_VK_BATCH_INVARIANT") != nullptr && atoi(getenv("GGML_VK_BATCH_INVARIANT")) != 0;
+    return src1->ne[2] > src0->ne[2] || (src1->ne[1] > 1 && !batch_inv_gqa_ok);
 }
 
 static void ggml_vk_mul_mat_vec_gqa_f16_f32(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
