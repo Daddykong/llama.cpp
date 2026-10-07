@@ -4508,3 +4508,55 @@ llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * c
 llama_context * llama_get_ctx_other(struct llama_context * ctx) {
     return ctx->get_cparams().ctx_other;
 }
+
+
+// ---- b65: attention-KV range save / drop / restore ----
+
+static llama_kv_cache * b65_attn_kv(llama_context * ctx) {
+    llama_memory_i * mem = ctx->get_memory();
+    llama_kv_cache * kv = dynamic_cast<llama_kv_cache *>(mem);
+    if (!kv) {
+        if (auto * hy = dynamic_cast<llama_memory_hybrid *>(mem)) kv = hy->get_mem_attn();
+    }
+    return kv;
+}
+
+size_t llama_b65_seq_range_save(struct llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1, const char * path) {
+    llama_kv_cache * kv = b65_attn_kv(ctx);
+    if (!kv) return 0;
+    ctx->synchronize();
+    try {
+        llama_file file(path, "wb");
+        llama_io_write_file io(&file);
+        kv->b65_set_pos_filter(p0, p1);
+        kv->state_write(io, seq_id, 0);
+        kv->b65_set_pos_filter(-1, -1);
+        return io.n_bytes();
+    } catch (const std::exception & e) {
+        kv->b65_set_pos_filter(-1, -1);
+        LLAMA_LOG_ERROR("%s: %s\n", __func__, e.what());
+        return 0;
+    }
+}
+
+bool llama_b65_seq_range_drop(struct llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    llama_kv_cache * kv = b65_attn_kv(ctx);
+    if (!kv) return false;
+    ctx->synchronize();
+    return kv->seq_rm(seq_id, p0, p1);
+}
+
+bool llama_b65_seq_range_load(struct llama_context * ctx, llama_seq_id seq_id, const char * path) {
+    llama_kv_cache * kv = b65_attn_kv(ctx);
+    if (!kv) return false;
+    ctx->synchronize();
+    try {
+        llama_file file(path, "rb");
+        llama_io_read_file io(&file);
+        kv->state_read(io, seq_id, 0);
+        return true;
+    } catch (const std::exception & e) {
+        LLAMA_LOG_ERROR("%s: %s\n", __func__, e.what());
+        return false;
+    }
+}

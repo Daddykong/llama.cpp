@@ -342,7 +342,10 @@ private:
     void sparse_shrink(uint32_t n_cells);
 public:
     bool sparse_park(llama_seq_id seq_id, bool park);   // b65
+    void b65_set_pos_filter(llama_pos p0, llama_pos p1) const { b65_p0 = p0; b65_p1 = p1; }   // b65: state_write filter
 private:
+    mutable llama_pos b65_p0 = -1;
+    mutable llama_pos b65_p1 = -1;
 
     // model layer id -> KV cache layer id
     std::unordered_map<int32_t, int32_t> map_layer_ids;

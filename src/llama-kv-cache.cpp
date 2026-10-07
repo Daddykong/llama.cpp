@@ -2311,6 +2311,8 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
 
             add_cell = add_cell && !cells.is_empty(i);
             add_cell = add_cell && (seq_id == -1 || cells.seq_has(i, seq_id));
+            // b65: optional position range (llama_b65_seq_range_save)
+            add_cell = add_cell && (b65_p0 < 0 || (cells.pos_get(i) >= b65_p0 && cells.pos_get(i) < b65_p1));
 
             // check the cell is not SWA-masked
             if (add_cell && seq_id != -1) {
