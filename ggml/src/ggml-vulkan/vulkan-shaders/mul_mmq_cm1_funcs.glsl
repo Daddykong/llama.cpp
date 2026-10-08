@@ -13,9 +13,19 @@ struct block_a_prefetch {
 
 block_a_prefetch block_a_load(uint ib, uint loadr) {
     block_a_prefetch blk;
+#if defined(DATA_A_Q4_0R)
+    // b65: row-reordered layout (reorder_q4_0.comp); block ib = row ib / nbpr, block jb within the row.
+    // Row byte offset rsb * 18 is a whole number of words because nbpr is even.
+    const uint nbpr = p.stride_a / QUANT_K;
+    const uint jb = ib % nbpr;
+    const uint rsb = ib - jb;
+    blk.qs = data_a_r32[(rsb * 9) / 2 + jb * 4 + loadr];
+    blk.d = data_a_r16[rsb * 9 + nbpr * 8 + jb];
+#else
     blk.qs = pack32(u16vec2(data_a_packed16[ib].qs[loadr * 2],
                              data_a_packed16[ib].qs[loadr * 2 + 1]));
     blk.d = data_a_packed16[ib].d;
+#endif
     return blk;
 }
 

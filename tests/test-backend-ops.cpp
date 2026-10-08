@@ -9582,6 +9582,24 @@ static void add_b65_sparse_t_cases(std::vector<std::unique_ptr<test_case>> & tes
     }
     test_cases.emplace_back(new test_b65_mm_add(GGML_TYPE_Q4_0, 5120, 3, 17408, 1));
     test_cases.emplace_back(new test_b65_mm_add(GGML_TYPE_Q5_K, 5120, 3, 6144, 1));
+    // b65 X14r: prompt-sized quant matmuls that reach the large int8 tile (m > 64 and n > 64), partial m / n tiles,
+    // k not a multiple of 128 (the int8 k-loop steps 128) on the small, medium and large tiles, and model-sized k
+    // (k % 256 == 0 is also what the GGML_VK_*_REPACK=2 reorder needs)
+    for (ggml_type t : {GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q8_0, GGML_TYPE_IQ4_NL,
+                        GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_IQ4_XS, GGML_TYPE_Q3_K, GGML_TYPE_Q6_K}) {
+        test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 256, 512, 1024, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 200, 300, 1024, {1, 1}, {1, 1}));
+        if (ggml_blck_size(t) == 32) {
+            test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 256, 512, 576, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32,  64, 512, 544, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32,  32,  40, 608, {1, 1}, {1, 1}));
+        }
+    }
+    for (ggml_type t : {GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_K, GGML_TYPE_Q8_0}) {
+        test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 512, 512, 5120, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 256, 512, 17408, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 384, 4096, 6144, {1, 1}, {1, 1}));
+    }
     // b65 row-reordered weights (GGML_VK_*_REPACK=2): model-sized k, decode (1-8 tokens) and prompt batches;
     // k=1280 (5 IQ4_XS superblocks) is not eligible for the IQ4_XS reorder and checks the fallback
     for (ggml_type t : {GGML_TYPE_IQ4_XS, GGML_TYPE_Q5_K, GGML_TYPE_Q8_0, GGML_TYPE_IQ4_NL, GGML_TYPE_Q6_K, GGML_TYPE_Q4_1, GGML_TYPE_Q4_0}) {
