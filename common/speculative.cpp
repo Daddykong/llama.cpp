@@ -2069,8 +2069,8 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
 
         if (adapt) {
             const char * c = std::getenv("LLAMA_NGRAM_COST");
-            // default: B65 verify graph ms by token count with mul_mmvq_wide (MTP-w2 sweep, 2026-10-08)
-            std::string cs = c ? c : "1:38;3:43;4:50;8:112;9:100;16:105;17:170;32:175;33:290;64:300;65:525;128:1040";
+            // default: B65 verify graph ms by token count with mul_mmvq_wide (MTP-w3/w4 sweeps, 2026-10-08)
+            std::string cs = c ? c : "1:39;3:43;4:50;6:91;8:112;9:96;16:101;17:146;32:154;33:244;64:258;65:519;128:1023";
             std::replace(cs.begin(), cs.end(), ';', ',');
             size_t pos = 0;
             while (pos < cs.size()) {

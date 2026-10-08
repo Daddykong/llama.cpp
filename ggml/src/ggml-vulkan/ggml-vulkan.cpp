@@ -3545,9 +3545,10 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         const char *       wn[4] = { "mul_mmvq_wide_q4_0r", "mul_mmvq_wide_q4_1r", "mul_mmvq_wide_q5_kr", "mul_mmvq_wide_q8_0r" };
         const uint32_t nc[3] = { 16, 32, 64 };
         // per column tile "ct:rt_mul:kcb" (columns per invocation, factor on the base RT of 128 rows per workgroup at
-        // 8 columns per invocation, k-chunk blocks). Defaults from the B65 sweep (MTP-w2, 2026-10-07): 16 and 32
-        // columns 4:2:16, 64 columns 8:1:8. GGML_VK_MMVQ_WIDE_CFG (all tiles) / GGML_VK_MMVQ_WIDE_CFG16|32|64 override.
-        uint32_t w_ct[3] = { 4, 4, 8 }, w_rtm[3] = { 2, 2, 1 }, w_kcb[3] = { 16, 16, 8 };
+        // 8 columns per invocation, k-chunk blocks). Defaults from the B65 sweeps (MTP-w3/w4, 2026-10-08), verify graph at
+        // 4.4K: 16 columns 4:2:16 (9-16 tokens 96-101 ms), 32 columns 8:2:8 (17-32: 146-154 ms), 64 columns 8:1:8
+        // (33-64: 244-258 ms). GGML_VK_MMVQ_WIDE_CFG (all tiles) / GGML_VK_MMVQ_WIDE_CFG16|32|64 override.
+        uint32_t w_ct[3] = { 4, 8, 8 }, w_rtm[3] = { 2, 2, 1 }, w_kcb[3] = { 16, 8, 8 };
         for (uint32_t c = 0; c < 3; ++c) {
             const char * all = getenv("GGML_VK_MMVQ_WIDE_CFG");
             const char * one = getenv(c == 0 ? "GGML_VK_MMVQ_WIDE_CFG16" : (c == 1 ? "GGML_VK_MMVQ_WIDE_CFG32" : "GGML_VK_MMVQ_WIDE_CFG64"));
