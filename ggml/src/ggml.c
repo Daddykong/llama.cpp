@@ -1105,9 +1105,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "SIGN_SCORE",
     "MUL_MAT_MASKED",
     "GDN_GATES",
+    "KV_QUEST_APPLY",
 };
 
-static_assert(GGML_OP_COUNT == 107, "GGML_OP_COUNT != 107");
+static_assert(GGML_OP_COUNT == 108, "GGML_OP_COUNT != 108");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1226,9 +1227,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sign_score(x)",
     "mul_mat_masked(w,x)",
     "gdn_gates(x)",
+    "kv_quest_apply(kq)",
 };
 
-static_assert(GGML_OP_COUNT == 107, "GGML_OP_COUNT != 107");
+static_assert(GGML_OP_COUNT == 108, "GGML_OP_COUNT != 108");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5514,6 +5516,27 @@ struct ggml_tensor * ggml_mul_mat_sparse_t(
 
 // b65 Quest-style KV block selection
 
+struct ggml_tensor * ggml_kv_block_minmax_ext(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * kmm,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * idx,
+        struct ggml_tensor  * after,
+        int                   block,
+        int                   reset) {
+    GGML_ASSERT(kmm->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F32 && idx->type == GGML_TYPE_I64);
+    GGML_ASSERT(kmm->ne[0] == 2*k->ne[0] && idx->ne[0] == k->ne[1] && block > 0);
+    struct ggml_tensor * result = ggml_view_tensor(ctx, kmm);
+    ggml_set_op_params_i32(result, 0, block);
+    ggml_set_op_params_i32(result, 1, reset);
+    result->op     = GGML_OP_KV_BLOCK_MINMAX;
+    result->src[0] = kmm;
+    result->src[1] = k;
+    result->src[2] = idx;
+    result->src[3] = after;
+    return result;
+}
+
 struct ggml_tensor * ggml_kv_block_minmax(
         struct ggml_context * ctx,
         struct ggml_tensor  * kmm,
@@ -5521,16 +5544,7 @@ struct ggml_tensor * ggml_kv_block_minmax(
         struct ggml_tensor  * idx,
         struct ggml_tensor  * after,
         int                   block) {
-    GGML_ASSERT(kmm->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F32 && idx->type == GGML_TYPE_I64);
-    GGML_ASSERT(kmm->ne[0] == 2*k->ne[0] && idx->ne[0] == k->ne[1] && block > 0);
-    struct ggml_tensor * result = ggml_view_tensor(ctx, kmm);
-    ggml_set_op_params_i32(result, 0, block);
-    result->op     = GGML_OP_KV_BLOCK_MINMAX;
-    result->src[0] = kmm;
-    result->src[1] = k;
-    result->src[2] = idx;
-    result->src[3] = after;
-    return result;
+    return ggml_kv_block_minmax_ext(ctx, kmm, k, idx, after, block, 0);
 }
 
 struct ggml_tensor * ggml_kv_quest_mask(
@@ -5544,8 +5558,11 @@ struct ggml_tensor * ggml_kv_quest_mask(
         int                   sink,
         int                   recent) {
     GGML_ASSERT(q->type == GGML_TYPE_F32 && kmm->type == GGML_TYPE_F32 && mask->type == GGML_TYPE_F32);
-    GGML_ASSERT(kmm->ne[0] == 2*q->ne[0]*n_head_kv && q->ne[1] % n_head_kv == 0 && mask->ne[1] >= q->ne[2]);
-    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, mask->ne[0], mask->ne[1], q->ne[1]);
+    GGML_ASSERT(kmm->ne[0] == 2*q->ne[0]*n_head_kv && q->ne[1] % n_head_kv == 0 && mask->ne[1] >= q->ne[2] && block > 0);
+    const int64_t nb = (mask->ne[0] + block - 1) / block;
+    const int64_t nw = (nb + 31) / 32;
+    GGML_ASSERT(kmm->ne[1] >= nb);
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, nw + nb, n_head_kv, q->ne[2]);
     ggml_set_op_params_i32(result, 0, n_head_kv);
     ggml_set_op_params_i32(result, 1, block);
     ggml_set_op_params_i32(result, 2, budget);
@@ -5555,6 +5572,22 @@ struct ggml_tensor * ggml_kv_quest_mask(
     result->src[0] = q;
     result->src[1] = kmm;
     result->src[2] = mask;
+    return result;
+}
+
+struct ggml_tensor * ggml_kv_quest_apply(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * kq,
+        struct ggml_tensor  * sel,
+        int                   block) {
+    GGML_ASSERT(kq->type == GGML_TYPE_F32 && sel->type == GGML_TYPE_I32 && block > 0);
+    GGML_ASSERT(kq->ne[3] == 1 && sel->ne[2] == kq->ne[1] && kq->ne[2] % sel->ne[1] == 0);
+    GGML_ASSERT(sel->ne[0] >= (kq->ne[0] + block - 1) / block);
+    struct ggml_tensor * result = ggml_view_tensor(ctx, kq);
+    ggml_set_op_params_i32(result, 0, block);
+    result->op     = GGML_OP_KV_QUEST_APPLY;
+    result->src[0] = kq;
+    result->src[1] = sel;
     return result;
 }
 

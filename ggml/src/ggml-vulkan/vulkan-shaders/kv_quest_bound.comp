@@ -1,0 +1,70 @@
+#version 450
+// b65 Quest v2, pass 1 of 2: per-block bounds. Workgroup = BPW blocks of one KV head g; one subgroup per block,
+// its lanes walk the block's min/max record (contiguous, 16-byte loads), the queries of g's G heads for all T tokens
+// sit in shared memory. Writes bound[t][g][b] = max_h sum_d max(q*min, q*max) as float bits after the bitmap words of
+// the output row, or -inf when no cell of the block is live for token t (mask row all -inf).
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_KHR_shader_subgroup_vote : enable
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+layout(constant_id = 0) const uint G = 1;   // query heads per KV head, 1..8
+layout(constant_id = 1) const uint T = 1;   // tokens, 1..4
+#define BPW 32
+#define DMAX 256
+layout(binding = 0) readonly buffer Q { float data_q[]; };
+layout(binding = 1) readonly buffer KMM { vec4 data_kmm4[]; };
+layout(binding = 2) readonly buffer M { float data_m[]; };
+layout(binding = 3) writeonly buffer DST { uint data_d[]; };
+layout(push_constant) uniform PC {
+    uint D; uint NB; uint NKV; uint B; uint NHKV; uint NW; uint ROW;
+    uint q_head; uint q_tok; uint kmm_row; uint m_row; uint q_off; uint kmm_off; uint m_off; uint d_off;
+} p;
+shared vec4 s_q[T * G * DMAX / 4];
+#define NEG_INF uintBitsToFloat(0xFF800000u)
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint g   = gl_WorkGroupID.y;
+    const uint b0  = gl_WorkGroupID.x * BPW;
+    const uint D4  = p.D / 4;
+    for (uint i = tid; i < T * G * D4; i += 256) {
+        const uint d4 = i % D4, th = i / D4;
+        const uint t = th / G, h = g * G + th % G;
+        const uint base = p.q_off + t * p.q_tok + h * p.q_head + 4 * d4;
+        s_q[i] = vec4(data_q[base], data_q[base + 1], data_q[base + 2], data_q[base + 3]);
+    }
+    barrier();
+    const uint lane = gl_SubgroupInvocationID, SG = gl_SubgroupSize;
+    for (uint bi = gl_SubgroupID; bi < BPW; bi += gl_NumSubgroups) {
+        const uint b = b0 + bi;
+        if (b >= p.NB) break;   // subgroup-uniform
+        bool live[T];
+        [[unroll]] for (uint t = 0; t < T; ++t) {
+            bool l = false;
+            const uint j1 = min((b + 1) * p.B, p.NKV);
+            for (uint j = b * p.B + lane; j < j1; j += SG) l = l || data_m[p.m_off + t * p.m_row + j] != NEG_INF;
+            live[t] = subgroupAny(l);
+        }
+        float acc[T * G];
+        [[unroll]] for (uint i = 0; i < T * G; ++i) acc[i] = 0.0;
+        const uint mn4 = (p.kmm_off + b * p.kmm_row + g * p.D) / 4;
+        const uint mx4 = mn4 + p.NHKV * D4;
+        for (uint d4 = lane; d4 < D4; d4 += SG) {
+            const vec4 mn = data_kmm4[mn4 + d4], mx = data_kmm4[mx4 + d4];
+            [[unroll]] for (uint i = 0; i < T * G; ++i) {
+                const vec4 qv = s_q[i * D4 + d4];
+                const vec4 m = max(qv * mn, qv * mx);
+                acc[i] += (m.x + m.y) + (m.z + m.w);
+            }
+        }
+        [[unroll]] for (uint i = 0; i < T * G; ++i) acc[i] = subgroupAdd(acc[i]);
+        if (lane == 0) {
+            [[unroll]] for (uint t = 0; t < T; ++t) {
+                float best = acc[t * G];
+                [[unroll]] for (uint h = 1; h < G; ++h) best = max(best, acc[t * G + h]);
+                data_d[p.d_off + (t * p.NHKV + g) * p.ROW + p.NW + b] = floatBitsToUint(live[t] ? best : NEG_INF);
+            }
+        }
+    }
+}

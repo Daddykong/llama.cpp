@@ -1067,7 +1067,8 @@ struct vk_device_struct {
     vk_pipeline pipeline_ssm_conv_f32;
     vk_pipeline pipeline_mul_mat_sparse_t_q4_0, pipeline_mul_mat_sparse_t_q4_1; // b65
     vk_pipeline pipeline_mul_mat_sparse_t_mt[2][5]; // b65: [q4_0, q4_1][ntok 2..4]
-    vk_pipeline pipeline_kv_block_minmax, pipeline_kv_quest_mask; // b65 Quest
+    vk_pipeline pipeline_kv_block_minmax; // b65 Quest
+    vk_pipeline pipeline_kv_quest_bound[8][4], pipeline_kv_quest_select, pipeline_kv_quest_apply; // b65 Quest v2
     vk_pipeline pipeline_sign_score, pipeline_mul_mat_masked_q4_0; // b65 sparse gate/up
     vk_pipeline pipeline_gdn_gates_f16, pipeline_gdn_gates_f32; // b65 GDN gates
     vk_pipeline pipeline_soft_max_stats, pipeline_soft_max_stats_f16; // b65 softmax folded into V x P
@@ -1378,6 +1379,12 @@ struct ggml_backend_vk_context {
     std::vector<const ggml_tensor *> unsynced_nodes_written;
     // GDN state fusion (per graph): skip flags, and for each GDN node the gather/copy node it absorbs (-1 if none)
     std::vector<uint8_t> gdn_node_skip;
+    // b65 Quest v2: the selection bitmap the current MUL_MAT node reads (K x Q writes -inf itself and skips K rows,
+    // V x P skips V rows), and the KV_QUEST_APPLY nodes whose work the K x Q kernel already did (per graph)
+    const ggml_tensor * quest_sel = nullptr;
+    const ggml_tensor * quest_apply_node = nullptr;
+    bool quest_is_kq = false;
+    std::vector<const ggml_tensor *> quest_applied;
     std::vector<int32_t> gdn_fuse_gather;
     std::vector<int32_t> gdn_fuse_cpy;
     uint64_t gdn_plan_fp = 0;

@@ -2703,6 +2703,26 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
         cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
     } else {
+        // b65 Quest v2: per-(token, KV head) bitmap of the blocks this step attends to, built before kq so the Vulkan
+        // K x Q matvec can skip the K rows of the other blocks (and write -inf there); V x P skips their V rows
+        ggml_tensor * quest_sel = nullptr;
+        int quest_blk = 0;
+        if (quest_kmm && quest_q && kq_mask && kq_mask->type == GGML_TYPE_F32 && kq_mask->ne[2] == 1 && kq_mask->ne[3] == 1) {
+            static const int q_max  = getenv("LLAMA_KV_QUEST_MAX_TOK") ? atoi(getenv("LLAMA_KV_QUEST_MAX_TOK")) : 4;
+            static const int q_bud  = getenv("LLAMA_KV_QUEST_BUDGET")  ? atoi(getenv("LLAMA_KV_QUEST_BUDGET"))  : 2048;
+            static const int q_sink = getenv("LLAMA_KV_QUEST_SINK")    ? atoi(getenv("LLAMA_KV_QUEST_SINK"))    : 64;
+            static const int q_rec  = getenv("LLAMA_KV_QUEST_RECENT")  ? atoi(getenv("LLAMA_KV_QUEST_RECENT"))  : 2;
+            static const int qb     = atoi(getenv("LLAMA_KV_QUEST_BLOCK"));
+            static const int q_from = getenv("LLAMA_KV_QUEST_FROM") ? atoi(getenv("LLAMA_KV_QUEST_FROM")) : 0;
+            llama_pos q_pmax = 0;
+            for (uint32_t i = 0; i < ubatch.n_tokens; ++i) q_pmax = std::max(q_pmax, ubatch.pos[i]);
+            if (quest_q->ne[2] <= q_max && kq_mask->ne[0] > q_bud && q_pmax >= q_from) {
+                quest_sel = ggml_kv_quest_mask(ctx0, quest_q, quest_kmm, kq_mask, (int) k->ne[2], qb, q_bud, q_sink, q_rec);
+                cb(quest_sel, "kq_quest_sel", il);
+                quest_blk = qb;
+            }
+        }
+
         // b65 kv4: prompt batches (> LLAMA_B65_KV_DEQ_MIN_TOK - 1 tokens, default 5+) on a quantized K cache: dequantize
         // the K view to f16 first (one pass, an op output freed after use), so K x Q is the same f16 matmul as on a 16-bit
         // cache; the strided int8 matmul cost 7-10% prompt speed at 32-64K (K8PP). 0 = off.
@@ -2712,6 +2732,9 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             cb(k, "k_deq", il);
         }
         ggml_tensor * kq = ggml_mul_mat(ctx0, k, q);
+        if (quest_sel) {
+            kq->src[2] = quest_sel;   // b65 Quest v2: ordering only (MUL_MAT ignores src[2]); the Vulkan K x Q reads it
+        }
         cb(kq, "kq", il);
 
         // note: this op tends to require high floating point range
@@ -2745,21 +2768,10 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             cb(kq, "kq_plus_kq_b", il);
         }
 
-        // b65 Quest: small steps attend only to the selected blocks (mask; the GQA kernels can skip masked rows)
-        if (quest_kmm && quest_q && kq_mask && kq_mask->type == GGML_TYPE_F32 && kq->type == GGML_TYPE_F32 &&
-            kq_mask->ne[2] == 1 && kq_mask->ne[3] == 1) {
-            static const int q_max  = getenv("LLAMA_KV_QUEST_MAX_TOK") ? atoi(getenv("LLAMA_KV_QUEST_MAX_TOK")) : 4;
-            static const int q_bud  = getenv("LLAMA_KV_QUEST_BUDGET")  ? atoi(getenv("LLAMA_KV_QUEST_BUDGET"))  : 2048;
-            static const int q_sink = getenv("LLAMA_KV_QUEST_SINK")    ? atoi(getenv("LLAMA_KV_QUEST_SINK"))    : 64;
-            static const int q_rec  = getenv("LLAMA_KV_QUEST_RECENT")  ? atoi(getenv("LLAMA_KV_QUEST_RECENT"))  : 2;
-            static const int qb     = atoi(getenv("LLAMA_KV_QUEST_BLOCK"));
-            static const int q_from = getenv("LLAMA_KV_QUEST_FROM") ? atoi(getenv("LLAMA_KV_QUEST_FROM")) : 0;
-            llama_pos q_pmax = 0;
-            for (uint32_t i = 0; i < ubatch.n_tokens; ++i) q_pmax = std::max(q_pmax, ubatch.pos[i]);
-            if (quest_q->ne[2] <= q_max && kq_mask->ne[0] > q_bud && q_pmax >= q_from) {
-                kq_mask = ggml_kv_quest_mask(ctx0, quest_q, quest_kmm, kq_mask, (int) k->ne[2], qb, q_bud, q_sink, q_rec);
-                cb(kq_mask, "kq_mask_quest", il);
-            }
+        // b65 Quest v2: small steps attend only to the selected blocks (bitmap computed before kq, see above)
+        if (quest_sel && kq->type == GGML_TYPE_F32) {
+            kq = ggml_kv_quest_apply(ctx0, kq, quest_sel, quest_blk);
+            cb(kq, "kq_quest", il);
         }
 
         kq = ggml_soft_max_ext(ctx0, kq, kq_mask, kq_scale, hparams.f_max_alibi_bias);
@@ -2996,7 +3008,8 @@ ggml_tensor * llm_graph_context::build_attn(
                 static const int qb = atoi(getenv("LLAMA_KV_QUEST_BLOCK"));
                 ggml_tensor * kmm2 = ggml_view_2d(ctx0, kmm, kmm->ne[0], kmm->ne[1], kmm->nb[1], 0);
                 ggml_tensor * k2   = ggml_view_2d(ctx0, k_cur, k_cur->ne[0]*k_cur->ne[1], k_cur->ne[2], k_cur->nb[2], 0);
-                ggml_tensor * upd  = ggml_kv_block_minmax(ctx0, kmm2, k2, k_idxs, k_set, qb);
+                static const int reset = getenv("LLAMA_KV_QUEST_NORESET") ? 0 : 1;   // b65 Quest v2: tight block summaries
+                ggml_tensor * upd  = ggml_kv_block_minmax_ext(ctx0, kmm2, k2, k_idxs, k_set, qb, reset);
                 ggml_build_forward_expand(gf, upd);
                 quest_kmm = upd;
                 quest_q   = q_cur;

@@ -1,0 +1,14 @@
+#version 450
+// b65 Quest v2: kq[j, t, h] = -inf where block j/B is not selected for (t, KV head h/G). Only runs when the K x Q
+// matvec could not do it itself.
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+layout(binding = 0) readonly buffer SEL { uint data_s[]; };
+layout(binding = 1) buffer KQ { float data_kq[]; };
+layout(push_constant) uniform PC { uint NKV; uint G; uint B; uint s_tok; uint s_head; uint s_off; uint kq_tok; uint kq_head; uint kq_off; } p;
+void main() {
+    const uint j = gl_GlobalInvocationID.x, t = gl_WorkGroupID.y, h = gl_WorkGroupID.z;
+    if (j >= p.NKV) return;
+    const uint b = j / p.B;
+    const uint w = data_s[p.s_off + t * p.s_tok + (h / p.G) * p.s_head + b / 32];
+    if (((w >> (b % 32)) & 1u) == 0u) data_kq[p.kq_off + t * p.kq_tok + h * p.kq_head + j] = uintBitsToFloat(0xFF800000u);
+}

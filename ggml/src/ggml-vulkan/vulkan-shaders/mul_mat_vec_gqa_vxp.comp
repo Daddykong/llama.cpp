@@ -39,7 +39,12 @@ layout (push_constant) uniform parameter
     uint b_offset;
     uint slice;          // k per slice, multiple of 8
     uint nchan_b;        // B channels (= A channels * GQA)
+    uint bm_offset;      // b65 Quest v2 selection bitmap (binding 3): word offset, token and KV-head strides,
+    uint bm_tok;         // cells per bit (0 = no bitmap). STAGED only: k tiles with no selected block for any
+    uint bm_head;        // token are skipped (their probabilities are 0)
+    uint qblock;
 } p;
+layout (binding = 3) readonly buffer QBM {uint data_qbm[];};
 
 #define FMA8(I, AR, K8)                                         \
     {                                                           \
@@ -109,6 +114,22 @@ void step8(const uint q, const uint k8) {
         }
     }
 }
+
+// b65 Quest v2: first k tile >= x of this slice that holds a block selected for any token of A channel h
+uint next_tile(uint x, const uint ntiles, const uint k0, const uint k1, const uint h) {
+    for (; x < ntiles; ++x) {
+        const uint c0 = k0 + x * KC;
+        const uint c1 = min(c0 + KC, k1) - 1;
+        for (uint b = c0 / p.qblock; b <= c1 / p.qblock; ++b) {
+            [[unroll]] for (uint t = 0; t < NTOK; ++t) {
+                if (((data_qbm[p.bm_offset + t * p.bm_tok + h * p.bm_head + b / 32] >> (b % 32)) & 1u) != 0u) {
+                    return x;
+                }
+            }
+        }
+    }
+    return ntiles;
+}
 #endif
 
 void main() {
@@ -160,8 +181,10 @@ void main() {
     const uint rw0    = gl_WorkGroupID.z * NR;
     uvec4 pre[KQ * RPT];
     const uint ntiles = (k1 - k0 + KC - 1) / KC;
-    {
-        const uint kc0 = k0 / 8;
+    uint tI = 0;
+    if (p.qblock != 0u) tI = next_tile(0u, ntiles, k0, k1, h);
+    if (tI < ntiles) {
+        const uint kc0 = k0 / 8 + tI * KQ;
         [[unroll]] for (uint j = 0; j < KQ * RPT; ++j) {
             const uint e = j * BLOCK + tid;
             const uint r = min(rw0 + e / KQ, p.nrows - 1);
@@ -171,7 +194,7 @@ void main() {
     }
     [[unroll]] for (uint i = 0; i < RPT * GQA * NTOK; ++i) accr[i] = 0.0;
     [[unroll]] for (uint i = 0; i < GQA * NTOK; ++i) bb[i] = b_base[i];
-    for (uint tI = 0; tI < ntiles; ++tI) {
+    while (tI < ntiles) {   // uniform: every invocation walks the same tiles
         barrier();
         [[unroll]] for (uint j = 0; j < KQ * RPT; ++j) {
             const uint e = j * BLOCK + tid;
@@ -189,8 +212,9 @@ void main() {
 #endif
         barrier();
         const uint kc0 = k0 / 8 + tI * KQ;   // first uvec4 column of this tile
-        if (tI + 1 < ntiles) {
-            const uint kn0 = kc0 + KQ;
+        const uint tN = p.qblock != 0u ? next_tile(tI + 1, ntiles, k0, k1, h) : tI + 1;
+        if (tN < ntiles) {
+            const uint kn0 = k0 / 8 + tN * KQ;
             [[unroll]] for (uint j = 0; j < KQ * RPT; ++j) {
                 const uint e = j * BLOCK + tid;
                 const uint r = min(rw0 + e / KQ, p.nrows - 1);
@@ -204,6 +228,7 @@ void main() {
         } else {
             for (uint q = 0; q < nq; ++q) step8(q, kc0 + q);
         }
+        tI = tN;
     }
     [[unroll]] for (uint r = 0; r < RPT; ++r) {
         const uint rr = rw0 + tid + r * BLOCK;
