@@ -262,6 +262,13 @@ void ggml_vk_print_device_lost_info(const vk_device& device) {
 }
 void * const vk_ptr_base = (void *)(uintptr_t) 0x1000;  // NOLINT
 
+// b65 [mtp]: smallest column count sent to mul_mmvq_wide (and so excluded from the mat-vec residual-add fusion)
+static int64_t ggml_vk_mmvq_wide_min() {
+    static const int64_t v = getenv("GGML_VK_DISABLE_MMVQ_WIDE") ? (int64_t) 1 << 30 :
+                             (getenv("GGML_VK_MMVQ_WIDE_MIN") ? std::max<int64_t>(2, atoll(getenv("GGML_VK_MMVQ_WIDE_MIN"))) : 5);
+    return v;
+}
+
 uint64_t vk_tensor_offset(const ggml_tensor * tensor) {
     if (tensor->view_src) {
         return (uint8_t *) tensor->view_src->data - (uint8_t *) vk_ptr_base;
@@ -8487,8 +8494,10 @@ void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, const st
 
     // b65 [mtp]: 9-64 column batches (long ngram drafts in the MTP-chain verify) of a row-reordered weight run on
     // mul_mmvq_wide (each weight block read once for all columns, integer dot); GGML_VK_DISABLE_MMVQ_WIDE=1 off
+    // from GGML_VK_MMVQ_WIDE_MIN columns (default 5: on the B65 the 5-8 column mat-vec costs 91-112 ms per verify
+    // graph vs ~97 ms on the 16-column tile, audit 2026-10-08)
     static const bool mmvq_wide_off = getenv("GGML_VK_DISABLE_MMVQ_WIDE") != nullptr;
-    if (!mmvq_wide_off && dst->ne[1] > (int64_t) mul_mat_vec_max_cols && dst->ne[1] <= 64 && ctx->num_additional_fused_ops == 0 &&
+    if (!mmvq_wide_off && dst->ne[1] >= ggml_vk_mmvq_wide_min() && dst->ne[1] <= 64 && ctx->num_additional_fused_ops == 0 &&
         ggml_vk_mmvq_wide(ctx, subctx, src0, src1, dst)) {
         return;
     }
@@ -15402,7 +15411,9 @@ bool ggml_vk_can_fuse(const ggml_backend_vk_context * ctx, const struct ggml_cgr
 
         // mat-vec only: one row, or (b65 [mtp]) 2..mul_mat_vec_max_cols columns without batch dims, which
         // ggml_vk_mul_mat also sends to the mat-vec shaders; they index the bias like D (column j at j*stride_d)
-        const bool mv_cols = mul->op == GGML_OP_MUL_MAT && mul->ne[1] <= mul_mat_vec_max_cols && mul->ne[2] == 1 && mul->ne[3] == 1 &&
+        // (column counts the wide kernel takes are not fused: it has no bias epilogue)
+        const bool mv_cols = mul->op == GGML_OP_MUL_MAT && mul->ne[1] <= mul_mat_vec_max_cols && mul->ne[1] < ggml_vk_mmvq_wide_min() &&
+                             mul->ne[2] == 1 && mul->ne[3] == 1 &&
                              mul->src[1] && mul->src[1]->ne[2] == 1 && mul->src[1]->ne[3] == 1 && ggml_is_contiguous(mul);
         static const bool mc_add_off = getenv("GGML_VK_DISABLE_MC_ADD_FUSION") != nullptr;
         if (ggml_nrows(mul) != 1 && (mc_add_off || !mv_cols)) {
