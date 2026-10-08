@@ -14093,11 +14093,23 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
             if (ctx->gdnf_at_gdn[node_idx] >= 0) gdnf_prep = &ctx->gdnf_plans[ctx->gdnf_at_gdn[node_idx]];
             if (ctx->gdnf_at_mul[node_idx] >= 0) gdnf_ng = &ctx->gdnf_plans[ctx->gdnf_at_mul[node_idx]];
         }
-        if (gdnf_prep) need_sync = true;
+        if (gdnf_prep && !need_sync) {
+            // the prep reads the projections and the conv cache and writes the cache rows; the previous layer's GDN
+            // read the scratch the prep overwrites
+            const vk_gdnf_plan & gp = *gdnf_prep;
+            need_sync = ctx->gdnf_scratch_dirty ||
+                overlaps_unsynced(gp.qkv, ctx->unsynced_nodes_written) || overlaps_unsynced(gp.ar, ctx->unsynced_nodes_written) ||
+                overlaps_unsynced(gp.br, ctx->unsynced_nodes_written) || overlaps_unsynced(gp.idx, ctx->unsynced_nodes_written) ||
+                overlaps_unsynced(gp.cs, ctx->unsynced_nodes_written);
+            for (int k = 0; k < gp.n_slots && !need_sync; ++k) {
+                need_sync = overlaps_unsynced(gp.slot_dst[k], ctx->unsynced_nodes_written) || overlaps_unsynced(gp.slot_dst[k], ctx->unsynced_nodes_read);
+            }
+        }
         if (gdnf_ng && !need_sync && (overlaps_unsynced(gdnf_ng->o, ctx->unsynced_nodes_written) ||
                                       overlaps_unsynced(gdnf_ng->nw, ctx->unsynced_nodes_written))) need_sync = true;
 
         if (need_sync) {
+            ctx->gdnf_scratch_dirty = false;
             if (vk_enable_sync_logger) {
                 std::cerr <<  "sync" << std::endl;
             }
@@ -14113,6 +14125,9 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
         }
         if (gdn_extra_read) ctx->unsynced_nodes_read.push_back(gdn_extra_read);
         if (gdnf_ng) { ctx->unsynced_nodes_read.push_back(gdnf_ng->o); ctx->unsynced_nodes_read.push_back(gdnf_ng->nw); }
+        if (gdnf_prep) {
+            for (const ggml_tensor * t : { gdnf_prep->qkv, gdnf_prep->ar, gdnf_prep->br, gdnf_prep->idx, gdnf_prep->cs }) ctx->unsynced_nodes_read.push_back(t);
+        }
         if (ctx->quest_sel) ctx->unsynced_nodes_read.push_back(ctx->quest_sel);
         if (gdn_extra_write) ctx->unsynced_nodes_written.push_back(gdn_extra_write);
         // Add all fused nodes to the unsynchronized lists.
@@ -14547,6 +14562,7 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
                 // b65 fused GDN layer: prep -> barrier -> GDN on the scratch
                 ggml_vk_gdnf_prep(ctx, compute_ctx, *gp);
                 ggml_vk_sync_buffers(ctx, compute_ctx);
+                ctx->gdnf_scratch_dirty = true;   // the GDN below reads the scratch
             }
             ggml_vk_gated_delta_net(ctx, compute_ctx, node, gi >= 0 ? cgraph->nodes[gi] : nullptr, ci >= 0 ? cgraph->nodes[ci] : nullptr, gp);
         }

@@ -1413,6 +1413,7 @@ struct ggml_backend_vk_context {
     struct gdnf_cache_entry { std::vector<vk_gdnf_plan> plans; std::vector<int32_t> at_gdn, at_mul, skips; };
     std::unordered_map<uint64_t, gdnf_cache_entry> gdnf_cache;
     vk_buffer gdnf_scratch;
+    bool gdnf_scratch_dirty = false;   // a GDN read the scratch since the last sync
     std::vector<const ggml_tensor *> unsynced_nodes_read;
     // Track which prealloc buffers have pending reads that need to be synchronized.
     // These are checked before writing to the buffer (and call ggml_vk_sync_buffers if set),
