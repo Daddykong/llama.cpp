@@ -7967,7 +7967,7 @@ static void ggml_vk_mul_mat_vec_gqa_vxp(ggml_backend_vk_context * ctx, vk_contex
     }
 
     vk_subbuffer d_D  = ggml_vk_tensor_subbuffer(ctx, dst, true);
-    vk_subbuffer d_Qx = ggml_vk_tensor_subbuffer(ctx, src0);
+    vk_subbuffer d_Qx = ggml_vk_tensor_subbuffer(ctx, src0, true);   // misalignment goes in a_offset (vxp_ok: 16-byte multiple)
     vk_subbuffer d_Qy = ggml_vk_tensor_subbuffer(ctx, src1, true);
     vk_subbuffer d_P  = ggml_vk_subbuffer(ctx, ctx->prealloc_split_k, 0);
 
