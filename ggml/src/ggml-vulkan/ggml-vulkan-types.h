@@ -1063,7 +1063,6 @@ struct vk_device_struct {
     vk_pipeline pipeline_sign_score, pipeline_mul_mat_masked_q4_0; // b65 sparse gate/up
     vk_pipeline pipeline_gdn_gates_f16, pipeline_gdn_gates_f32; // b65 GDN gates
     vk_pipeline pipeline_gdn_prep_f32, pipeline_gdn_normgate_f32; // b65 fused GDN layer (prep + norm-gate)
-    vk_pipeline pipeline_gated_delta_net_nf; // b65 fused GDN layer phase 2 (S_V 128, norm in the last workgroup)
     vk_pipeline pipeline_soft_max_stats, pipeline_soft_max_stats_f16; // b65 softmax folded into V x P
     vk_pipeline pipeline_gated_delta_net_chunk; // b65
     vk_pipeline pipeline_ssm_conv_silu_f32;
@@ -1364,9 +1363,7 @@ struct vk_gdnf_plan {
     const ggml_tensor * o = nullptr;      // GDN output view feeding the RMS_NORM
     const ggml_tensor * nw = nullptr;     // norm weight [128]
     const ggml_tensor * gz = nullptr;     // silu(z)
-    const ggml_tensor * y = nullptr;      // the final MUL (gated-norm output)
     float norm_eps = 0.0f;
-    bool nf = false;                      // phase 2: the norm runs inside the GDN dispatch (the final MUL is skipped)
 };
 
 struct ggml_backend_vk_context {

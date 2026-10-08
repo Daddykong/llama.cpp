@@ -4939,9 +4939,6 @@ struct test_gdn_layer_fusion : public test_case {
         ggml_tensor * alpha = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, nv, T);
         ggml_tensor * braw  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, nv, T);
         ggml_set_name(z, "z"); ggml_set_name(alpha, "alpha"); ggml_set_name(braw, "braw");
-        // silu(z) is computed early, as the Vulkan graph_optimize orders it in the model (next to the projections)
-        ggml_tensor * gz = ggml_silu(ctx, ggml_reshape_4d(ctx, z, S * 1, nv, T, 1));
-        ggml_build_forward_expand(gf, gz);
         // weights
         ggml_tensor * conv_w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, conv_k, conv_dim);
         ggml_tensor * dt     = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, nv);
@@ -5002,7 +4999,8 @@ struct test_gdn_layer_fusion : public test_case {
         checked.push_back(scpy);
 
         // gated norm
-        ggml_tensor * out = ggml_mul(ctx, ggml_mul(ctx, ggml_rms_norm(ctx, o, eps), norm_w), gz);
+        ggml_tensor * zz = ggml_reshape_4d(ctx, z, S, nv, T, 1);
+        ggml_tensor * out = ggml_mul(ctx, ggml_mul(ctx, ggml_rms_norm(ctx, o, eps), norm_w), ggml_silu(ctx, zz));
         ggml_set_name(out, "out");
         checked.insert(checked.begin(), out);
         return out;
