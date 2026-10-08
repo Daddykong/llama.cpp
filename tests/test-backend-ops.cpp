@@ -9513,6 +9513,32 @@ struct test_b65_kq_quant : public test_case {
     }
 };
 
+// b65 kv4: V x P on one layer of a quantized V cache with flash attention off. The cache is untransposed
+// [kv_heads*d, n_kv] (rows = tokens); V is the [d, n_kv, kv_heads] view, P the f32 [n_kv, n_tok, heads] softmax.
+// n_tok <= 4: out_prod(V, P^T) (the backend reads V in place); deq = 1: the long-batch path (dequant + transposed f16
+// copy + matmul)
+struct test_b65_vxq : public test_case {
+    const ggml_type type;
+    const int64_t d, heads, heads_kv, n_kv, n_tok;
+    const int deq;
+    std::string vars() override { return VARS_TO_STR7(type, d, heads, heads_kv, n_kv, n_tok, deq); }
+    test_b65_vxq(ggml_type type, int64_t d, int64_t heads, int64_t heads_kv, int64_t n_kv, int64_t n_tok, int deq = 0)
+        : type(type), d(d), heads(heads), heads_kv(heads_kv), n_kv(n_kv), n_tok(n_tok), deq(deq) {}
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "B65_VXQ"; }
+    double max_nmse_err() override { return 5e-4; }
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * cache = ggml_new_tensor_2d(ctx, type, d * heads_kv, n_kv);
+        ggml_tensor * v = ggml_view_3d(ctx, cache, d, n_kv, heads_kv, cache->nb[1], ggml_row_size(type, d), 0);
+        ggml_tensor * kq = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_kv, n_tok, heads);
+        if (!deq) {
+            return ggml_out_prod(ctx, v, ggml_transpose(ctx, kq));
+        }
+        ggml_tensor * vf = ggml_cpy(ctx, v, ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d, n_kv, heads_kv));
+        ggml_tensor * vt = ggml_cpy(ctx, ggml_transpose(ctx, vf), ggml_new_tensor_3d(ctx, GGML_TYPE_F16, n_kv, d, heads_kv));
+        return ggml_mul_mat(ctx, vt, kq);
+    }
+};
+
 // b65: sigmoid of a strided view times a same-shaped tensor (the qwen35 attention gate, LLAMA_GATE_NOCONT=1)
 struct test_b65_gate_mul : public test_case {
     const int64_t d, h, t;
@@ -9547,6 +9573,18 @@ static void add_b65_sparse_t_cases(std::vector<std::unique_ptr<test_case>> & tes
     test_cases.emplace_back(new test_b65_sm_mm(512, 64, 128, 8, 2, true));
     test_cases.emplace_back(new test_b65_sm_mm(1000, 100, 128, 6, 1, true));
     test_cases.emplace_back(new test_b65_sm_mm(4096, 512, 256, 24, 4, true));
+    // b65 kv4: quantized V cache, FA off (Qwen3.8-27B: d 256, 24 heads on 4 KV heads)
+    for (ggml_type vt : { GGML_TYPE_Q8_0, GGML_TYPE_Q4_0 }) {
+        for (int64_t n_kv : { 64, 1000, 4096, 33024 }) {
+            for (int64_t n_tok : { 1, 2, 3, 4 }) {
+                test_cases.emplace_back(new test_b65_vxq(vt, 256, 24, 4, n_kv, n_tok));
+            }
+        }
+        test_cases.emplace_back(new test_b65_vxq(vt, 128, 8, 2, 1000, 3));
+        test_cases.emplace_back(new test_b65_vxq(vt, 256, 16, 2, 777, 1));
+        test_cases.emplace_back(new test_b65_vxq(vt, 256, 24, 4, 4096, 7, 1));
+        test_cases.emplace_back(new test_b65_vxq(vt, 256, 24, 4, 4096, 64, 1));
+    }
     // b65: quantized K cache, FA off (Qwen3.8-27B: d 256, 24 heads on 4 KV heads)
     for (ggml_type kt : { GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_IQ4_NL }) {
         for (int64_t n_tok : { 1, 2, 4, 7, 32, 512 }) {

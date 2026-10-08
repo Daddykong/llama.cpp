@@ -2769,13 +2769,34 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         }
         cb(kq, "kq_soft_max", il);
 
-        if (!v_trans) {
+        ggml_tensor * kqv = nullptr;
+        if (!v_trans && ggml_is_quantized(v->type)) {
+            // b65 kv4: quantized V cache with FA off (stored untransposed). Up to LLAMA_B65_VXQ_MAX_TOK (4) tokens:
+            // V x P as out_prod(V, P^T), read in place by the backend; longer batches: V dequantized and transposed
+            // to f16, then the normal matmul.
+            static const int vxq_max = getenv("LLAMA_B65_VXQ_MAX_TOK") ? atoi(getenv("LLAMA_B65_VXQ_MAX_TOK")) : 4;
+            const int64_t gqa = v->ne[2] > 0 ? kq->ne[2] / v->ne[2] : 0;
+            if (kq->ne[1] <= vxq_max && kq->type == GGML_TYPE_F32 && gqa >= 1 && gqa <= 8 && kq->ne[2] % v->ne[2] == 0) {
+                kqv = ggml_out_prod(ctx0, v, ggml_transpose(ctx0, kq));
+            } else {
+                ggml_tensor * vf = ggml_cpy(ctx0, v, ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, v->ne[0], v->ne[1], v->ne[2], v->ne[3]));   // (ggml_cast has no src[1]: CPU dup_from_q needs it)
+                cb(vf, "v_deq", il);
+                v = ggml_cpy(ctx0, ggml_transpose(ctx0, vf),
+                             ggml_new_tensor_4d(ctx0, GGML_TYPE_F16, vf->ne[1], vf->ne[0], vf->ne[2], vf->ne[3]));
+                cb(v, "v_cont", il);
+                if (kq->type != GGML_TYPE_F32 && kq->type != GGML_TYPE_F16) {
+                    kq = ggml_cast(ctx0, kq, GGML_TYPE_F32);
+                }
+            }
+        } else if (!v_trans) {
             // note: avoid this branch
             v = ggml_cont(ctx0, ggml_transpose(ctx0, v));
             cb(v, "v_cont", il);
         }
 
-        ggml_tensor * kqv = ggml_mul_mat(ctx0, v, kq);
+        if (kqv == nullptr) {
+            kqv = ggml_mul_mat(ctx0, v, kq);
+        }
         cb(kqv, "kqv", il);
 
         // for MLA with the absorption optimization, we need to "decompress" from MQA back to MHA

@@ -473,11 +473,7 @@ llama_context::llama_context(
 
         sched_reserve();
 
-        if (!cparams.flash_attn) {
-            if (ggml_is_quantized(params.type_v)) {
-                throw std::runtime_error("quantized V cache was requested, but this requires Flash Attention");
-            }
-        }
+        // b65 kv4: a quantized V cache with FA off is stored untransposed and read by out_prod (llama-graph.cpp)
     }
 
     // Initialize the full vocabulary token ids for backend samplers.
@@ -3866,15 +3862,13 @@ llama_context * llama_init_from_model(
         return nullptr;
     }
 
-    if (ggml_is_quantized(params.type_v) && params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_ENABLED) {
-        if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO) {
-            LLAMA_LOG_INFO("%s: enabling flash_attn since it is required for quantized V cache\n", __func__);
-            params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
-        }
-        if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED) {
-            LLAMA_LOG_ERROR("%s: quantized V cache requires flash_attn to be enabled\n", __func__);
-            return nullptr;
-        }
+    if (ggml_is_quantized(params.type_v) && params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO) {
+        LLAMA_LOG_INFO("%s: enabling flash_attn since it is required for quantized V cache\n", __func__);
+        params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+    }
+    if (ggml_is_quantized(params.type_v) && params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED) {
+        // b65 kv4: FA off with a quantized V cache: V untransposed, V x P as out_prod (llama-graph.cpp)
+        LLAMA_LOG_INFO("%s: quantized V cache with flash_attn off (b65: untransposed V, out_prod V x P)\n", __func__);
     }
 
     if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED && ggml_is_quantized(params.type_k)) {

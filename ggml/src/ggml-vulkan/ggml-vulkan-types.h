@@ -874,6 +874,8 @@ struct vk_device_struct {
     vk_pipeline pipeline_mul_mat_vec_gqa_vxpb_f16_f32[8][4]; // b65 V x P k-sliced, A staged, B by subgroup shuffles (GGML_VK_GQA_VXP=3)
     uint32_t mul_mat_vec_gqa_vxpb_sg; // b65 subgroup size of the vxpb pipelines, 0 = not available
     vk_pipeline pipeline_mul_mat_vec_gqa_vxp_reduce; // b65
+    vk_pipeline pipeline_mul_mat_vec_gqa_vxq_q8_0_f32[8][4]; // b65 kv4: V x P with a q8_0 V cache (out_prod form)
+    vk_pipeline pipeline_mul_mat_vec_gqa_vxq_q4_0_f32[8][4]; // b65 kv4: q4_0 V cache
     uint32_t mul_mat_vec_gqa_vxp_block; // b65 rows per workgroup
     uint32_t mul_mat_vec_gqa_vxps_rpt; // b65 rows per invocation of the staged kernel
     uint32_t mul_mat_vec_gqa_vxpl_rpt[8][4]; // b65 rows per invocation of the mode-4 kernel
