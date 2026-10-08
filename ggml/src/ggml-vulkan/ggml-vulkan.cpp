@@ -4182,6 +4182,14 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                     gdn_names[si][kda], gdn_len, gdn_data, "main", 9, sizeof(vk_op_gated_delta_net_push_constants),
                     wg_denoms, {S_V, kda, gdn_subgroup_size, lanes_per_column}, 1, true, use_subgroup_ops, gdn_subgroup_size);
             }
+            // b65 fused GDN layer phase 2: same configuration, norm in the last workgroup of each head
+            if (S_V == 128u && use_subgroup_ops && device->vulkan_memory_model) {
+                ggml_vk_create_pipeline(device, device->pipeline_gated_delta_net_nf, "gated_delta_net_nf_f32_d128",
+                    use_clustered_reduce ? gated_delta_net_nf_f32_len : gated_delta_net_nf_f32_nocluster_len,
+                    use_clustered_reduce ? (const void *)gated_delta_net_nf_f32_data : (const void *)gated_delta_net_nf_f32_nocluster_data,
+                    "main", 12, sizeof(vk_op_gated_delta_net_push_constants),
+                    wg_denoms, {S_V, 0u, gdn_subgroup_size, lanes_per_column}, 1, true, true, gdn_subgroup_size);
+            }
         }
     }
 
@@ -4200,7 +4208,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_soft_max_stats_f16, "soft_max_stats_f16", soft_max_stats_f16_len, soft_max_stats_f16_data, "main", 3, sizeof(vk_op_sm_stats_push_constants), {1, 1, 1}, {}, 1);   // b65
     ggml_vk_create_pipeline(device, device->pipeline_gdn_gates_f16, "gdn_gates_f16", gdn_gates_f16_len, gdn_gates_f16_data, "main", 6, sizeof(vk_op_gdn_gates_push_constants), {1, 1, 1}, {}, 1, false, true, 32);   // b65
     ggml_vk_create_pipeline(device, device->pipeline_gdn_gates_f32, "gdn_gates_f32", gdn_gates_f32_len, gdn_gates_f32_data, "main", 6, sizeof(vk_op_gdn_gates_push_constants), {1, 1, 1}, {}, 1, false, true, 32);   // b65
-    ggml_vk_create_pipeline(device, device->pipeline_gdn_prep_f32, "gdn_prep_f32", gdn_prep_f32_len, gdn_prep_f32_data, "main", 9, sizeof(vk_op_gdn_prep_push_constants), {1, 1, 1}, {}, 1);   // b65 fused GDN layer
+    ggml_vk_create_pipeline(device, device->pipeline_gdn_prep_f32, "gdn_prep_f32", gdn_prep_f32_len, gdn_prep_f32_data, "main", 10, sizeof(vk_op_gdn_prep_push_constants), {1, 1, 1}, {}, 1);   // b65 fused GDN layer
     ggml_vk_create_pipeline(device, device->pipeline_gdn_normgate_f32, "gdn_normgate_f32", gdn_normgate_f32_len, gdn_normgate_f32_data, "main", 4, sizeof(vk_op_gdn_normgate_push_constants), {1, 1, 1}, {}, 1);   // b65 fused GDN layer
     ggml_vk_create_pipeline(device, device->pipeline_sign_score, "sign_score", sign_score_len, sign_score_data, "main", 5, sizeof(vk_op_sign_score_push_constants), {1, 1, 1}, {}, 1, false, true, 32);
     ggml_vk_create_pipeline(device, device->pipeline_mul_mat_masked_q4_0, "mul_mat_masked_q4_0", mul_mat_masked_q4_0_len, mul_mat_masked_q4_0_data, "main", 4, sizeof(vk_op_mm_masked_push_constants), {1, 1, 1}, {}, 1, false, true, 32);
@@ -11650,16 +11658,20 @@ void ggml_vk_lightning_indexer(ggml_backend_vk_context * ctx, vk_context& subctx
 
 // b65 fused GDN layer: scratch layout of the prep output (element offsets, each region 64-element aligned so it can
 // be bound on its own at the minimum storage-buffer offset alignment)
-struct vk_gdnf_layout { uint32_t q, k, v, g, b, total; };
+struct vk_gdnf_layout { uint32_t q, k, v, g, b, o, w, cnt, total; };
 static vk_gdnf_layout ggml_vk_gdnf_layout(uint32_t nk, uint32_t nv, uint32_t T) {
     auto up = [](uint32_t x) { return (x + 63u) & ~63u; };
     vk_gdnf_layout l;
-    l.q = 0;
+    // fixed head: the phase-2 counters (must not move between steps of different T) and the norm weight copy
+    l.cnt = 0;
+    l.w = 256u;
+    l.q = l.w + 128u;
     l.k = l.q + up(nk * 128u * T);
     l.v = l.k + up(nk * 128u * T);
     l.g = l.v + up(nv * 128u * T);
     l.b = l.g + up(nv * T);
-    l.total = l.b + up(nv * T);
+    l.o = l.b + up(nv * T);
+    l.total = l.o + up(nv * 128u * T);
     return l;
 }
 
@@ -11744,7 +11756,7 @@ void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, 
     }
 
     const float scale = 1.0f / sqrtf((float)S_v);
-    const vk_op_gated_delta_net_push_constants pc = {
+    vk_op_gated_delta_net_push_constants pc = {
         H, n_tokens, n_seqs, s_off,
         gsq1, gsq2, gsq3,
         gsv1, gsv2, gsv3,
@@ -11754,6 +11766,27 @@ void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, 
         K,
         fuse, idx_off, sout_slot_stride
     };
+
+    if (gdnf && gdnf->nf) {
+        // phase 2: the norm-gate in the last workgroup of each head writes the final MUL's output
+        pipeline = ctx->device->pipeline_gated_delta_net_nf;
+        ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+        const vk_gdnf_layout l = ggml_vk_gdnf_layout(gdnf->nk, gdnf->nv, gdnf->T);
+        const ggml_tensor * y = gdnf->y;
+        // binding 11 = the whole scratch: counters at 0, the norm weight, ..., o
+        pc.nf_o_off = l.o;
+        pc.nf_w_off = l.w;
+        pc.nf_cnt_off = l.cnt;
+        pc.nf_y_off = get_misalign_bytes(ctx, y) / 4;   pc.nf_y_s = (uint32_t)(y->nb[1] / 4);
+        pc.nf_g_off = get_misalign_bytes(ctx, gdnf->gz) / 4; pc.nf_g_s = (uint32_t)(gdnf->gz->nb[1] / 4);
+        pc.nf_eps = gdnf->norm_eps;
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+            {src_buf[0], src_buf[1], src_buf[2], src_buf[3], src_buf[4], src_buf[5], dst_buf, idx_buf, sout_buf,
+             ggml_vk_tensor_subbuffer(ctx, gdnf->gz, true), ggml_vk_tensor_subbuffer(ctx, y, true),
+             vk_subbuffer{ ctx->gdnf_scratch, 0, (size_t)l.total * sizeof(float) }},
+            pc, { H, n_seqs, S_v });
+        return;
+    }
 
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
         {src_buf[0], src_buf[1], src_buf[2], src_buf[3], src_buf[4], src_buf[5], dst_buf, idx_buf, sout_buf},
@@ -11800,8 +11833,10 @@ static void ggml_vk_gdnf_prep(ggml_backend_vk_context * ctx, vk_context& subctx,
     pc.A_off  = get_misalign_bytes(ctx, p.A) / 4;
     pc.eps = p.eps; pc.qk_scale = p.qk_scale;
     pc.out_q = l.q; pc.out_k = l.k; pc.out_v = l.v; pc.out_g = l.g; pc.out_b = l.b;
+    pc.out_w = p.nf ? l.w : 0u;
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
-        { b_qkv, b_cs, b_idx, b_cw, b_ar, b_br, b_dt, b_A, vk_subbuffer{ ctx->gdnf_scratch, 0, (size_t)l.total * sizeof(float) } },
+        { b_qkv, b_cs, b_idx, b_cw, b_ar, b_br, b_dt, b_A, vk_subbuffer{ ctx->gdnf_scratch, 0, (size_t)l.total * sizeof(float) },
+          p.nf ? ggml_vk_tensor_subbuffer(ctx, p.nw, true) : b_cw },
         pc, { 2 * p.nk + p.nv, 1, 1 });
 }
 
@@ -14113,6 +14148,11 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
         }
         if (gdn_extra_read) ctx->unsynced_nodes_read.push_back(gdn_extra_read);
         if (gdnf_ng) { ctx->unsynced_nodes_read.push_back(gdnf_ng->o); ctx->unsynced_nodes_read.push_back(gdnf_ng->nw); }
+        if (gdnf_prep && gdnf_prep->nf) {
+            ctx->unsynced_nodes_written.push_back(gdnf_prep->y);
+            ctx->unsynced_nodes_read.push_back(gdnf_prep->nw);
+            ctx->unsynced_nodes_read.push_back(gdnf_prep->gz);
+        }
         if (ctx->quest_sel) ctx->unsynced_nodes_read.push_back(ctx->quest_sel);
         if (gdn_extra_write) ctx->unsynced_nodes_written.push_back(gdn_extra_write);
         // Add all fused nodes to the unsynchronized lists.
@@ -16443,9 +16483,13 @@ static void ggml_vk_plan_gdn_state_fusion(ggml_backend_vk_context * ctx, const g
 // The structural match is shared by graph_optimize (which keeps the prep's and norm-gate's inputs allocated until
 // the nodes that emit them) and the per-graph planner (which also checks memory safety on the allocated graph).
 // ---------------------------------------------------------------------------------------------------------------
+static int ggml_vk_gdnf_level() {
+    // 1: prep + GDN + norm-gate (3 dispatches); 2: the norm-gate inside the GDN (2 dispatches)
+    static const int lv = getenv("GGML_VK_GDN_LAYER_FUSION") ? atoi(getenv("GGML_VK_GDN_LAYER_FUSION")) : 0;
+    return lv;
+}
 static bool ggml_vk_gdnf_enabled() {
-    static const bool on = getenv("GGML_VK_GDN_LAYER_FUSION") != nullptr && atoi(getenv("GGML_VK_GDN_LAYER_FUSION")) != 0;
-    return on;
+    return ggml_vk_gdnf_level() > 0;
 }
 static bool ggml_vk_gdnf_normgate_enabled() {
     static const bool on = getenv("GGML_VK_GDN_LAYER_FUSION_NORMGATE") == nullptr || atoi(getenv("GGML_VK_GDN_LAYER_FUSION_NORMGATE")) != 0;
@@ -16670,7 +16714,7 @@ static bool ggml_vk_gdnf_match(const ggml_cgraph * cg, int g, const vk_gdnf_grap
                 !ggml_is_contiguous(gz) || !ggml_is_contiguous(mg) || !ggml_vk_gdnf_f32(mg) || gz == mw) mg = nullptr;
         }
         if (mg && gi.pos.count(mg)) {
-            p.o = rn->src[0]; p.nw = nw; p.gz = gz;
+            p.o = rn->src[0]; p.nw = nw; p.gz = gz; p.y = mg;
             memcpy(&p.norm_eps, rn->op_params, sizeof(float));
             p.mul = gi.pos.at(mg);
             absorbed.push_back(rn);
@@ -16809,10 +16853,22 @@ static void ggml_vk_plan_gdn_layer_fusion_impl(ggml_backend_vk_context * ctx, co
                 }
             }
         }
+        // phase 2: the GDN writes the final MUL's output itself (silu(z) must exist before the GDN, and nothing between
+        // the GDN and the final MUL may touch that output's memory)
+        if (p.mul >= 0 && ggml_vk_gdnf_level() >= 2 && ctx->device->pipeline_gated_delta_net_nf &&
+            prod_pos(p.gz) < g && p.y->buffer && p.nv <= 256 && get_misalign_bytes(ctx, p.nw) == 0) {
+            ctx->gdn_node_skip[p.mul] = 1;
+            if (untouched(p.y, g, p.mul, true)) {
+                p.nf = true;
+                ab_ng.push_back(p.mul);
+            } else {
+                ctx->gdn_node_skip[p.mul] = 0;
+            }
+        }
         for (int ap : ab_pre) ctx->gdnf_skip_mark[ap] = 1;
         if (p.mul >= 0) for (int ap : ab_ng) ctx->gdnf_skip_mark[ap] = 1;
         ctx->gdnf_at_gdn[g] = (int)ctx->gdnf_plans.size();
-        if (p.mul >= 0) ctx->gdnf_at_mul[p.mul] = (int)ctx->gdnf_plans.size();
+        if (p.mul >= 0 && !p.nf) ctx->gdnf_at_mul[p.mul] = (int)ctx->gdnf_plans.size();
         ctx->gdnf_plans.push_back(p);
     }
     if (ctx->gdnf_plans.empty()) return;
@@ -16826,12 +16882,15 @@ static void ggml_vk_plan_gdn_layer_fusion_impl(ggml_backend_vk_context * ctx, co
             ggml_vk_destroy_buffer(ctx->gdnf_scratch);
         }
         ctx->gdnf_scratch = ggml_vk_create_buffer_device(ctx->device, bytes);
+        ggml_vk_buffer_memset(ctx->gdnf_scratch, 0, 0, bytes);   // the phase-2 counters start at 0
     }
     static const bool dbg = getenv("GGML_VK_GDNF_DEBUG") != nullptr;
     if (dbg) {
         int nng = 0;
         for (const auto & p : ctx->gdnf_plans) nng += p.mul >= 0;
-        fprintf(stderr, "gdnf: %d layers fused (%d with norm-gate), T=%u\n", (int)ctx->gdnf_plans.size(), nng, ctx->gdnf_plans[0].T);
+        int nnf = 0;
+        for (const auto & p : ctx->gdnf_plans) nnf += p.nf;
+        fprintf(stderr, "gdnf: %d layers fused (%d with norm-gate, %d of them inside the GDN), T=%u\n", (int)ctx->gdnf_plans.size(), nng, nnf, ctx->gdnf_plans[0].T);
     }
 }
 

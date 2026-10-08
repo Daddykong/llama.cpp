@@ -8,6 +8,12 @@
 #if USE_SUBGROUP_ADD
 #extension GL_KHR_shader_subgroup_arithmetic : enable
 #endif
+#if GDN_NORM_FUSE
+// b65 fused GDN layer, phase 2: the gated output norm (RMS_NORM(o) * w * silu(z)) runs in the last workgroup of each
+// head; o goes through a device-coherent scratch, the last workgroup is found with an acquire-release counter
+#extension GL_KHR_memory_scope_semantics : enable
+#pragma use_vulkan_memory_model
+#endif
 
 // Caller guarantees valid spec constants: S_V % COLS_PER_WG == 0 and S_V % LANES_PER_COLUMN == 0,
 // so no bounds checking is needed.
@@ -35,6 +41,9 @@ layout(push_constant) uniform Parameters {
     uint fuse;
     uint idx_off;
     uint sout_slot_stride;
+    // GDN_NORM_FUSE only
+    uint nf_o_off, nf_y_off, nf_y_s, nf_g_off, nf_g_s, nf_w_off, nf_cnt_off;
+    float nf_eps;
 };
 
 layout(binding = 0) readonly  buffer QBuf     { FLOAT_TYPE data_q[];     };
@@ -46,6 +55,13 @@ layout(binding = 5) readonly  buffer StateBuf { FLOAT_TYPE data_state[]; };
 layout(binding = 6)           buffer DstBuf   { FLOAT_TYPE data_dst[];   };
 layout(binding = 7) readonly  buffer IdxBuf   { int data_idx[];          };
 layout(binding = 8) writeonly buffer SOutBuf  { FLOAT_TYPE data_sout[];  };
+#if GDN_NORM_FUSE
+// binding 11: o (float bits), the norm weight (float bits, copied there by the prep) and the per-head counters
+layout(binding = 9)  readonly  buffer NGBuf   { float data_ng[];  };
+layout(binding = 10) writeonly buffer NYBuf   { float data_ny[];  };
+layout(binding = 11) devicecoherent buffer NOBuf { uint data_no[]; };
+shared uint nf_last;
+#endif
 
 #if !USE_SUBGROUP_ADD && !USE_SUBGROUP_CLUSTERED
 shared FLOAT_TYPE temp[SUBGROUP_SIZE];
@@ -172,7 +188,11 @@ void main() {
         FLOAT_TYPE attn_col = reduce_partial(attn_partial);
 
         if (lane == 0) {
+#if GDN_NORM_FUSE
+            data_no[nf_o_off + attn_off + col] = floatBitsToUint(attn_col * scale);
+#else
             data_dst[attn_off + col] = attn_col * scale;
+#endif
         }
 
         attn_off += S_V * H;
@@ -207,4 +227,36 @@ void main() {
             }
         }
     }
+
+#if GDN_NORM_FUSE
+    // every o of this workgroup is written: count the workgroup; the last one of the head does the gated norm
+    controlBarrier(gl_ScopeWorkgroup, gl_ScopeQueueFamily, gl_StorageSemanticsBuffer | gl_StorageSemanticsShared, gl_SemanticsAcquireRelease);
+    if (gl_LocalInvocationIndex == 0) {
+        const uint prev = atomicAdd(data_no[nf_cnt_off + seq_id * H + head_id], COLS_PER_WG, gl_ScopeQueueFamily,
+                                    gl_StorageSemanticsBuffer, gl_SemanticsAcquireRelease);
+        nf_last = (prev + COLS_PER_WG == S_V) ? 1u : 0u;
+    }
+    controlBarrier(gl_ScopeWorkgroup, gl_ScopeQueueFamily, gl_StorageSemanticsBuffer | gl_StorageSemanticsShared, gl_SemanticsAcquireRelease);
+    if (nf_last != 0u) {
+        const uint lid = gl_LocalInvocationIndex;
+        for (uint t = 0; t < n_tokens; t++) {
+            const uint row = (seq_id * n_tokens + t) * H + head_id;
+            const uint ob  = nf_o_off + row * S_V;
+            FLOAT_TYPE ss = 0.0;
+            for (uint i = lid; i < S_V; i += SUBGROUP_SIZE) {
+                const FLOAT_TYPE x = uintBitsToFloat(data_no[ob + i]);
+                ss += x * x;
+            }
+            ss = subgroupAdd(ss);
+            const FLOAT_TYPE sc = inversesqrt(ss / FLOAT_TYPE(S_V) + FLOAT_TYPE(nf_eps));
+            for (uint i = lid; i < S_V; i += SUBGROUP_SIZE) {
+                data_ny[nf_y_off + row * nf_y_s + i] = float((sc * uintBitsToFloat(data_no[ob + i]) * uintBitsToFloat(data_no[nf_w_off + i])) *
+                                                             FLOAT_TYPE(data_ng[nf_g_off + row * nf_g_s + i]));
+            }
+        }
+        if (lid == 0) {
+            data_no[nf_cnt_off + seq_id * H + head_id] = 0u;   // ready for the next layer
+        }
+    }
+#endif
 }
