@@ -2083,7 +2083,24 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
                 }
                 pos = e + 1;
             }
-            std::sort(cost_pts.begin(), cost_pts.end());
+            // validate: positive token counts and costs, one point per token count (last wins), increasing order
+            std::vector<std::pair<int, double>> v;
+            for (const auto & pt : cost_pts) {
+                if (pt.first <= 0 || !(pt.second > 0.0) || !std::isfinite(pt.second)) {
+                    SPC_WRN("ngram_mod: ignoring cost point %d:%g\n", pt.first, pt.second);
+                    continue;
+                }
+                v.push_back(pt);
+            }
+            std::stable_sort(v.begin(), v.end(), [](const auto & a, const auto & b) { return a.first < b.first; });
+            cost_pts.clear();
+            for (const auto & pt : v) {
+                if (!cost_pts.empty() && cost_pts.back().first == pt.first) {
+                    cost_pts.back() = pt;
+                } else {
+                    cost_pts.push_back(pt);
+                }
+            }
             SPC_INF("ngram_mod: adaptive draft length on, %zu cost points\n", cost_pts.size());
         }
     }
@@ -2171,6 +2188,12 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
         }
         result.resize(result.size() - n);
 
+        // b65 [mtp]: the caller truncates drafts to dparams.n_max; do it here so the policy learns from the real length
+        if (adapt && dparams.n_max > 0 && (int) result.size() > dparams.n_max) {
+            result.resize(dparams.n_max);
+        }
+        // note: the n-gram chain still had to reach n_min to be considered; the policy may then return fewer tokens
+        // (by design: a long match is the evidence, the verify cost decides how much of it to send)
         if (adapt && !result.empty()) {
             const int l = adapt_len(sinfo, (int) result.size());
             if (verbose) {
