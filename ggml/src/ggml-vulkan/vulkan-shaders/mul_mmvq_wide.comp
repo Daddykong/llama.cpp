@@ -14,13 +14,13 @@
 // each k-slice go to slice z of the output (summed by mul_mat_split_k_reduce).
 
 #define BLOCK_SIZE 256
-#define CT 8          // columns per invocation
-#define KCB 8         // q8_1 blocks (32 values each) per staged k-chunk
 
 layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
 
 layout(constant_id = 0) const uint NC = 64;   // column tile (16, 32 or 64)
 layout(constant_id = 1) const uint RT = 4;    // rows per invocation
+layout(constant_id = 2) const uint CT = 8;    // columns per invocation (divides NC)
+layout(constant_id = 3) const uint KCB = 8;   // q8_1 blocks (32 values each) per staged k-chunk
 
 layout (binding = 0) readonly buffer A_R128 {uvec4 data_a_r128[];};
 layout (binding = 0) readonly buffer A_R32 {uint data_a_r32[];};
