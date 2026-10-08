@@ -1326,6 +1326,8 @@ void process_shaders() {
     string_to_spv("sign_score", "sign_score.comp", {});
     string_to_spv("gdn_gates_f16", "gdn_gates.comp", {{"W_F16", "1"}});
     string_to_spv("gdn_gates_f32", "gdn_gates.comp", {});
+    string_to_spv("gdn_prep_f32", "gdn_prep.comp", {});   // b65 fused GDN layer
+    string_to_spv("gdn_normgate_f32", "gdn_normgate.comp", {});   // b65 fused GDN layer
     string_to_spv("mul_mat_masked_q4_0", "mul_mat_masked.comp", {});
     string_to_spv("kv_quest_bound", "kv_quest_bound.comp", {});    // b65 Quest v2
     string_to_spv("kv_quest_select", "kv_quest_select.comp", {});

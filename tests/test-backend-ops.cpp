@@ -4890,6 +4890,144 @@ struct test_gated_delta_net_cache_fusion : public test_case {
     }
 };
 
+// b65: one qwen35 linear-attention layer's decode chain, as the model builds it (conv-state gather + CONCAT +
+// SSM_CONV + SILU + conv-state CPYs per rollback slot, L2 norm q/k, sigmoid beta, softplus gate, GATED_DELTA_NET
+// with the state gather/CPY, gated RMS norm). The Vulkan backend fuses it with GGML_VK_GDN_LAYER_FUSION=1; the CPU
+// runs the unfused graph. Checked: the layer output, every conv-state cache row written, the state cache rows.
+struct test_gdn_layer_fusion : public test_case {
+    const int64_t nk, nv, T, K;
+    const bool merged;   // qkv as a view of a wider (merged qkv|z) projection output
+    std::vector<ggml_tensor *> checked;
+
+    std::string vars() override {
+        return VARS_TO_STR5(nk, nv, T, K, merged);
+    }
+
+    test_gdn_layer_fusion(int64_t nk = 16, int64_t nv = 48, int64_t T = 1, int64_t K = 1, bool merged = false)
+        : nk(nk), nv(nv), T(T), K(K), merged(merged) {}
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "GDN_LAYER_FUSION";
+    }
+
+    bool run_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return checked; }
+
+    double max_nmse_err() override { return getenv("GDNF_TEST_TOL") ? atof(getenv("GDNF_TEST_TOL")) : 1e-6; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        checked.clear();
+        const int64_t S = 128, conv_k = 4;
+        const int64_t conv_dim = S * (2 * nk + nv);
+        const int64_t mem = 2, head = 1;           // cache rows per slot, row of this sequence
+        const int64_t row_r = (conv_k - 1) * conv_dim;
+        const int64_t row_s = S * S * nv;
+
+        // projections (inputs here)
+        ggml_tensor * qkv_mixed;
+        if (merged) {
+            ggml_tensor * qkvz = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, conv_dim + S * nv, T);
+            ggml_set_name(qkvz, "qkvz");
+            qkv_mixed = ggml_view_3d(ctx, qkvz, conv_dim, T, 1, qkvz->nb[1], qkvz->nb[1] * T, 0);
+        } else {
+            qkv_mixed = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, conv_dim, T);
+            ggml_set_name(qkv_mixed, "qkv");
+            qkv_mixed = ggml_reshape_3d(ctx, qkv_mixed, conv_dim, T, 1);
+        }
+        ggml_tensor * z     = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, S * nv, T);
+        ggml_tensor * alpha = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, nv, T);
+        ggml_tensor * braw  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, nv, T);
+        ggml_set_name(z, "z"); ggml_set_name(alpha, "alpha"); ggml_set_name(braw, "braw");
+        // weights
+        ggml_tensor * conv_w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, conv_k, conv_dim);
+        ggml_tensor * dt     = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, nv);
+        ggml_tensor * A      = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, nv);
+        ggml_tensor * norm_w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, S);
+        ggml_set_name(conv_w, "conv_w"); ggml_set_name(dt, "dt"); ggml_set_name(A, "A"); ggml_set_name(norm_w, "norm_w");
+        // caches and the gather index
+        ggml_tensor * cache_r = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, row_r, mem * K);
+        ggml_tensor * cache_s = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, row_s, mem * K);
+        ggml_tensor * idx     = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+        ggml_set_name(cache_r, "cache_r"); ggml_set_name(cache_s, "cache_s"); ggml_set_name(idx, "idx");
+
+        // beta, gate
+        ggml_tensor * beta = ggml_sigmoid(ctx, ggml_reshape_4d(ctx, braw, 1, nv, T, 1));
+        ggml_tensor * a3   = ggml_reshape_3d(ctx, alpha, nv, T, 1);
+        ggml_tensor * gate = ggml_mul(ctx, ggml_softplus(ctx, ggml_add(ctx, a3, dt)), A);
+        gate = ggml_reshape_4d(ctx, gate, 1, nv, T, 1);
+
+        // conv state
+        ggml_tensor * cs = ggml_get_rows(ctx, cache_r, idx);
+        cs = ggml_reshape_3d(ctx, cs, conv_k - 1, conv_dim, 1);
+        ggml_tensor * conv_input = ggml_concat(ctx, cs, ggml_transpose(ctx, qkv_mixed), 0);
+        const size_t row_size = ggml_row_size(cache_r->type, row_r);
+        for (int64_t t = 1; t <= K; ++t) {
+            const int64_t s_idx  = K == 1 ? T : std::max<int64_t>(0, conv_input->ne[0] - (conv_k - 1) - K + t);
+            const int64_t s_slot = K - t;
+            ggml_tensor * last = ggml_view_3d(ctx, conv_input, conv_k - 1, conv_dim, 1, conv_input->nb[1], conv_input->nb[2],
+                                              ggml_row_size(conv_input->type, s_idx));
+            ggml_tensor * dst  = ggml_view_2d(ctx, cache_r, row_r, 1, cache_r->nb[1], (s_slot * mem + head) * row_size);
+            ggml_tensor * c = ggml_cpy(ctx, last, dst);
+            ggml_build_forward_expand(gf, c);   // as the model does: the cache writes are side branches
+            checked.push_back(c);
+        }
+        ggml_tensor * conv = ggml_silu(ctx, ggml_ssm_conv(ctx, conv_input, conv_w));
+        const size_t nb1q = ggml_row_size(conv->type, conv_dim);
+        ggml_tensor * q = ggml_view_4d(ctx, conv, S, nk, T, 1, ggml_row_size(conv->type, S), nb1q, nb1q * T, 0);
+        ggml_tensor * k = ggml_view_4d(ctx, conv, S, nk, T, 1, ggml_row_size(conv->type, S), nb1q, nb1q * T,
+                                       ggml_row_size(conv->type, S * nk));
+        ggml_tensor * v = ggml_view_4d(ctx, conv, S, nv, T, 1, ggml_row_size(conv->type, S), nb1q, nb1q * T,
+                                       ggml_row_size(conv->type, 2 * S * nk));
+        const float eps = 1e-6f;
+        q = ggml_scale(ctx, ggml_rms_norm(ctx, q, eps / S), 1.0f / sqrtf((float)S));
+        k = ggml_scale(ctx, ggml_rms_norm(ctx, k, eps / S), 1.0f / sqrtf((float)S));
+
+        // recurrent state
+        ggml_tensor * st = ggml_get_rows(ctx, cache_s, idx);
+        st = ggml_reshape_4d(ctx, st, S, S, nv, 1);
+        ggml_tensor * gdn = ggml_gated_delta_net(ctx, q, k, v, gate, beta, st, K);
+        ggml_tensor * o = ggml_view_4d(ctx, gdn, S, nv, T, 1, ggml_row_size(gdn->type, S), ggml_row_size(gdn->type, S * nv),
+                                       ggml_row_size(gdn->type, S * nv * T), 0);
+        const int64_t n_written = std::min<int64_t>(T, K);
+        ggml_tensor * ssrc = ggml_view_3d(ctx, gdn, row_s, 1, n_written, ggml_row_size(gdn->type, row_s),
+                                          ggml_row_size(gdn->type, row_s), ggml_row_size(gdn->type, S * nv * T));
+        ggml_tensor * sdst = ggml_view_3d(ctx, cache_s, row_s, 1, n_written, cache_s->nb[1], (size_t)mem * cache_s->nb[1],
+                                          (size_t)head * cache_s->nb[1]);
+        ggml_tensor * scpy = ggml_cpy(ctx, ssrc, sdst);
+        ggml_build_forward_expand(gf, scpy);
+        checked.push_back(scpy);
+
+        // gated norm
+        ggml_tensor * zz = ggml_reshape_4d(ctx, z, S, nv, T, 1);
+        ggml_tensor * out = ggml_mul(ctx, ggml_mul(ctx, ggml_rms_norm(ctx, o, eps), norm_w), ggml_silu(ctx, zz));
+        ggml_set_name(out, "out");
+        checked.insert(checked.begin(), out);
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (ggml_is_view_op(t->op) || t->op != GGML_OP_NONE) { continue; }
+            if (strcmp(t->name, "idx") == 0) {
+                const int32_t v = 1;
+                ggml_backend_tensor_set(t, &v, 0, sizeof(v));
+            } else if (strcmp(t->name, "A") == 0) {
+                init_tensor_uniform(t, -2.0f, -0.1f);
+            } else if (strcmp(t->name, "norm_w") == 0) {
+                init_tensor_uniform(t, 0.5f, 1.5f);
+            } else if (strcmp(t->name, "cache_s") == 0) {
+                init_tensor_uniform(t, -0.3f, 0.3f);
+            } else if (strcmp(t->name, "conv_w") == 0) {
+                init_tensor_uniform(t, -0.5f, 0.5f);
+            } else {
+                init_tensor_uniform(t, -2.0f, 2.0f);
+            }
+        }
+    }
+};
+
+
 // GGML_OP_GATED_LINEAR_ATTN
 struct test_gla : public test_case {
     const ggml_type type;
@@ -11956,6 +12094,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   4, 1, 4));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 8, 32,   4, 2, 4));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   8, 1, 4));
+    // b65 fused GDN layer: the 27B's shapes (16 k heads, 48 v heads), a 0.8B-like shape (16/16), a small one (2/6),
+    // 1-4 tokens, plain (K=1) and the MTP rollback slots (K=3), and the merged qkv|z view
+    for (int64_t T : { 1, 2, 3, 4 }) {
+        for (int64_t K : { 1, 3 }) {
+            test_cases.emplace_back(new test_gdn_layer_fusion(16, 48, T, K, false));
+            test_cases.emplace_back(new test_gdn_layer_fusion(16, 16, T, K, false));
+            test_cases.emplace_back(new test_gdn_layer_fusion(2, 6, T, K, false));
+        }
+        test_cases.emplace_back(new test_gdn_layer_fusion(16, 48, T, 3, true));
+    }
 
 #if 0
     // these tests are disabled to save execution time, sbut they can be handy for debugging

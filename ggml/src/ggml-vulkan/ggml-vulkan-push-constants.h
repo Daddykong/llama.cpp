@@ -796,6 +796,26 @@ struct vk_op_ssm_scan_push_constants {
     uint32_t n_seq, K;
 };
 
+struct vk_op_gdn_prep_push_constants {   // b65 fused GDN layer (gdn_prep.comp)
+    uint32_t nk, nv, T;
+    uint32_t qkv_off, qkv_s1;
+    uint32_t cs_off, cs_row, idx_off;
+    uint32_t n_slots;
+    uint32_t slot_off[4];
+    uint32_t slot_sidx[4];
+    uint32_t w_off;
+    uint32_t a_off, a_s1, b_off, b_s1;
+    uint32_t dt_off, A_off;
+    float eps, qk_scale;
+    uint32_t out_q, out_k, out_v, out_g, out_b;
+};
+
+struct vk_op_gdn_normgate_push_constants {   // b65 fused GDN layer (gdn_normgate.comp)
+    uint32_t o_off, g_off, w_off, d_off;
+    uint32_t o_s, g_s, d_s;
+    float eps;
+};
+
 struct vk_op_gdn_gates_push_constants {   // b65
     uint32_t E; uint32_t H; uint32_t T; uint32_t x_row; uint32_t w_row; uint32_t d_tok; uint32_t d_half;
     uint32_t x_off; uint32_t wb_off; uint32_t wa_off; uint32_t dt_off; uint32_t a_off; uint32_t d_off;

@@ -1,0 +1,139 @@
+#version 450
+
+// b65 fused GDN-layer decode, part 1 of 3 ("prep"): everything between the linear-attention input projections
+// and the delta rule, for 1-8 tokens of one sequence, in one dispatch:
+//   conv-state gather (cache row picked by the index) + CONCAT with the new qkv columns + SSM_CONV + SILU,
+//   the conv-state cache writes (one per rollback slot), L2 norm of q and k (RMS_NORM(eps/n) + SCALE(1/sqrt(n))),
+//   beta = sigmoid(beta_raw), gate = softplus(alpha_raw + dt) * A.
+// q, k, v, gate and beta go to a private scratch buffer that the GATED_DELTA_NET dispatch then reads.
+// One workgroup per 128-channel chunk (q heads, k heads, v heads); one lane per channel, so every conv-state
+// element is read and written by the same lane (in-place cache update is race free).
+
+#extension GL_EXT_control_flow_attributes : require
+
+#define S 128
+#define MAX_T 8
+
+layout(local_size_x = S, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Parameters {
+    uint nk;          // q/k heads
+    uint nv;          // v heads (= gate/beta heads)
+    uint T;           // tokens (1..MAX_T)
+    uint qkv_off;     // element offset of qkv (channel-contiguous, token stride qkv_s1)
+    uint qkv_s1;
+    uint cs_off;      // element offset of the conv cache binding base
+    uint cs_row;      // elements per cache row (3 * channels)
+    uint idx_off;     // element offset of the gather index
+    uint n_slots;     // conv-state writes (1..4)
+    uint slot_off0, slot_off1, slot_off2, slot_off3;     // element offsets of each written cache row
+    uint slot_sidx0, slot_sidx1, slot_sidx2, slot_sidx3; // first conv_input column copied into that row
+    uint w_off;
+    uint a_off, a_s1; // alpha raw [nv, T]
+    uint b_off, b_s1; // beta raw [nv, T]
+    uint dt_off, A_off;
+    float eps;        // RMS_NORM eps (already eps/n)
+    float qk_scale;   // SCALE after the norm
+    uint out_q, out_k, out_v, out_g, out_b;  // element offsets in the scratch buffer
+};
+
+layout(binding = 0) readonly  buffer QKV   { float data_qkv[];   };
+layout(binding = 1)           buffer CS    { float data_cs[];    };
+layout(binding = 2) readonly  buffer IDX   { int   data_idx[];   };
+layout(binding = 3) readonly  buffer CW    { float data_cw[];    };
+layout(binding = 4) readonly  buffer AR    { float data_ar[];    };
+layout(binding = 5) readonly  buffer BR    { float data_br[];    };
+layout(binding = 6) readonly  buffer DT    { float data_dt[];    };
+layout(binding = 7) readonly  buffer AA    { float data_aa[];    };
+layout(binding = 8) writeonly buffer OUT   { float data_out[];   };
+
+shared float red[S];
+
+float block_sum(float v) {
+    const uint lid = gl_LocalInvocationID.x;
+    red[lid] = v;
+    barrier();
+    [[unroll]] for (uint s = S / 2; s > 0; s >>= 1) {
+        if (lid < s) {
+            red[lid] += red[lid + s];
+        }
+        barrier();
+    }
+    const float r = red[0];
+    barrier();
+    return r;
+}
+
+float conv_in(const float st[3], const float x[MAX_T], uint j) {
+    // conv_input column j: the 3 cached columns, then the new tokens
+    float r = st[0];
+    [[unroll]] for (uint i = 1; i < 3; i++) { if (j == i) r = st[i]; }
+    [[unroll]] for (uint i = 0; i < MAX_T; i++) { if (j == 3 + i) r = x[i]; }
+    return r;
+}
+
+void main() {
+    const uint ch  = gl_WorkGroupID.x;          // 128-channel chunk: [0, nk) q, [nk, 2nk) k, [2nk, 2nk+nv) v
+    const uint lid = gl_LocalInvocationID.x;
+    const uint c   = ch * S + lid;             // channel
+
+    // conv state of this channel (gathered row) and the new inputs
+    const uint rin = cs_off + uint(data_idx[idx_off]) * cs_row + c * 3;
+    float st[3];
+    [[unroll]] for (uint j = 0; j < 3; j++) {
+        st[j] = data_cs[rin + j];
+    }
+    float x[MAX_T];
+    [[unroll]] for (uint t = 0; t < MAX_T; t++) {
+        x[t] = t < T ? data_qkv[qkv_off + t * qkv_s1 + c] : 0.0f;
+    }
+
+    const vec4 w = vec4(data_cw[w_off + c * 4 + 0], data_cw[w_off + c * 4 + 1], data_cw[w_off + c * 4 + 2], data_cw[w_off + c * 4 + 3]);
+    float y[MAX_T];
+    [[unroll]] for (uint t = 0; t < MAX_T; t++) {
+        const vec4 in4 = vec4(conv_in(st, x, t), conv_in(st, x, t + 1), conv_in(st, x, t + 2), conv_in(st, x, t + 3));
+        const float s = dot(in4, w);
+        y[t] = s / (1.0f + exp(-s));
+    }
+
+    // conv-state cache writes (all reads of this channel are done above)
+    [[unroll]] for (uint k = 0; k < 4; k++) {
+        if (k < n_slots) {
+            const uint off  = k == 0 ? slot_off0  : k == 1 ? slot_off1  : k == 2 ? slot_off2  : slot_off3;
+            const uint sidx = k == 0 ? slot_sidx0 : k == 1 ? slot_sidx1 : k == 2 ? slot_sidx2 : slot_sidx3;
+            [[unroll]] for (uint j = 0; j < 3; j++) {
+                data_cs[cs_off + off + c * 3 + j] = conv_in(st, x, sidx + j);
+            }
+        }
+    }
+
+    if (ch < 2 * nk) {
+        // q or k head: L2 norm per token as RMS_NORM(eps/n) then SCALE(1/sqrt(n))
+        const bool is_q = ch < nk;
+        const uint head = is_q ? ch : ch - nk;
+        const uint base = (is_q ? out_q : out_k) + head * S + lid;
+        [[unroll]] for (uint t = 0; t < MAX_T; t++) {
+            if (t < T) {   // uniform across the workgroup
+                const float sum   = block_sum(y[t] * y[t]);
+                const float mean  = sum / float(S);
+                const float scale = inversesqrt(mean + eps);
+                data_out[base + t * nk * S] = (scale * y[t]) * qk_scale;
+            }
+        }
+    } else {
+        const uint h = ch - 2 * nk;
+        [[unroll]] for (uint t = 0; t < MAX_T; t++) {
+            if (t < T) {
+                data_out[out_v + t * nv * S + h * S + lid] = y[t];
+            }
+        }
+        if (lid < T) {
+            const uint t = lid;
+            const float br = data_br[b_off + t * b_s1 + h];
+            data_out[out_b + t * nv + h] = 1.0f / (1.0f + exp(-br));
+            const float ax = data_ar[a_off + t * a_s1 + h] + data_dt[dt_off + h];
+            const float sp = (ax > 20.0f) ? ax : log(1.0f + exp(ax));
+            data_out[out_g + t * nv + h] = sp * data_aa[A_off + h];
+        }
+    }
+}

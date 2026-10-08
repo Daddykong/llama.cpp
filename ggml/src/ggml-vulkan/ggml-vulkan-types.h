@@ -1062,6 +1062,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_kv_quest_bound[8][4], pipeline_kv_quest_select, pipeline_kv_quest_apply; // b65 Quest v2
     vk_pipeline pipeline_sign_score, pipeline_mul_mat_masked_q4_0; // b65 sparse gate/up
     vk_pipeline pipeline_gdn_gates_f16, pipeline_gdn_gates_f32; // b65 GDN gates
+    vk_pipeline pipeline_gdn_prep_f32, pipeline_gdn_normgate_f32; // b65 fused GDN layer (prep + norm-gate)
     vk_pipeline pipeline_soft_max_stats, pipeline_soft_max_stats_f16; // b65 softmax folded into V x P
     vk_pipeline pipeline_gated_delta_net_chunk; // b65
     vk_pipeline pipeline_ssm_conv_silu_f32;
@@ -1341,6 +1342,30 @@ class vk_perf_logger {
     uint32_t print_count {};
 };
 
+// b65 fused GDN layer: one linear-attention layer's decode chain, as matched in the graph
+struct vk_gdnf_plan {
+    int gdn = -1;                         // GATED_DELTA_NET node (the prep and the GDN are emitted here)
+    int mul = -1;                         // final MUL of the gated norm (the norm-gate is emitted here), -1: not fused
+    const ggml_tensor * qkv = nullptr;    // [conv_dim, T] channel-contiguous projection output (view base for strides)
+    const ggml_tensor * cs = nullptr;     // conv-state cache (gather source), 2D [row, rows]
+    const ggml_tensor * idx = nullptr;    // gather index (I32, 1 element)
+    const ggml_tensor * cw = nullptr;     // conv kernel [4, conv_dim]
+    const ggml_tensor * ar = nullptr;     // alpha raw [nv, T]
+    const ggml_tensor * br = nullptr;     // beta raw [nv, T]
+    const ggml_tensor * dt = nullptr;     // [nv]
+    const ggml_tensor * A = nullptr;      // [nv]
+    int n_slots = 0;
+    const ggml_tensor * slot_dst[4] = {}; // conv-state CPY destinations
+    uint32_t slot_sidx[4] = {};           // first conv_input column copied into that destination
+    float eps = 0.0f, qk_scale = 1.0f;
+    uint32_t nk = 0, nv = 0, T = 0;
+    // norm-gate
+    const ggml_tensor * o = nullptr;      // GDN output view feeding the RMS_NORM
+    const ggml_tensor * nw = nullptr;     // norm weight [128]
+    const ggml_tensor * gz = nullptr;     // silu(z)
+    float norm_eps = 0.0f;
+};
+
 struct ggml_backend_vk_context {
     std::string name;
 
@@ -1379,6 +1404,15 @@ struct ggml_backend_vk_context {
     std::vector<int32_t> gdn_fuse_gather;
     std::vector<int32_t> gdn_fuse_cpy;
     uint64_t gdn_plan_fp = 0;
+    // b65 fused GDN layer (GGML_VK_GDN_LAYER_FUSION): plans found for this graph, and per node the plan whose prep
+    // (at the GDN node) or norm-gate (at the final MUL node) is emitted there (-1 if none)
+    std::vector<struct vk_gdnf_plan> gdnf_plans;
+    std::vector<int32_t> gdnf_at_gdn;
+    std::vector<int32_t> gdnf_at_mul;
+    std::vector<uint8_t> gdnf_skip_mark;
+    struct gdnf_cache_entry { std::vector<vk_gdnf_plan> plans; std::vector<int32_t> at_gdn, at_mul, skips; };
+    std::unordered_map<uint64_t, gdnf_cache_entry> gdnf_cache;
+    vk_buffer gdnf_scratch;
     std::vector<const ggml_tensor *> unsynced_nodes_read;
     // Track which prealloc buffers have pending reads that need to be synchronized.
     // These are checked before writing to the buffer (and call ggml_vk_sync_buffers if set),

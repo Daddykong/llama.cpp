@@ -1,0 +1,42 @@
+#version 450
+
+// b65 fused GDN-layer decode, part 3 of 3: the gated output norm, RMS_NORM(o) * w * silu(z), in one dispatch
+// (replaces RMS_NORM + MUL(w) + MUL(silu_z)). One workgroup per 128-element row (head x token).
+
+#extension GL_EXT_control_flow_attributes : require
+
+#define S 128
+
+layout(local_size_x = S, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Parameters {
+    uint o_off, g_off, w_off, d_off;   // element offsets
+    uint o_s, g_s, d_s;                // row strides (elements)
+    float eps;
+};
+
+layout(binding = 0) readonly  buffer O { float data_o[]; };
+layout(binding = 1) readonly  buffer G { float data_g[]; };
+layout(binding = 2) readonly  buffer W { float data_w[]; };
+layout(binding = 3) writeonly buffer D { float data_d[]; };
+
+shared float red[S];
+
+void main() {
+    const uint row = gl_WorkGroupID.x;
+    const uint lid = gl_LocalInvocationID.x;
+
+    const float x = data_o[o_off + row * o_s + lid];
+    red[lid] = x * x;
+    barrier();
+    [[unroll]] for (uint s = S / 2; s > 0; s >>= 1) {
+        if (lid < s) {
+            red[lid] += red[lid + s];
+        }
+        barrier();
+    }
+    const float mean  = red[0] / float(S);
+    const float scale = inversesqrt(mean + eps);
+    const float v = (scale * x * data_w[w_off + lid]) * data_g[g_off + row * g_s + lid];
+    data_d[d_off + row * d_s + lid] = v;
+}
