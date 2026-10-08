@@ -8811,13 +8811,14 @@ void ggml_compute_forward_mul_mat_sparse_t(
     }
 }
 
-// b65 Quest: grow-only per-block key min/max (single thread; tiny)
+// b65 Quest: grow-only per-block key min/max (single thread; tiny); with reset, a key on a block's first cell restarts it
 void ggml_compute_forward_kv_block_minmax(const ggml_compute_params * params, ggml_tensor * dst) {
     if (params->ith != 0) return;
     const ggml_tensor * kmm = dst->src[0];
     const ggml_tensor * k   = dst->src[1];
     const ggml_tensor * idx = dst->src[2];
     const int B = ggml_get_op_params_i32(dst, 0);
+    const bool reset = ggml_get_op_params_i32(dst, 1) != 0;
     const int64_t E = k->ne[0], T = k->ne[1];
     for (int64_t t = 0; t < T; ++t) {
         const int64_t cell = ((const int64_t *) idx->data)[t];
@@ -8825,37 +8826,49 @@ void ggml_compute_forward_kv_block_minmax(const ggml_compute_params * params, gg
         float * mn = (float *) ((char *) kmm->data + b * kmm->nb[1]);
         float * mx = mn + E;
         const float * kr = (const float *) ((const char *) k->data + t * k->nb[1]);
-        for (int64_t d = 0; d < E; ++d) { mn[d] = std::min(mn[d], kr[d]); mx[d] = std::max(mx[d], kr[d]); }
+        if (reset && cell % B == 0) {
+            for (int64_t d = 0; d < E; ++d) { mn[d] = kr[d]; mx[d] = kr[d]; }
+        } else {
+            for (int64_t d = 0; d < E; ++d) { mn[d] = std::min(mn[d], kr[d]); mx[d] = std::max(mx[d], kr[d]); }
+        }
     }
 }
 
-// b65 Quest: per-(token, KV head) block bounds -> selected-block mask for that head's query heads
+// b65 Quest: order-preserving key of a float bound (-0 counts as +0), larger = better
+static inline uint32_t quest_ord(float f) {
+    uint32_t u;
+    memcpy(&u, &f, sizeof(u));
+    if (u == 0x80000000u) u = 0u;
+    return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+}
+
+// b65 Quest: per-(token, KV head) block bounds -> selected-block bitmap (see ggml_kv_quest_mask)
 void ggml_compute_forward_kv_quest_mask(const ggml_compute_params * params, ggml_tensor * dst) {
     const ggml_tensor * q    = dst->src[0];
     const ggml_tensor * kmm  = dst->src[1];
     const ggml_tensor * mask = dst->src[2];
     const int NHKV = ggml_get_op_params_i32(dst, 0), B = ggml_get_op_params_i32(dst, 1);
     const int budget = ggml_get_op_params_i32(dst, 2), sink = ggml_get_op_params_i32(dst, 3), recent = ggml_get_op_params_i32(dst, 4);
-    const int64_t D = q->ne[0], NH = q->ne[1], T = q->ne[2], NKV = mask->ne[0], MT = mask->ne[1];
+    const int64_t D = q->ne[0], NH = q->ne[1], T = q->ne[2], NKV = mask->ne[0];
     const int64_t G = NH / NHKV, E = D * NHKV;
-    const int64_t NB = (NKV + B - 1) / B;
-    std::vector<float> bound(NB);
+    const int64_t NB = (NKV + B - 1) / B, NW = (NB + 31) / 32;
+    std::vector<char> live(NB), sel(NB);
     std::vector<int> order;
-    std::vector<char> sel(NB);
-    for (int64_t job = params->ith; job < MT * NHKV; job += params->nth) {
+    for (int64_t job = params->ith; job < T * NHKV; job += params->nth) {
         const int64_t t = job / NHKV, g = job % NHKV;
         const float * mrow = (const float *) ((const char *) mask->data + t * mask->nb[1]);
-        if (t >= T) {
-            for (int64_t h = g * G; h < (g + 1) * G; ++h) {
-                float * out = (float *) ((char *) dst->data + t * dst->nb[1] + h * dst->nb[2]);
-                memcpy(out, mrow, NKV * sizeof(float));
+        uint32_t * out = (uint32_t *) ((char *) dst->data + t * dst->nb[2] + g * dst->nb[1]);
+        float * bnd = (float *) (out + NW);
+        int64_t nb_live = 0;
+        for (int64_t b = 0; b < NB; ++b) {
+            live[b] = 0;
+            for (int64_t j = b * B; j < std::min<int64_t>((b + 1) * B, NKV); ++j) {
+                if (mrow[j] != -INFINITY) { live[b] = 1; break; }
             }
-            continue;
+            if (live[b]) nb_live = b + 1;
         }
-        int64_t last = -1;
-        for (int64_t j = NKV - 1; j >= 0; --j) if (mrow[j] > -INFINITY) { last = j; break; }
-        const int64_t nb_live = last < 0 ? 0 : last / B + 1;
-        for (int64_t b = 0; b < nb_live; ++b) {
+        for (int64_t b = 0; b < NB; ++b) {
+            if (!live[b]) { bnd[b] = -INFINITY; continue; }
             const float * mn = (const float *) ((const char *) kmm->data + b * kmm->nb[1]) + g * D;
             const float * mx = mn + E;
             float best = -INFINITY;
@@ -8865,23 +8878,46 @@ void ggml_compute_forward_kv_quest_mask(const ggml_compute_params * params, ggml
                 for (int64_t d = 0; d < D; ++d) s += std::max(qr[d] * mn[d], qr[d] * mx[d]);
                 best = std::max(best, s);
             }
-            bound[b] = best;
+            bnd[b] = best;
         }
-        int64_t used = 0;
-        std::fill(sel.begin(), sel.end(), 0);
-        for (int64_t b = 0; b < nb_live; ++b) {
-            if (b * B < sink || b >= nb_live - recent) { sel[b] = 1; used += B; }
-        }
+        int64_t n_forced = 0;
         order.clear();
-        for (int64_t b = 0; b < nb_live; ++b) if (!sel[b]) order.push_back((int) b);
-        std::sort(order.begin(), order.end(), [&](int a, int c) { return bound[a] > bound[c] || (bound[a] == bound[c] && a < c); });
-        for (int b : order) { if (used + B > budget) break; sel[b] = 1; used += B; }
-        for (int64_t h = g * G; h < (g + 1) * G; ++h) {
-            float * out = (float *) ((char *) dst->data + t * dst->nb[1] + h * dst->nb[2]);
-            for (int64_t j = 0; j < NKV; ++j) {
-                const int64_t b = j / B;
-                out[j] = (b < nb_live && !sel[b]) ? -INFINITY : mrow[j];
-            }
+        for (int64_t b = 0; b < NB; ++b) {
+            sel[b] = live[b] && (b * B < sink || b >= nb_live - recent);
+            if (sel[b]) n_forced++;
+            else if (live[b]) order.push_back((int) b);
+        }
+        const int64_t k_free = std::max<int64_t>(0, budget / B - n_forced);
+        if ((int64_t) order.size() > k_free) {
+            std::sort(order.begin(), order.end(), [&](int a, int c) {
+                const uint32_t ka = quest_ord(bnd[a]), kc = quest_ord(bnd[c]);
+                return ka > kc || (ka == kc && a < c);
+            });
+            order.resize(k_free);
+        }
+        for (int b : order) sel[b] = 1;
+        for (int64_t w = 0; w < NW; ++w) {
+            uint32_t word = 0;
+            for (int64_t i = 0; i < 32 && w * 32 + i < NB; ++i) if (sel[w * 32 + i]) word |= 1u << i;
+            out[w] = word;
+        }
+    }
+}
+
+// b65 Quest: kq[j, t, h] = -inf where block j/B is not selected for (t, KV head of h)
+void ggml_compute_forward_kv_quest_apply(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * kq  = dst->src[0];
+    const ggml_tensor * sel = dst->src[1];
+    const int B = ggml_get_op_params_i32(dst, 0);
+    const int64_t NKV = kq->ne[0], T = kq->ne[1], NH = kq->ne[2], NHKV = sel->ne[1];
+    const int64_t G = NH / NHKV;
+    for (int64_t r = params->ith; r < T * NH; r += params->nth) {
+        const int64_t t = r % T, h = r / T;
+        const uint32_t * bits = (const uint32_t *) ((const char *) sel->data + t * sel->nb[2] + (h / G) * sel->nb[1]);
+        float * row = (float *) ((char *) dst->data + t * dst->nb[1] + h * dst->nb[2]);
+        for (int64_t j = 0; j < NKV; ++j) {
+            const int64_t b = j / B;
+            if (!((bits[b / 32] >> (b % 32)) & 1u)) row[j] = -INFINITY;
         }
     }
 }

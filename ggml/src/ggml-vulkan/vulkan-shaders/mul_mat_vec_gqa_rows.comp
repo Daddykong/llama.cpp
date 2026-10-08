@@ -29,7 +29,23 @@ layout (push_constant) uniform parameter
     uint a_offset;
     uint b_offset;
     uint d_offset;
+    uint mask_offset;       // b65 Quest v2 (flags & 4): selection bitmap at binding 3, word offset
+    uint mask_tok_stride;   // words per token
+    uint mask_head_stride;  // words per A channel (KV head)
+    uint flags;
+    uint qblock;            // cells per bit
 } p;
+
+layout (binding = 3) readonly buffer QBM {uint data_qbm[];};   // b65 Quest v2 (aliases Fuse0)
+
+// bit t of the result: token t keeps block blk of A channel h
+uint quest_bits(const uint h, const uint blk) {
+    uint m = 0;
+    [[unroll]] for (uint t = 0; t < NTOK; ++t) {
+        m |= ((data_qbm[p.mask_offset + t * p.mask_tok_stride + h * p.mask_head_stride + blk / 32] >> (blk % 32)) & 1u) << t;
+    }
+    return m;
+}
 
 void main() {
     const uint row0 = gl_WorkGroupID.x * 64 * R + gl_LocalInvocationID.x;
@@ -53,7 +69,20 @@ void main() {
     const uint b_cs   = p.b_chan_stride / 4;
     const uint b_ts   = p.b_tok_stride / 4;
 
-    for (uint k4 = 0; k4 < p.ncols / 4; ++k4) {
+    // b65 Quest v2 (K x Q): rows of unselected blocks are not read; their outputs are -inf
+    const bool qsk = (p.flags & 4u) != 0u;
+    uint qsel[R];
+    bool qany = !qsk;
+    [[unroll]] for (uint r = 0; r < R; ++r) {
+        qsel[r] = (1u << NTOK) - 1u;
+        if (qsk) {
+            const uint row = row0 + r * 64;
+            qsel[r] = row < p.nrows ? quest_bits(h, row / p.qblock) : 0u;
+            qany = qany || qsel[r] != 0u;
+        }
+    }
+
+    for (uint k4 = 0; qany && k4 < p.ncols / 4; ++k4) {
         vec4 av[R];
         [[unroll]] for (uint r = 0; r < R; ++r) {
             av[r] = vec4(data_a_v4[a_base[r] + k4]);
@@ -73,7 +102,8 @@ void main() {
         if (row < p.nrows) {
             [[unroll]] for (uint t = 0; t < NTOK; ++t) {
                 [[unroll]] for (uint c = 0; c < GQA; ++c) {
-                    data_d[p.d_offset + (h * GQA + c) * p.d_chan_stride + t * p.d_tok_stride + row] = acc[(r * NTOK + t) * GQA + c];
+                    data_d[p.d_offset + (h * GQA + c) * p.d_chan_stride + t * p.d_tok_stride + row] =
+                        ((qsel[r] >> t) & 1u) != 0u ? acc[(r * NTOK + t) * GQA + c] : uintBitsToFloat(0xFF800000u);
                 }
             }
         }

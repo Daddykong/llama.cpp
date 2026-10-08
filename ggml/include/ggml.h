@@ -606,6 +606,7 @@ extern "C" {
         GGML_OP_SIGN_SCORE,
         GGML_OP_MUL_MAT_MASKED,
         GGML_OP_GDN_GATES,
+        GGML_OP_KV_QUEST_APPLY,
 
         GGML_OP_COUNT,
     };
@@ -2480,6 +2481,8 @@ extern "C" {
             int                   n_chunks);
 
     // b65: Quest-style KV block selection (see ggml.c)
+    // kmm: [2*E, n_blocks] f32 per-block key min (first E) / max (last E), E = head_dim * n_head_kv.
+    // reset != 0: a key landing on the first cell of a block restarts that block's min/max (cells fill blocks in order)
     GGML_API struct ggml_tensor * ggml_kv_block_minmax(
             struct ggml_context * ctx,
             struct ggml_tensor  * kmm,
@@ -2488,6 +2491,21 @@ extern "C" {
             struct ggml_tensor  * after,
             int                   block);
 
+    GGML_API struct ggml_tensor * ggml_kv_block_minmax_ext(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * kmm,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * idx,
+            struct ggml_tensor  * after,
+            int                   block,
+            int                   reset);
+
+    // selected-block bitmap, one per (token, KV head): I32 [n_words + n_blocks, n_head_kv, n_tokens], n_blocks =
+    // ceil(mask->ne[0] / block), n_words = ceil(n_blocks / 32); bit b of word w = block 32*w + b is kept. The
+    // n_blocks words after the bitmap are scratch (the per-block bounds). Kept: live blocks (any cell of the mask row
+    // not -inf) that are sink blocks (start < sink), one of the last `recent` live blocks, or among the best
+    // floor(budget/block) - n_forced others by bound = max over the KV head's query heads of sum_d max(q*min, q*max)
+    // (ties: lower block first)
     GGML_API struct ggml_tensor * ggml_kv_quest_mask(
             struct ggml_context * ctx,
             struct ggml_tensor  * q,
@@ -2498,6 +2516,14 @@ extern "C" {
             int                   budget,
             int                   sink,
             int                   recent);
+
+    // in place: kq [n_kv, n_tokens, n_head] = -inf where the block of the KV head of the column is not selected
+    // (the Vulkan K x Q kernel does this itself and skips those K rows; the V x P kernels skip the V rows)
+    GGML_API struct ggml_tensor * ggml_kv_quest_apply(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * kq,
+            struct ggml_tensor  * sel,
+            int                   block);
 
     // b65: sparse gate/up (sign-sketch predictor + masked matvec)
     GGML_API struct ggml_tensor * ggml_sign_score(

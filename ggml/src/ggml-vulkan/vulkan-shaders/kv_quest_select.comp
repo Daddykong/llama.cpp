@@ -1,0 +1,126 @@
+#version 450
+// b65 Quest v2, pass 2 of 2: one workgroup per (KV head g, token t). Keeps live sink blocks, the last RECENT live
+// blocks and the best floor(budget/B) - n_forced other live blocks (key = order-preserving bits of the bound, ties:
+// lower block first), found by a 4 x 8-bit radix select (no bisection); writes the NW bitmap words of the row.
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+layout(binding = 0) buffer DST { uint data_d[]; };
+layout(push_constant) uniform PC { uint NB; uint NW; uint ROW; uint NHKV; uint B; uint budget; uint sink; uint recent; uint d_off; } p;
+shared uint s_red[64];
+shared uint s_hist[256];
+shared uint s_res[3];
+#define DEAD 0x007FFFFFu   // key of -inf
+
+uint qkey(uint u) { if (u == 0x80000000u) u = 0u; return (u & 0x80000000u) != 0u ? ~u : (u | 0x80000000u); }
+
+// inclusive workgroup scan; total over the workgroup in tot
+uint wg_scan(uint v, out uint tot) {
+    const uint s = subgroupInclusiveAdd(v);
+    const uint a = subgroupAdd(v);
+    barrier();
+    if (gl_SubgroupInvocationID == 0) s_red[gl_SubgroupID] = a;
+    barrier();
+    uint off = 0, all = 0;
+    for (uint i = 0; i < gl_NumSubgroups; ++i) { const uint x = s_red[i]; if (i < gl_SubgroupID) off += x; all += x; }
+    tot = all;
+    return s + off;
+}
+uint wg_max(uint v) {
+    v = subgroupMax(v);
+    barrier();
+    if (gl_SubgroupInvocationID == 0) s_red[gl_SubgroupID] = v;
+    barrier();
+    uint m = 0;
+    for (uint i = 0; i < gl_NumSubgroups; ++i) m = max(m, s_red[i]);
+    return m;
+}
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint g = gl_WorkGroupID.x, t = gl_WorkGroupID.y;
+    const uint row = p.d_off + (t * p.NHKV + g) * p.ROW;
+    const uint bnd = row + p.NW;
+
+    uint lb = 0;
+    for (uint b = tid; b < p.NB; b += 256) if (qkey(data_d[bnd + b]) != DEAD) lb = max(lb, b + 1);
+    const uint nb_live = wg_max(lb);
+
+    uint nf = 0, nc = 0;
+    for (uint b = tid; b < nb_live; b += 256) {
+        if (qkey(data_d[bnd + b]) == DEAD) continue;
+        if (b * p.B < p.sink || b + p.recent >= nb_live) nf++; else nc++;
+    }
+    uint tot;
+    wg_scan(nf, tot); const uint n_forced = tot;
+    wg_scan(nc, tot); const uint n_cand = tot;
+    const uint kmax = p.budget / p.B;
+    const uint kfree = kmax > n_forced ? kmax - n_forced : 0u;
+
+    const bool all = n_cand <= kfree;
+    uint prefix = 0xFFFFFFFFu, pmask = 0xFFFFFFFFu, need = 0;
+    bool eq_all = false;
+    if (!all && kfree > 0) {
+        prefix = 0; pmask = 0; need = kfree;
+        [[unroll]] for (uint pass = 0; pass < 4; ++pass) {
+            const uint shift = 24 - 8 * pass;
+            s_hist[tid] = 0;
+            barrier();
+            for (uint b = tid; b < nb_live; b += 256) {
+                const uint u = qkey(data_d[bnd + b]);
+                if (u == DEAD || b * p.B < p.sink || b + p.recent >= nb_live) continue;
+                if ((u & pmask) == prefix) atomicAdd(s_hist[(u >> shift) & 255u], 1u);
+            }
+            barrier();
+            const uint c = s_hist[255 - tid];
+            const uint incl = wg_scan(c, tot);
+            if (incl >= need && incl - c < need) { s_res[0] = 255 - tid; s_res[1] = incl - c; s_res[2] = c; }
+            barrier();
+            const uint digit = s_res[0], above = s_res[1], cnt = s_res[2];
+            barrier();
+            prefix |= digit << shift;
+            pmask  |= 0xFFu << shift;
+            need   -= above;
+            if (cnt == need) { eq_all = true; break; }
+        }
+    }
+
+    uint carry = 0;
+    for (uint w0 = 0; w0 < p.NW; w0 += 256) {
+        const uint w = w0 + tid;
+        uint nties = 0;
+        if (w < p.NW && !all && !eq_all) {
+            for (uint i = 0; i < 32; ++i) {
+                const uint b = w * 32 + i;
+                if (b >= nb_live) break;
+                const uint u = qkey(data_d[bnd + b]);
+                if (u == DEAD || b * p.B < p.sink || b + p.recent >= nb_live) continue;
+                if ((u & pmask) == prefix) nties++;
+            }
+        }
+        uint rank = wg_scan(nties, tot) - nties + carry;
+        carry += tot;
+        if (w < p.NW) {
+            uint word = 0;
+            for (uint i = 0; i < 32; ++i) {
+                const uint b = w * 32 + i;
+                if (b >= nb_live) break;
+                const uint u = qkey(data_d[bnd + b]);
+                if (u == DEAD) continue;
+                bool keep = b * p.B < p.sink || b + p.recent >= nb_live;
+                if (!keep && (all || kfree > 0)) {
+                    const uint m = u & pmask;
+                    if (all || m > prefix) {
+                        keep = true;
+                    } else if (m == prefix) {
+                        keep = eq_all || rank < need;
+                        rank++;
+                    }
+                }
+                if (keep) word |= 1u << i;
+            }
+            data_d[row + w] = word;
+        }
+    }
+}

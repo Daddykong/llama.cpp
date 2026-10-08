@@ -85,6 +85,7 @@ void ggml_compute_forward_argsort(const struct ggml_compute_params * params, str
 void ggml_compute_forward_mul_mat_sparse_t(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_kv_block_minmax(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_kv_quest_mask(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+void ggml_compute_forward_kv_quest_apply(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_sign_score(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_mul_mat_masked(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_gdn_gates(const struct ggml_compute_params * params, struct ggml_tensor * dst);

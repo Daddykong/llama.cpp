@@ -58,6 +58,10 @@ struct vk_mat_vec_vxp_push_constants {
     uint32_t b_offset;
     uint32_t slice;
     uint32_t nchan_b;
+    uint32_t bm_offset;   // b65 Quest v2 bitmap (binding 3): word offset, token / KV-head strides, cells per bit
+    uint32_t bm_tok;
+    uint32_t bm_head;
+    uint32_t qblock;      // 0 = no bitmap
 };
 struct vk_mat_vec_vxp_reduce_push_constants {
     uint32_t nrows;
@@ -84,7 +88,9 @@ struct vk_mat_vec_gqa_push_constants {
     uint32_t mask_offset;       // b65: element offset of the mask (binding 3)
     uint32_t mask_tok_stride;
     uint32_t mask_head_stride;  // 0 = one mask for all heads
-    uint32_t flags;             // 1 = rows: skip fully masked rows, 2 = split: skip zero-probability positions
+    uint32_t flags;             // 1 = rows: skip fully masked rows, 2 = split: skip zero-probability positions,
+                                // 4 = b65 Quest v2 bitmap at binding 3 (mask_* = word offset / token / KV-head strides)
+    uint32_t qblock;            // b65 Quest v2: cells per bitmap bit
 };
 
 // b65 [mtp]: split-k V x softmax(KQ) (mul_mat_vec_gqa_splitk.comp)
@@ -803,12 +809,17 @@ struct vk_op_mm_masked_push_constants {   // b65
     uint32_t a_off; uint32_t x_off; uint32_t s_off; uint32_t d_off; float thr;
 };
 struct vk_op_kv_minmax_push_constants {   // b65 Quest
-    uint32_t E; uint32_t T; uint32_t B; uint32_t kmm_row; uint32_t k_row; uint32_t kmm_off; uint32_t k_off; uint32_t idx_off;
+    uint32_t E; uint32_t T; uint32_t B; uint32_t kmm_row; uint32_t k_row; uint32_t kmm_off; uint32_t k_off; uint32_t idx_off; uint32_t reset;
 };
-struct vk_op_kv_quest_push_constants {    // b65 Quest
-    uint32_t D; uint32_t NH; uint32_t T; uint32_t NKV; uint32_t MT; uint32_t NHKV; uint32_t B; uint32_t budget; uint32_t sink; uint32_t recent;
-    uint32_t q_head; uint32_t q_tok; uint32_t kmm_row; uint32_t m_row; uint32_t d_row; uint32_t d_head;
-    uint32_t q_off; uint32_t kmm_off; uint32_t m_off; uint32_t d_off;
+struct vk_op_kv_quest_bound_push_constants {    // b65 Quest v2
+    uint32_t D; uint32_t NB; uint32_t NKV; uint32_t B; uint32_t NHKV; uint32_t NW; uint32_t ROW;
+    uint32_t q_head; uint32_t q_tok; uint32_t kmm_row; uint32_t m_row; uint32_t q_off; uint32_t kmm_off; uint32_t m_off; uint32_t d_off;
+};
+struct vk_op_kv_quest_select_push_constants {   // b65 Quest v2
+    uint32_t NB; uint32_t NW; uint32_t ROW; uint32_t NHKV; uint32_t B; uint32_t budget; uint32_t sink; uint32_t recent; uint32_t d_off;
+};
+struct vk_op_kv_quest_apply_push_constants {    // b65 Quest v2
+    uint32_t NKV; uint32_t G; uint32_t B; uint32_t s_tok; uint32_t s_head; uint32_t s_off; uint32_t kq_tok; uint32_t kq_head; uint32_t kq_off;
 };
 
 struct vk_op_sparse_t_push_constants {   // b65

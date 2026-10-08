@@ -1,12 +1,12 @@
 #version 450
-// b65 Quest: grow-only per-block key min/max. One invocation per key dimension d; walks the tokens of the batch.
+// b65 Quest: grow-only per-block key min/max (reset: restarted by a key on the block's first cell). One invocation per key dimension d; walks the tokens of the batch.
 #extension GL_EXT_control_flow_attributes : require
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 layout(binding = 0) readonly buffer A { float data_kmm_in[]; };
 layout(binding = 1) readonly buffer K { float data_k[]; };
 layout(binding = 2) readonly buffer I { uvec2 data_idx[]; };
 layout(binding = 3) buffer D { float data_kmm[]; };
-layout(push_constant) uniform PC { uint E; uint T; uint B; uint kmm_row; uint k_row; uint kmm_off; uint k_off; uint idx_off; } p;
+layout(push_constant) uniform PC { uint E; uint T; uint B; uint kmm_row; uint k_row; uint kmm_off; uint k_off; uint idx_off; uint reset; } p;
 void main() {
     const uint d = gl_GlobalInvocationID.x;
     if (d >= p.E) return;
@@ -14,7 +14,12 @@ void main() {
         const uint cell = data_idx[p.idx_off + t].x;
         const uint base = p.kmm_off + (cell / p.B) * p.kmm_row;
         const float v = data_k[p.k_off + t * p.k_row + d];
-        data_kmm[base + d]       = min(data_kmm[base + d], v);
-        data_kmm[base + p.E + d] = max(data_kmm[base + p.E + d], v);
+        if (p.reset != 0u && cell % p.B == 0u) {   // a block's first cell restarts its summary
+            data_kmm[base + d]       = v;
+            data_kmm[base + p.E + d] = v;
+        } else {
+            data_kmm[base + d]       = min(data_kmm[base + d], v);
+            data_kmm[base + p.E + d] = max(data_kmm[base + p.E + d], v);
+        }
     }
 }

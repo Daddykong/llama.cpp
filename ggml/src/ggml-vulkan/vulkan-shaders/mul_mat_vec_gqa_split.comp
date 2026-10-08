@@ -34,7 +34,23 @@ layout (push_constant) uniform parameter
     uint a_offset;
     uint b_offset;
     uint d_offset;
+    uint mask_offset;       // b65 Quest v2 (flags & 4): selection bitmap at binding 3, word offset
+    uint mask_tok_stride;   // words per token
+    uint mask_head_stride;  // words per A channel (KV head)
+    uint flags;
+    uint qblock;            // cells per bit
 } p;
+
+layout (binding = 3) readonly buffer QBM {uint data_qbm[];};   // b65 Quest v2 (aliases Fuse0)
+
+// bit t of the result: token t keeps block blk of A channel h
+uint quest_bits(const uint h, const uint blk) {
+    uint m = 0;
+    [[unroll]] for (uint t = 0; t < NTOK; ++t) {
+        m |= ((data_qbm[p.mask_offset + t * p.mask_tok_stride + h * p.mask_head_stride + blk / 32] >> (blk % 32)) & 1u) << t;
+    }
+    return m;
+}
 
 // NROWS * GQA * NTOK <= 128 partial sums per subgroup
 shared float red[BLOCK_SIZE / 8][128];
@@ -59,7 +75,11 @@ void main() {
     const uint b_ts   = p.b_tok_stride / 4;
     const uint n4     = p.ncols / 4;
 
+    const bool qsk = (p.flags & 4u) != 0u;   // b65 Quest v2 (V x P): positions of unselected blocks are skipped (P = 0)
     for (uint k4 = tid; k4 < n4; k4 += BLOCK_SIZE) {
+        if (qsk && quest_bits(h, (k4 * 4) / p.qblock) == 0u) {
+            continue;
+        }
         vec4 av[NROWS];
         [[unroll]] for (uint r = 0; r < NROWS; ++r) {
             av[r] = vec4(data_a_v4[a_base[r] + k4]);
