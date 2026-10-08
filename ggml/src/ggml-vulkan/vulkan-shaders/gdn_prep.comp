@@ -35,6 +35,7 @@ layout(push_constant) uniform Parameters {
     float eps;        // RMS_NORM eps (already eps/n)
     float qk_scale;   // SCALE after the norm
     uint out_q, out_k, out_v, out_g, out_b;  // element offsets in the scratch buffer
+    uint out_w;       // != 0: copy the norm weight (binding 9, 128 floats) to the scratch at out_w (phase 2)
 };
 
 layout(binding = 0) readonly  buffer QKV   { float data_qkv[];   };
@@ -46,6 +47,7 @@ layout(binding = 5) readonly  buffer BR    { float data_br[];    };
 layout(binding = 6) readonly  buffer DT    { float data_dt[];    };
 layout(binding = 7) readonly  buffer AA    { float data_aa[];    };
 layout(binding = 8) writeonly buffer OUT   { float data_out[];   };
+layout(binding = 9) readonly  buffer NW    { float data_nw[];    };
 
 shared float red[S];
 
@@ -75,6 +77,9 @@ float conv_in(const float st[3], const float x[MAX_T], uint j) {
 void main() {
     const uint ch  = gl_WorkGroupID.x;          // 128-channel chunk: [0, nk) q, [nk, 2nk) k, [2nk, 2nk+nv) v
     const uint lid = gl_LocalInvocationID.x;
+    if (out_w != 0u && ch == 0u) {
+        data_out[out_w + lid] = data_nw[lid];
+    }
     const uint c   = ch * S + lid;             // channel
 
     // conv state of this channel (gathered row) and the new inputs
