@@ -3420,6 +3420,21 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             ggml_vk_create_pipeline2(device, device->pipeline_mul_mat_vec_p021_f16_f32[i], "mul_mat_vec_p021_f16_f32"+std::to_string(i+1), mul_mat_vec_p021_f16_f32_len,              mul_mat_vec_p021_f16_f32_data,              "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_p021_push_constants), {1, 1, 1}, {device->subgroup_size, i + 1}, 1, true);
         }
     }
+#if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
+    if (device->integer_dot_product) {   // b65 [mtp]: 9-64 column matmul for the reordered types
+        const void * const wd[4] = { mul_mmvq_wide_q4_0r_data, mul_mmvq_wide_q4_1r_data, mul_mmvq_wide_q5_kr_data, mul_mmvq_wide_q8_0r_data };
+        const uint64_t     wl[4] = { mul_mmvq_wide_q4_0r_len,  mul_mmvq_wide_q4_1r_len,  mul_mmvq_wide_q5_kr_len,  mul_mmvq_wide_q8_0r_len };
+        const char *       wn[4] = { "mul_mmvq_wide_q4_0r", "mul_mmvq_wide_q4_1r", "mul_mmvq_wide_q5_kr", "mul_mmvq_wide_q8_0r" };
+        const uint32_t nc[3] = { 16, 32, 64 };
+        const uint32_t rt[3] = { 1, 2, 4 };   // rows per invocation: 128 rows per workgroup for every column tile
+        for (uint32_t t = 0; t < 4; ++t) {
+            for (uint32_t c = 0; c < 3; ++c) {
+                ggml_vk_create_pipeline2(device, device->pipeline_mmvq_wide[t][c], std::string(wn[t]) + "_" + std::to_string(nc[c]), wl[t], wd[t], "main", 3,
+                                        7 * sizeof(uint32_t), {1, 1, 1}, {nc[c], rt[c]}, 1);
+            }
+        }
+    }
+#endif
     ggml_vk_create_pipeline(device, device->pipeline_mul_mat_vec_gqa_splitk_reduce, "mul_mat_vec_gqa_splitk_reduce", mul_mat_vec_gqa_splitk_reduce_len, mul_mat_vec_gqa_splitk_reduce_data, "main", 2, 3 * sizeof(uint32_t), {256, 1, 1}, {}, 1);   // b65 [mtp]
     ggml_vk_create_pipeline(device, device->pipeline_mul_mat_vec_nc_f16_f32, "mul_mat_vec_nc_f16_f32", mul_mat_vec_nc_f16_f32_len, mul_mat_vec_nc_f16_f32_data, "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_nc_push_constants), {1, 1, 1}, {}, 1);
     for (uint32_t g = 0; g < 8; ++g) {
@@ -8076,6 +8091,92 @@ void ggml_vk_dsv4_hc_post(ggml_backend_vk_context * ctx, vk_context& subctx, con
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { x_buf, r_buf, p_buf, c_buf, d_buf }, pc, { n_embd, n_tokens, 1 });
 }
 
+// b65 [mtp]: see mul_mmvq_wide.comp. Returns false (nothing recorded) when the case is not covered.
+static bool ggml_vk_mmvq_wide(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    const ggml_type at = ggml_vk_mm_a_type(src0);
+    int ti = -1;
+    switch (at) {
+        case GGML_TYPE_Q4_0R_VK: ti = 0; break;
+        case GGML_TYPE_Q4_1R_VK: ti = 1; break;
+        case GGML_TYPE_Q5_KR_VK: ti = 2; break;
+        case GGML_TYPE_Q8_0R_VK: ti = 3; break;
+        default: return false;
+    }
+    const int64_t n = dst->ne[1];
+    const uint32_t ci = n <= 16 ? 0 : (n <= 32 ? 1 : 2);
+    if (!ctx->device->pipeline_mmvq_wide[ti][ci] || src1->type != GGML_TYPE_F32 || !ggml_is_contiguous(src1) ||
+        !ggml_is_contiguous(dst) || dst->type != GGML_TYPE_F32 || src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[2] != 1 ||
+        src1->ne[3] != 1 || src0->ne[0] % (ti == 2 ? 256 : 32) != 0 || src1->ne[0] != src0->ne[0] ||
+        get_misalign_bytes(ctx, src1) != 0 || get_misalign_bytes(ctx, dst) != 0 ||
+        ggml_nbytes(src0) > ctx->device->properties.limits.maxStorageBufferRange) {
+        return false;
+    }
+    const uint32_t k = (uint32_t) src0->ne[0];
+    const uint32_t m = (uint32_t) src0->ne[1];
+    const uint64_t y_ne = (uint64_t) k * n;
+    const uint64_t y_sz = ggml_vk_align_size(y_ne, 128) * ggml_type_size(GGML_TYPE_Q8_1) / ggml_blck_size(GGML_TYPE_Q8_1);
+    if (ctx->prealloc_size_y < y_sz) {
+        ctx->prealloc_size_y = y_sz;
+        ggml_vk_preallocate_buffers(ctx, subctx);
+    }
+    vk_pipeline to_q8_1 = ggml_vk_get_quantize_pipeline(ctx, GGML_TYPE_Q8_1);
+    vk_pipeline pw = ctx->device->pipeline_mmvq_wide[ti][ci];
+    const uint32_t nc = ci == 0 ? 16u : (ci == 1 ? 32u : 64u);
+
+    // k-split when the row x column tiles would not fill the GPU (GGML_VK_MMVQ_WIDE_WG: target workgroups)
+    static const uint32_t target_wg = getenv("GGML_VK_MMVQ_WIDE_WG") ? (uint32_t) atoi(getenv("GGML_VK_MMVQ_WIDE_WG")) : 160u;
+    const uint32_t gx = CEIL_DIV(m, 128u);
+    const uint32_t gy = CEIL_DIV((uint32_t) n, nc);
+    const uint32_t nblk = k / 32;
+    uint32_t ksplit = std::min<uint32_t>(8u, std::max<uint32_t>(1u, CEIL_DIV(target_wg, gx * gy)));
+    uint32_t kblocks = ROUNDUP_POW2(CEIL_DIV(nblk, ksplit), 8u);
+    ksplit = CEIL_DIV(nblk, kblocks);
+    const uint64_t ne_d = (uint64_t) m * n;
+    if (ksplit > 1 && ctx->prealloc_size_split_k < ne_d * ksplit * sizeof(float)) {
+        ctx->prealloc_size_split_k = ne_d * ksplit * sizeof(float);
+        ggml_vk_preallocate_buffers(ctx, subctx);
+    }
+
+    ggml_pipeline_request_descriptor_sets(ctx, to_q8_1, 1);
+    ggml_pipeline_request_descriptor_sets(ctx, pw, 1);
+    if (ksplit > 1) {
+        ggml_pipeline_request_descriptor_sets(ctx, ctx->device->pipeline_matmul_split_k_reduce, 1);
+    }
+
+    vk_subbuffer d_Qx = ggml_vk_tensor_subbuffer(ctx, src0);
+    vk_subbuffer d_Qy = ggml_vk_tensor_subbuffer(ctx, src1);
+    vk_subbuffer d_D  = ggml_vk_tensor_subbuffer(ctx, dst);
+    vk_subbuffer d_Y  = { ctx->prealloc_y, 0, ctx->prealloc_y->size };
+
+    if (ctx->prealloc_y_last_pipeline_used != to_q8_1.get() || ctx->prealloc_y_last_tensor_used != src1 || ctx->prealloc_y_last_k_padded) {
+        if (ctx->prealloc_y_need_sync) {
+            ggml_vk_sync_buffers(ctx, subctx);
+        }
+        ggml_vk_quantize_q8_1(ctx, subctx, d_Qy, d_Y, (uint32_t) y_ne);
+        ctx->prealloc_y_last_pipeline_used = to_q8_1.get();
+        ctx->prealloc_y_last_tensor_used = src1;
+        ctx->prealloc_y_last_k_padded = false;
+    }
+
+    const std::array<uint32_t, 7> pc = { k, m, (uint32_t) n, k, ksplit > 1 ? m : (uint32_t) (dst->nb[1] / sizeof(float)), kblocks,
+                                         ksplit > 1 ? (uint32_t) ne_d : 0u };
+    if (ksplit > 1) {
+        if (ctx->prealloc_split_k_need_sync) {
+            ggml_vk_sync_buffers(ctx, subctx);
+        }
+        vk_subbuffer d_P = ggml_vk_subbuffer(ctx, ctx->prealloc_split_k, 0);
+        ggml_vk_dispatch_pipeline(ctx, subctx, pw, { d_Qx, d_Y, d_P }, pc, { gx, gy, ksplit });
+        ggml_vk_sync_buffers(ctx, subctx);
+        const std::array<uint32_t, 2> pc2 = { (uint32_t) ne_d, ksplit };
+        ggml_vk_dispatch_pipeline(ctx, subctx, ctx->device->pipeline_matmul_split_k_reduce, { d_P, d_D }, pc2, { (uint32_t) ne_d, 1, 1 });
+        ctx->prealloc_split_k_need_sync = true;
+    } else {
+        ggml_vk_dispatch_pipeline(ctx, subctx, pw, { d_Qx, d_Y, d_D }, pc, { gx, gy, 1 });
+    }
+    ctx->prealloc_y_need_sync = true;
+    return true;
+}
+
 void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
     ggml_tensor * dst = cgraph->nodes[node_idx];
     ggml_tensor * src0 = dst->src[0];
@@ -8087,14 +8188,27 @@ void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, const st
         ggml_vk_q4_0r_ensure(ctx, subctx, src0);
     }
 
+    // b65 [mtp]: 9-64 column batches (long ngram drafts in the MTP-chain verify) of a row-reordered weight run on
+    // mul_mmvq_wide (each weight block read once for all columns, integer dot); GGML_VK_DISABLE_MMVQ_WIDE=1 off
+    static const bool mmvq_wide_off = getenv("GGML_VK_DISABLE_MMVQ_WIDE") != nullptr;
+    if (!mmvq_wide_off && dst->ne[1] > (int64_t) mul_mat_vec_max_cols && dst->ne[1] <= 64 && ctx->num_additional_fused_ops == 0 &&
+        ggml_vk_mmvq_wide(ctx, subctx, src0, src1, dst)) {
+        return;
+    }
+
     // b65 [mtp]: GGML_VK_MV_CHUNK_MAX=<N>: 9..N columns (long ngram drafts in the MTP-chain verify) as mat-vec
     // dispatches of up to mul_mat_vec_max_cols columns each instead of one tiled matmul, whose tiles are far wider
     // than the batch (the matmul path costs about as much as a 128-column batch there)
+    // b65 [mtp]: small f16 weights (the 48-row GDN alpha/beta projections) at 9-64 columns always take this path:
+    // the tiled matmul costs ~320 us there vs ~8 us per 8-column mat-vec (GGML_VK_DISABLE_MV_CHUNK_SMALL=1 off)
     static const int64_t mv_chunk_max = getenv("GGML_VK_MV_CHUNK_MAX") ? atoll(getenv("GGML_VK_MV_CHUNK_MAX")) : 0;
-    if (mv_chunk_max > (int64_t) mul_mat_vec_max_cols && dst->ne[1] > (int64_t) mul_mat_vec_max_cols && dst->ne[1] <= mv_chunk_max &&
+    static const bool mv_chunk_small = getenv("GGML_VK_DISABLE_MV_CHUNK_SMALL") == nullptr;
+    const bool chunk_small = mv_chunk_small && src0->type == GGML_TYPE_F16 && src0->ne[1] <= 256 && dst->ne[1] <= 64;
+    if ((chunk_small || (mv_chunk_max > (int64_t) mul_mat_vec_max_cols && dst->ne[1] <= mv_chunk_max && ggml_is_quantized(src0->type))) &&
+        dst->ne[1] > (int64_t) mul_mat_vec_max_cols &&
         ctx->num_additional_fused_ops == 0 && dst->ne[2] == 1 && dst->ne[3] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1 &&
         src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && ggml_is_contiguous(dst) && ggml_is_contiguous(src0) &&
-        ggml_is_quantized(src0->type) && src0->ne[2] == 1 && src0->ne[3] == 1 &&
+        src0->ne[2] == 1 && src0->ne[3] == 1 &&
         ggml_nbytes(src0) <= ctx->device->properties.limits.maxStorageBufferRange) {
         const int64_t n = dst->ne[1];
         for (int64_t c0 = 0; c0 < n; c0 += mul_mat_vec_max_cols) {

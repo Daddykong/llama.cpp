@@ -1,0 +1,191 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_integer_dot_product : require
+
+// b65 [mtp]: 9-64 column matmul for the row-reordered weight types (Q4_0R, Q4_1R, Q5_KR, Q8_0R) against q8_1
+// activations (the multi-token verify of long ngram drafts). Streams each weight block from memory once for all
+// columns: a workgroup owns ROWS_PER_WG rows x NC columns; the q8_1 blocks of all NC columns for a k-chunk are staged
+// in shared memory, and each invocation keeps RT rows x CT columns of sums in registers, decoding each of its weight
+// blocks once and dotting it (integer dot) with CT columns. Optional k-split (gl_WorkGroupID.z): the partial sums of
+// each k-slice go to slice z of the output (summed by mul_mat_split_k_reduce).
+
+#define BLOCK_SIZE 256
+#define CT 8          // columns per invocation
+#define KCB 8         // q8_1 blocks (32 values each) per staged k-chunk
+
+layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+layout(constant_id = 0) const uint NC = 64;   // column tile (16, 32 or 64)
+layout(constant_id = 1) const uint RT = 4;    // rows per invocation
+
+layout (binding = 0) readonly buffer A_R128 {uvec4 data_a_r128[];};
+layout (binding = 0) readonly buffer A_R32 {uint data_a_r32[];};
+layout (binding = 0) readonly buffer A_R16 {float16_t data_a_r16[];};
+
+struct block_q8_1_x4_t { f16vec2 ds[4]; int32_t qs[32]; };
+layout (binding = 1) readonly buffer B {block_q8_1_x4_t data_b[];};
+layout (binding = 1) readonly buffer B_R128 {ivec4 data_b_r128[];};
+
+layout (binding = 2) writeonly buffer D {float data_d[];};
+
+layout (push_constant) uniform parameter {
+    uint ncols;      // k (values per weight row)
+    uint nrows;      // m
+    uint n;          // columns of B / D actually present
+    uint stride_b;   // values between B columns (k padded as quantized)
+    uint stride_d;   // floats between D columns
+    uint k_blocks;   // 32-value blocks per k-slice
+    uint d_slice;    // floats between output k-slices (0 when there is one slice)
+} p;
+
+shared ivec4 sb_lo[KCB][NC];
+shared ivec4 sb_hi[KCB][NC];
+shared vec2  sb_ds[KCB][NC];
+
+#if defined(DATA_A_Q5_KR)
+void r5_scale_min(const uvec4 hdr, const uint j, out float sc, out float m) {
+    const uint sh = 8 * (j & 3);
+    const uint y = hdr.y >> sh;
+    const uint z = hdr.z >> sh;
+    const uint w = (hdr.w >> sh) & 0xFF;
+    const bool lo = j < 4;
+    sc = float(lo ? (y & 63) : ((w & 15) | (((y >> 6) & 3) << 4)));
+    m  = float(lo ? (z & 63) : ((w >> 4) | (((z >> 6) & 3) << 4)));
+}
+#endif
+
+// weight block of 32 values at k-block jb (column jb*32) of row `row` -> 8 packed int8 words + coefficients:
+// sum = ds.x * (c.x * dot(a[0..3], b_lo) + c.y * dot(a[4..7], b_hi)) + c.z * ds.y
+void decode(const uint row, const uint jb, out int32_t a[8], out vec3 c) {
+#if defined(DATA_A_Q4_0R)
+    const uint nbpr = p.ncols / 32;
+    const uint rsb = row * nbpr;
+    const uvec4 q = data_a_r128[(rsb * 9) / 8 + jb];
+    const float da = float(data_a_r16[rsb * 9 + nbpr * 8 + jb]);
+    [[unroll]] for (uint w = 0; w < 4; ++w) {
+        a[w]     = int32_t( q[w]       & 0x0F0F0F0Fu);
+        a[w + 4] = int32_t((q[w] >> 4) & 0x0F0F0F0Fu);
+    }
+    c = vec3(da, da, -8.0 * da);
+#elif defined(DATA_A_Q4_1R)
+    const uint nbpr = p.ncols / 32;
+    const uint rsb = row * nbpr;
+    const uvec4 q = data_a_r128[(rsb * 5) / 4 + jb];
+    [[unroll]] for (uint w = 0; w < 4; ++w) {
+        a[w]     = int32_t( q[w]       & 0x0F0F0F0Fu);
+        a[w + 4] = int32_t((q[w] >> 4) & 0x0F0F0F0Fu);
+    }
+    const vec2 dm = unpackHalf2x16(data_a_r32[rsb * 5 + nbpr * 4 + jb]);
+    c = vec3(dm.x, dm.x, dm.y);
+#elif defined(DATA_A_Q8_0R)
+    const uint nbpr = p.ncols / 32;
+    const uint rsb = row * nbpr;
+    const uint q4i = (rsb * 17) / 8 + 2 * jb;
+    const uvec4 q0 = data_a_r128[q4i];
+    const uvec4 q1 = data_a_r128[q4i + 1];
+    a[0] = int32_t(q0.x); a[1] = int32_t(q0.y); a[2] = int32_t(q0.z); a[3] = int32_t(q0.w);
+    a[4] = int32_t(q1.x); a[5] = int32_t(q1.y); a[6] = int32_t(q1.z); a[7] = int32_t(q1.w);
+    const float da = float(data_a_r16[rsb * 17 + nbpr * 16 + jb]);
+    c = vec3(da, da, 0.0);
+#elif defined(DATA_A_Q5_KR)
+    const uint nb = p.ncols / 256;
+    const uint js = jb;            // 32-value sub-block index along the row
+    const uint jsb = js / 8;       // superblock
+    const uint rsb = row * nb;
+    const uvec4 q = data_a_r128[rsb * 11 + js];
+    const uint qh = data_a_r32[rsb * 44 + nb * 32 + js];
+    const uvec4 hdr = data_a_r128[rsb * 11 + nb * 10 + jsb];
+    [[unroll]] for (uint w = 0; w < 4; ++w) {
+        a[w]     = int32_t(( q[w]       & 0x0F0F0F0Fu) | (((qh >> w)       & 0x01010101u) << 4));
+        a[w + 4] = int32_t(((q[w] >> 4) & 0x0F0F0F0Fu) | (((qh >> (w + 4)) & 0x01010101u) << 4));
+    }
+    const vec2 dm = unpackHalf2x16(hdr.x);
+    float sc, mn;
+    r5_scale_min(hdr, js % 8, sc, mn);
+    c = vec3(dm.x * sc, dm.x * sc, -dm.y * mn);
+#endif
+}
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint ncg = NC / CT;                    // column groups
+    const uint cg  = tid % ncg;
+    const uint rg  = tid / ncg;
+    const uint rows_per_wg = (BLOCK_SIZE / ncg) * RT;
+    const uint row0 = gl_WorkGroupID.x * rows_per_wg + rg * RT;
+    const uint col0 = gl_WorkGroupID.y * NC;
+    const uint kb0  = gl_WorkGroupID.z * p.k_blocks;
+    const uint nkb  = min(p.k_blocks, p.ncols / 32 - kb0);
+
+    float acc[RT][CT];
+    [[unroll]] for (uint r = 0; r < RT; ++r) {
+        [[unroll]] for (uint c = 0; c < CT; ++c) {
+            acc[r][c] = 0.0;
+        }
+    }
+
+    for (uint kc = 0; kc < nkb; kc += KCB) {
+        const uint nk = min(KCB, nkb - kc);
+        barrier();
+        // stage the q8_1 blocks kb0+kc .. +nk of columns col0 .. col0+NC (zeros past the last column)
+        for (uint e = tid; e < KCB * NC; e += BLOCK_SIZE) {
+            const uint kk = e / NC;
+            const uint j  = e % NC;
+            const uint col = col0 + j;
+            if (kk < nk && col < p.n) {
+                const uint b = (col * p.stride_b) / 32 + kb0 + kc + kk;
+                const uint bo = b / 4;
+                const uint bi = b % 4;
+                sb_ds[kk][j] = vec2(data_b[bo].ds[bi]);
+                sb_lo[kk][j] = data_b_r128[bo * 9 + 1 + bi * 2];
+                sb_hi[kk][j] = data_b_r128[bo * 9 + 2 + bi * 2];
+            } else {
+                sb_ds[kk][j] = vec2(0.0);
+                sb_lo[kk][j] = ivec4(0);
+                sb_hi[kk][j] = ivec4(0);
+            }
+        }
+        barrier();
+        for (uint kk = 0; kk < nk; ++kk) {
+            const uint jb = kb0 + kc + kk;
+            [[unroll]] for (uint r = 0; r < RT; ++r) {
+                const uint row = min(row0 + r, p.nrows - 1);
+                int32_t a[8];
+                vec3 cf;
+                decode(row, jb, a, cf);
+                [[unroll]] for (uint c = 0; c < CT; ++c) {
+                    const uint j = cg * CT + c;
+                    const ivec4 bl = sb_lo[kk][j];
+                    const ivec4 bh = sb_hi[kk][j];
+                    int32_t s_lo = dotPacked4x8EXT(a[0], bl.x);
+                    s_lo += dotPacked4x8EXT(a[1], bl.y);
+                    s_lo += dotPacked4x8EXT(a[2], bl.z);
+                    s_lo += dotPacked4x8EXT(a[3], bl.w);
+                    int32_t s_hi = dotPacked4x8EXT(a[4], bh.x);
+                    s_hi += dotPacked4x8EXT(a[5], bh.y);
+                    s_hi += dotPacked4x8EXT(a[6], bh.z);
+                    s_hi += dotPacked4x8EXT(a[7], bh.w);
+                    const vec2 ds = sb_ds[kk][j];
+                    acc[r][c] += ds.x * (cf.x * float(s_lo) + cf.y * float(s_hi)) + cf.z * ds.y;
+                }
+            }
+        }
+    }
+
+    [[unroll]] for (uint r = 0; r < RT; ++r) {
+        const uint row = row0 + r;
+        if (row >= p.nrows) {
+            continue;
+        }
+        [[unroll]] for (uint c = 0; c < CT; ++c) {
+            const uint col = col0 + cg * CT + c;
+            if (col < p.n) {
+                data_d[gl_WorkGroupID.z * p.d_slice + col * p.stride_d + row] = acc[r][c];
+            }
+        }
+    }
+}
