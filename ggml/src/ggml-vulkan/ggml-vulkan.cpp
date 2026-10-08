@@ -8007,8 +8007,12 @@ static void ggml_vk_mul_mat_vec_gqa_f16_f32(ggml_backend_vk_context * ctx, vk_co
     // b65 [mtp]: GGML_VK_GQA_SPLITK=1 -- long k as k-chunks per workgroup (all rows, B staged once per chunk),
     // then an in-order sum of the chunk partials. Same kernel and chunking for 1-4 tokens.
     static const bool splitk_env = getenv("GGML_VK_GQA_SPLITK") != nullptr && atoi(getenv("GGML_VK_GQA_SPLITK")) != 0;
+    // b65: in batch-invariant mode only when the 4-token pipeline exists too (SIMD32 devices skip it: R*GQA*NTOK cap),
+    // so 1-4 tokens never split between this kernel and another one
+    static const bool splitk_batch_inv = getenv("GGML_VK_BATCH_INVARIANT") != nullptr && atoi(getenv("GGML_VK_BATCH_INVARIANT")) != 0;
     if (split && splitk_env && src0->type == GGML_TYPE_F16 && gqa * ntok <= 32 &&
-        ctx->device->pipeline_mul_mat_vec_gqa_splitk_f16_f32[gqa - 1][ntok - 1] != nullptr) {
+        ctx->device->pipeline_mul_mat_vec_gqa_splitk_f16_f32[gqa - 1][ntok - 1] != nullptr &&
+        (!splitk_batch_inv || (gqa * 4 <= 32 && ctx->device->pipeline_mul_mat_vec_gqa_splitk_f16_f32[gqa - 1][3] != nullptr))) {
         static const uint32_t target_wg = getenv("GGML_VK_GQA_SPLITK_WG") ? (uint32_t)atoi(getenv("GGML_VK_GQA_SPLITK_WG")) : 1024u;
         const uint32_t nch_heads = (uint32_t)src0->ne[2];
         const uint32_t row_blocks = CEIL_DIV(rows, 64u);
