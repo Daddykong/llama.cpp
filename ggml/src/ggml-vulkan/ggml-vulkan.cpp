@@ -7899,8 +7899,9 @@ static bool ggml_vk_mul_mat_vec_gqa_ok(const ggml_backend_vk_context * ctx, cons
 // row count (never on the token count), so 1-4 token steps give bit-identical results.
 // GGML_VK_GQA_VXP: 0 off, 1 direct row loads, 2 A staged through shared memory, 3 + B by subgroup shuffles,
 // 4 A and B staged through shared memory
+// Default 4 (B65 VXP-2, 28K MTP request 36.3 -> 38.9 tok/s; 1-token decode unchanged); GGML_VK_GQA_VXP=0 turns it off.
 static int ggml_vk_gqa_vxp_mode() {
-    static const int mode = getenv("GGML_VK_GQA_VXP") != nullptr ? atoi(getenv("GGML_VK_GQA_VXP")) : 0;
+    static const int mode = getenv("GGML_VK_GQA_VXP") != nullptr ? atoi(getenv("GGML_VK_GQA_VXP")) : 4;
     return mode;
 }
 
