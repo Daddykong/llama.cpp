@@ -4182,13 +4182,31 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                     gdn_names[si][kda], gdn_len, gdn_data, "main", 9, sizeof(vk_op_gated_delta_net_push_constants),
                     wg_denoms, {S_V, kda, gdn_subgroup_size, lanes_per_column}, 1, true, use_subgroup_ops, gdn_subgroup_size);
             }
-            // b65 fused GDN layer phase 2: same configuration, norm in the last workgroup of each head
-            if (S_V == 128u && use_subgroup_ops && device->vulkan_memory_model) {
+            // b65 fused GDN layer phase 2: same configuration, norm in the last workgroup of each head.
+            // GGML_VK_GDNF_NF_MODE 4 memory model, one release per workgroup (default), 1 acquire-release fences, 2 legacy
+            // coherent, 3 timing only (wrong output); GGML_VK_GDNF_NF_COLS
+            // columns' subgroups per workgroup (1, 2, 4, 8)
+            static const int nf_mode = getenv("GGML_VK_GDNF_NF_MODE") ? atoi(getenv("GGML_VK_GDNF_NF_MODE")) : 4;
+            static const uint32_t nf_cols = getenv("GGML_VK_GDNF_NF_COLS") ? (uint32_t)atoi(getenv("GGML_VK_GDNF_NF_COLS")) : 1u;
+            const uint32_t cpw = gdn_subgroup_size / lanes_per_column;
+            if (S_V == 128u && use_subgroup_ops && ((nf_mode != 1 && nf_mode != 4) || device->vulkan_memory_model) && nf_mode >= 1 && nf_mode <= 4 &&
+                (nf_cols == 1 || is_pow2(nf_cols)) && nf_cols <= 8 && (S_V % (cpw * nf_cols)) == 0) {
+                const void * nf_data[4][2] = {
+                    { gated_delta_net_nf_m1_f32_data, gated_delta_net_nf_m1_f32_nocluster_data },
+                    { gated_delta_net_nf_m2_f32_data, gated_delta_net_nf_m2_f32_nocluster_data },
+                    { gated_delta_net_nf_m3_f32_data, gated_delta_net_nf_m3_f32_nocluster_data },
+                    { gated_delta_net_nf_m4_f32_data, gated_delta_net_nf_m4_f32_nocluster_data } };
+                const size_t nf_len[4][2] = {
+                    { gated_delta_net_nf_m1_f32_len, gated_delta_net_nf_m1_f32_nocluster_len },
+                    { gated_delta_net_nf_m2_f32_len, gated_delta_net_nf_m2_f32_nocluster_len },
+                    { gated_delta_net_nf_m3_f32_len, gated_delta_net_nf_m3_f32_nocluster_len },
+                    { gated_delta_net_nf_m4_f32_len, gated_delta_net_nf_m4_f32_nocluster_len } };
+                const int ci = use_clustered_reduce ? 0 : 1;
                 ggml_vk_create_pipeline(device, device->pipeline_gated_delta_net_nf, "gated_delta_net_nf_f32_d128",
-                    use_clustered_reduce ? gated_delta_net_nf_f32_len : gated_delta_net_nf_f32_nocluster_len,
-                    use_clustered_reduce ? (const void *)gated_delta_net_nf_f32_data : (const void *)gated_delta_net_nf_f32_nocluster_data,
+                    nf_len[nf_mode - 1][ci], nf_data[nf_mode - 1][ci],
                     "main", 12, sizeof(vk_op_gated_delta_net_push_constants),
-                    wg_denoms, {S_V, 0u, gdn_subgroup_size, lanes_per_column}, 1, true, true, gdn_subgroup_size);
+                    {1u, 1u, cpw * nf_cols}, {S_V, 0u, gdn_subgroup_size, lanes_per_column, nf_cols, gdn_subgroup_size * nf_cols},
+                    1, true, true, gdn_subgroup_size);
             }
         }
     }
