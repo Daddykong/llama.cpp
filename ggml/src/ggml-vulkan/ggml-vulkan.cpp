@@ -1355,35 +1355,69 @@ static vk_fa_tuning_params get_fa_tuning_params_coopmat2(const vk_device& device
 
     // b65: Intel Xe2 runs coopmat2 at SIMD16 with 128 GRFs (8 KB) per subgroup. GGML_VK_CM2_FA="Br,Bc,WG" overrides
     // the tile (rows, KV columns, invocations) for tuning.
-    // On Intel the shader also runs its chunked path (d_split / row_split carry the HSK chunk for Q x K^T and the key
-    // chunk for P x V; 0 = upstream path): Br 16, Bc 128, 16 subgroups -> the driver's 2 x 8 subgroup grid holds an
-    // 8 x 32 block of O and 8 x 16 of S per subgroup (no spills in the KV loop at HSK 256).
-    // GGML_VK_CM2_FA="Br,Bc,WG[,chunk_d,chunk_kv]" overrides (chunk_d 0 = upstream path).
+    // On Intel the shader runs its chunked path (d_split / row_split carry the HSK chunk for Q x K^T and the key chunk
+    // for P x V; 0 = upstream path). The driver (mesa-anv2 p12) splits every workgroup matrix over one grid of
+    // (Br / 8) row bands x gcd(Bc / 16, HSV_pad / 16) column groups, so the workgroup is sized to that grid: at
+    // HSK = HSV = 256, Br 16, Bc 128 -> 2 x 8 subgroups (256 invocations), 8 x 16 of S and 8 x 32 of O per subgroup,
+    // no spills in the KV loop. Head sizes that are not a multiple of 32 use 16-wide K chunks (f16/f32/bf16 K only).
+    // GGML_VK_CM2_FA="Br,Bc,WG[,chunk_d,chunk_kv]" overrides (WG 0 = derived; chunk_d 0 = upstream path at that tile).
+    // When the chunks do not fit the head size the stock tile and upstream path stay.
     if (device->vendor_id == VK_VENDOR_ID_INTEL) {
         result.subgroup_size = 16;
-        result.block_rows = 16;
-        result.block_cols = 128;
-        result.workgroup_size = 256;
-        result.d_split = 32;
-        result.row_split = 16;
+    }
+    const uint32_t hsk_pad = (hsk + 15) & ~15u, hsv_pad = (hsv + 15) & ~15u;
+    const bool k_blocks = ggml_is_quantized(k_type);
+    vk_fa_tuning_params chunked = result;
+    bool use_chunked = false;
+    uint32_t wg_req = 0;
+    if (device->vendor_id == VK_VENDOR_ID_INTEL) {
+        chunked.block_rows = 16;
+        chunked.block_cols = 128;
+        chunked.d_split = hsk_pad % 32 == 0 ? 32 : (k_blocks ? 0 : 16);
+        chunked.row_split = 16;
+        use_chunked = chunked.d_split != 0;
     }
     if (const char * e = getenv("GGML_VK_CM2_FA")) {
-        unsigned br = 0, bc = 0, wg = 0, cd = result.d_split, ckv = result.row_split;
+        unsigned br = 0, bc = 0, wg = 0, cd = chunked.d_split ? chunked.d_split : 32, ckv = 16;
         if (sscanf(e, "%u,%u,%u,%u,%u", &br, &bc, &wg, &cd, &ckv) >= 3) {
-            result.block_rows = br;
-            result.block_cols = bc;
-            result.workgroup_size = wg;
-            result.d_split = cd;
-            result.row_split = ckv;
+            chunked.block_rows = br;
+            chunked.block_cols = bc;
+            chunked.d_split = cd;
+            chunked.row_split = ckv;
+            wg_req = wg;
+            use_chunked = true;
         }
     }
-    // the chunks must tile HSK / Bc exactly (and the K chunk hold whole 32-element quant blocks)
-    if (result.d_split != 0 && (((hsk + 15) & ~15u) % result.d_split != 0 || result.row_split == 0 ||
-                                result.block_cols % result.row_split != 0 || result.d_split % 32 != 0)) {
-        result.d_split = 0;
-        result.row_split = 0;
+    if (use_chunked && chunked.d_split != 0) {
+        // the chunks must tile HSK / Bc exactly, a quantized K chunk must hold whole 32-element blocks
+        if (hsk_pad % chunked.d_split != 0 || chunked.d_split % 16 != 0 || (k_blocks && chunked.d_split % 32 != 0) ||
+            chunked.row_split == 0 || chunked.row_split % 16 != 0 || chunked.block_cols % chunked.row_split != 0) {
+            use_chunked = false;
+        }
     }
-
+    if (use_chunked) {
+        if (wg_req) {
+            chunked.workgroup_size = wg_req;
+        } else {
+            // workgroup-scope matrices are defined for 128 or 256 invocations only. Aim for 8 or 16 subgroups in the
+            // grid: narrow V heads (few column groups) get more rows and, with a single column group, fewer keys per
+            // block so each subgroup's share of S and O stays small.
+            auto gcd = [](uint32_t a, uint32_t b) { while (b) { const uint32_t r = a % b; a = b; b = r; } return a; };
+            uint32_t cg = gcd(chunked.block_cols / 16, hsv_pad / 16);
+            if (cg == 1 && chunked.block_cols > 64 && chunked.block_cols % (2 * chunked.row_split) == 0) {
+                chunked.block_cols /= 2;
+                cg = gcd(chunked.block_cols / 16, hsv_pad / 16);
+            }
+            const uint32_t sg_size = result.subgroup_size ? result.subgroup_size : 16;
+            while ((chunked.block_rows / 8) * cg < 8 && chunked.block_rows < 64) {
+                chunked.block_rows *= 2;
+            }
+            chunked.workgroup_size = (chunked.block_rows / 8) * cg * sg_size >= 256 ? 256 : 128;
+        }
+    }
+    if (use_chunked) {
+        result = chunked;
+    }
     return result;
 }
 
@@ -1435,7 +1469,8 @@ vk_fa_tuning_params get_fa_tuning_params(const vk_device& device, uint32_t hsk, 
 }
 
 vk_fa_pipeline_state get_fa_pipeline_state(const vk_device& device, const vk_fa_tuning_params& params, uint32_t hsk, uint32_t hsv, bool aligned, bool f32acc,
-                                                  bool use_mask, bool use_mask_opt, bool use_logit_softcap, bool use_sparse, ggml_type k_type, ggml_type v_type) {
+                                                  bool use_mask, bool use_mask_opt, bool use_logit_softcap, bool use_sparse, ggml_type k_type, ggml_type v_type,
+                                                  bool v_trans = false) {
     const bool old_amd_windows = device->vendor_id == VK_VENDOR_ID_AMD && device->driver_id == vk::DriverId::eAmdProprietary &&
                                  (device->architecture == AMD_GCN || device->architecture == AMD_RDNA1 || device->architecture == AMD_RDNA2);
 
@@ -1443,7 +1478,8 @@ vk_fa_pipeline_state get_fa_pipeline_state(const vk_device& device, const vk_fa_
                      (use_mask          ? 2 : 0) |
                      (use_logit_softcap ? 4 : 0) |
                      (old_amd_windows   ? 8 : 0) |
-                     (use_sparse        ? 16 : 0);
+                     (use_sparse        ? 16 : 0) |
+                     (v_trans           ? 32 : 0);   // b65: V stored transposed (keys contiguous), coopmat2 chunked path
 
     const uint32_t subgroup_size = params.disable_subgroups ? 0 : params.subgroup_size;
 
@@ -1852,10 +1888,12 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         // accumulator + A/B tiles has to stay well under that or the shader spills. Tiles as {BLOCK_SIZE, BM, BN, BK,
         // enable_smaller_matrices}; GGML_VK_CM2_MM_TILES="WG,BM,BN,BK[,small]/.../..." (s/m/l) overrides them,
         // BK raised to >= 32 for the quant shaders (32-element blocks).
+        // Shim measurements (mesa-anv2 p13, unroll 1): 128x32x32 no spills, 256x64x64 ~117, 256x128x64 ~214, 256x128x128 624
+        // (the per-element decode callbacks of the quant shaders dominate the register use).
         if (device->vendor_id == VK_VENDOR_ID_INTEL) {
             s_warptile = { 128,  32,  32, 32, 0 };
-            m_warptile = { 128,  64,  64, 32, 0 };
-            l_warptile = { 256, 128, 128, 32, 0 };
+            m_warptile = { 256,  64,  64, 32, 0 };
+            l_warptile = { 256, 128,  64, 32, 0 };
         }
         if (const char * e = getenv("GGML_VK_CM2_MM_TILES")) {
             std::array<uint32_t, 5> v[3] = {};
@@ -2420,10 +2458,10 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     if (device->coopmat2_mm) {
         // b65: Intel runs coopmat2 at SIMD16 (the DPAS width; without a required size ANV picks SIMD32 for
         // cooperative-matrix shaders, which halves the registers per lane); GGML_VK_CM2_UNROLL = k-loop unroll for
-        // 32-element quant blocks (upstream 8; Intel default 2)
+        // 32-element quant blocks (upstream 8; Intel default 1)
         const uint32_t cm2_sgs = device->vendor_id == VK_VENDOR_ID_INTEL ? 16u : 0u;
         const uint32_t cm2_unroll = getenv("GGML_VK_CM2_UNROLL") ? (uint32_t)atoi(getenv("GGML_VK_CM2_UNROLL")) :
-                                    device->vendor_id == VK_VENDOR_ID_INTEL ? 2u : 8u;
+                                    device->vendor_id == VK_VENDOR_ID_INTEL ? 1u : 8u;
         auto const &ggml_vk_mul_mm_cm2_spec = [&](std::vector<uint32_t> spec, bool aligned, uint32_t type = UINT32_MAX) {
             spec.push_back(aligned ? 1u : 0u);        // ALIGNED
             spec.push_back(cm2_sgs ? cm2_sgs : device->subgroup_size);     // subgroup_size
@@ -9162,7 +9200,9 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     // input tensor rows must be contiguous
     GGML_ASSERT(nbq0 == ggml_type_size(q->type));
     GGML_ASSERT(nbk0 == ggml_type_size(k->type));
-    GGML_ASSERT(nbv0 == ggml_type_size(v->type));
+    // b65: V may be a transposed f16 view (keys contiguous, the FA-off KV cache layout); coopmat2 chunked path only
+    const bool v_trans = nbv0 != ggml_type_size(v->type);
+    GGML_ASSERT(!v_trans || (v->type == GGML_TYPE_F16 && nbv1 == ggml_type_size(v->type)));
 
     GGML_ASSERT(neq0 == HSK);
 
@@ -9225,6 +9265,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     }
 
     tuning_params = get_fa_tuning_params(ctx->device, HSK, HSV, N, KV, k_type_eff, v_type_eff, f32acc);
+    GGML_ASSERT(!v_trans || (tuning_params.path == FA_COOPMAT2 && tuning_params.d_split != 0));
 
     float scale         = 1.0f;
     float max_bias      = 0.0f;
@@ -9243,7 +9284,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     static const bool disable_sparse = getenv("GGML_VK_FA_SPARSE_DISABLE") != nullptr;
     // cm2 dense is fast, so it needs a larger reduction to win.
     const int64_t min_ratio = tuning_params.path == FA_COOPMAT2 ? 4 : 2;
-    const bool use_sparse = !disable_sparse && n_kv_max > 0 && mask &&
+    const bool use_sparse = !disable_sparse && !v_trans && n_kv_max > 0 && mask &&
                             max_bias == 0.0f && logit_softcap == 0.0f &&
                             k_type_eff == GGML_TYPE_F16 && v_type_eff == GGML_TYPE_F16 &&
                             nem0 == KV &&
@@ -9252,7 +9293,8 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
 
     const uint32_t q_stride = (uint32_t)(nbq1 / ggml_type_size(q->type));
     uint32_t k_stride = (uint32_t)(nbk1 / ggml_type_size(k->type));
-    uint32_t v_stride = (uint32_t)(nbv1 / ggml_type_size(v->type));
+    // transposed V: the stride between head-dim rows (keys are contiguous)
+    uint32_t v_stride = (uint32_t)((v_trans ? nbv0 : nbv1) / ggml_type_size(v->type));
 
     // For F32, the shader treats it as a block of size 4 (for vec4 loads)
     if (k->type == GGML_TYPE_F32) {
@@ -9292,7 +9334,8 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     bool use_mask_opt = mask && !use_sparse && nem1 >= 32 && nem0 * nem1 > 32768 && nem0 >= tuning_params.block_cols * 16
                         && (ctx->device->architecture != vk_device_architecture::AMD_GCN || HSK > 256 || HSV > 256);
     vk_fa_pipeline_state fa_pipeline_state = get_fa_pipeline_state(ctx->device, tuning_params, HSK, HSV, aligned, f32acc,
-                                                                   mask != nullptr, use_mask_opt, logit_softcap != 0, use_sparse, k_type_eff, v_type_eff);
+                                                                   mask != nullptr, use_mask_opt, logit_softcap != 0, use_sparse, k_type_eff, v_type_eff,
+                                                                   v_trans);
 
     vk_pipeline pipeline = nullptr;
 
@@ -17442,6 +17485,18 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 if (!coopmat2 && !(device->subgroup_shuffle && device->subgroup_vote)) {
                     // scalar/coopmat1 FA uses subgroupShuffle/subgroupAll
                     return false;
+                }
+                // b65: transposed f16 V (keys contiguous) only through the coopmat2 chunked path (prompt batches)
+                if (op->src[2]->nb[0] != ggml_type_size(op->src[2]->type)) {
+                    if (!coopmat2 || op->src[2]->type != GGML_TYPE_F16 || op->src[1]->type != GGML_TYPE_F16 ||
+                        op->src[2]->nb[1] != ggml_type_size(op->src[2]->type) || op->src[0]->ne[1] < 2) {
+                        return false;
+                    }
+                    const vk_fa_tuning_params tp = get_fa_tuning_params(device, HSK, HSV, (uint32_t)op->src[0]->ne[1],
+                                                                        (uint32_t)op->src[1]->ne[1], GGML_TYPE_F16, GGML_TYPE_F16, true);
+                    if (tp.path != FA_COOPMAT2 || tp.d_split == 0) {
+                        return false;
+                    }
                 }
                 return true;
             }

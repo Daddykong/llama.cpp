@@ -9059,7 +9059,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
     // input tensor rows must be contiguous
     GGML_ASSERT(nbq0 == ggml_type_size(q->type));
     GGML_ASSERT(nbk0 == ggml_type_size(k->type));
-    GGML_ASSERT(nbv0 == ggml_type_size(v->type));
+    GGML_ASSERT(nbv0 == ggml_type_size(v->type) || v->type == GGML_TYPE_F16); // b65: f16 V may be transposed (strided rows)
 
     GGML_ASSERT(neq0 == DK);
     GGML_ASSERT(nek0 == DK);
@@ -9108,6 +9108,10 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
     GGML_ASSERT((                            q_to_vec_dot) && "fattn: unsupported K-type");
     GGML_ASSERT((v->type == GGML_TYPE_F32 || v_to_float  ) && "fattn: unsupported V-type");
 
+    // b65: transposed f16 V (strided rows): gathered element by element into the f32 path
+    const bool v_strided = nbv0 != ggml_type_size(v->type);
+    const bool v_f16_acc = v->type == GGML_TYPE_F16 && !v_strided;
+
     int ith = params->ith;
 
     for (int ir = ir0; ir < ir1; ++ir) {
@@ -9127,7 +9131,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         ggml_fp16_t * VKQ16 = (ggml_fp16_t *) (VKQ32 + 1*DV); // (temporary) FP16 VKQ accumulator
         ggml_fp16_t * Q_q   = (ggml_fp16_t *) (VKQ32 + 2*DV); // (temporary) buffer for Q converted to quantized/FP16
 
-        if (v->type == GGML_TYPE_F16) {
+        if (v_f16_acc) {
             memset(VKQ16, 0, DV*sizeof(ggml_fp16_t));
         } else {
             memset(VKQ32, 0, DV*sizeof(float));
@@ -9176,7 +9180,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
 
             const char * v_data = ((const char *) v->data + (ic*nbv1 + iv2*nbv2 + iv3*nbv3));
 
-            if (v->type == GGML_TYPE_F16) {
+            if (v_f16_acc) {
                 if (s > M) {
                     // s is new maximum, ms < 1.0f, vs == expf(s - s) == 1.0f
                     M = s;
@@ -9205,7 +9209,12 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
                 }
 
                 // V += v*expf(s - M)
-                if (v_to_float) {
+                if (v_strided) {
+                    for (int64_t d = 0; d < DV; ++d) {
+                        V32[d] = GGML_CPU_FP16_TO_FP32(*(const ggml_fp16_t *) (v_data + d*nbv0));
+                    }
+                    ggml_vec_mad_f32(DV, VKQ32, V32, vs);
+                } else if (v_to_float) {
                     v_to_float(v_data, V32, DV);
                     ggml_vec_mad_f32(DV, VKQ32, V32, vs);
                 } else {
@@ -9217,7 +9226,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
             S = S*ms + vs; // scale and increment sum with partial sum
         }
 
-        if (v->type == GGML_TYPE_F16) {
+        if (v_f16_acc) {
             for (int64_t d = 0; d < DV; ++d) {
                 VKQ32[d] = GGML_CPU_FP16_TO_FP32(VKQ16[d]);
             }
@@ -9652,7 +9661,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
     // input tensor rows must be contiguous
     GGML_ASSERT(nbq0 == ggml_type_size(q->type));
     GGML_ASSERT(nbk0 == ggml_type_size(k->type));
-    GGML_ASSERT(nbv0 == ggml_type_size(v->type));
+    GGML_ASSERT(nbv0 == ggml_type_size(v->type) || v->type == GGML_TYPE_F16); // b65: f16 V may be transposed (strided rows)
 
     GGML_ASSERT(neq0 == DK);
     GGML_ASSERT(nek0 == DK);
@@ -9673,7 +9682,9 @@ static void ggml_compute_forward_flash_attn_ext_f16(
     const bool use_ref = params->use_ref;
 
     const bool kv_is_f32_or_f16 = (k->type == GGML_TYPE_F32 || k->type == GGML_TYPE_F16);
-    const bool use_split_kv_path = !use_ref && (neq1 == 1 && neq3 == 1) && kv_is_f32_or_f16 && (k->type == v->type) && q->type == GGML_TYPE_F32 && nek1 >= 512;
+    // b65: a transposed f16 V (nbv0 != element size) only runs through the plain one-chunk path
+    const bool v_strided = nbv0 != ggml_type_size(v->type);
+    const bool use_split_kv_path = !use_ref && !v_strided && (neq1 == 1 && neq3 == 1) && kv_is_f32_or_f16 && (k->type == v->type) && q->type == GGML_TYPE_F32 && nek1 >= 512;
 
     if (use_split_kv_path) {
         const int64_t chunk_size = (nek1 + nth - 1) / nth;
@@ -9730,7 +9741,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
         const int64_t dr = (nr + nchunk - 1) / nchunk;
 
         static constexpr int64_t Q_TILE_SZ  = ggml_fa_tile_config::Q;
-        bool use_tiled = !use_ref &&
+        bool use_tiled = !use_ref && !v_strided &&
                                (q->type == GGML_TYPE_F32 &&
                                 kv_is_f32_or_f16 &&
                                 k->type == v->type &&

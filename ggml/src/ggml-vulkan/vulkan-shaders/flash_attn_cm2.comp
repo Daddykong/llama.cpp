@@ -187,6 +187,10 @@ ACC_TYPE faAddSparseMask(const uint32_t row, const uint32_t col, const ACC_TYPE 
 // key slices; the row sums come from a row reduction instead of P x ones.
 const uint32_t FA_CHUNK_D = D_split;
 const uint32_t FA_CHUNK_KV = row_split;
+// chunk sizes for the chunked loops and matrix types, never 0 (16 on the upstream path where that code is dead: the
+// NVIDIA compiler crashes on zero-sized or 1-wide matrix types and divisions by a zero specialization constant)
+const uint32_t FA_CHUNK_D1 = FA_CHUNK_D != 0 ? FA_CHUNK_D : 16;
+const uint32_t FA_CHUNK_KV1 = FA_CHUNK_KV != 0 ? FA_CHUNK_KV : 16;
 // aligned variant of the chunked path: f16 K/V without decode, read through the dword views
 #if defined(BFLOAT16)
 const bool FA_U32 = FA_CHUNK_D != 0 && Clamp == 0;
@@ -423,27 +427,27 @@ void main() {
         uint32_t k_offset = ik2*p.nb12 + ik3*p.nb13;
         if (FA_CHUNK_D != 0) {
             [[dont_unroll]]
-            for (uint32_t ci = 0; ci < HSK_pad / FA_CHUNK_D; ++ci) {
+            for (uint32_t ci = 0; ci < HSK_pad / FA_CHUNK_D1; ++ci) {
                 // c as a product (not a loop-carried sum) so the driver can prove its alignment
-                const uint32_t c = ci * FA_CHUNK_D;
-                coopmat<FLOAT_TYPE, gl_ScopeWorkgroup, Br, FA_CHUNK_D, gl_MatrixUseA> Qc;
+                const uint32_t c = ci * FA_CHUNK_D1;
+                coopmat<FLOAT_TYPE, gl_ScopeWorkgroup, Br, FA_CHUNK_D1, gl_MatrixUseA> Qc;
                 coopMatLoad(Qc, fa_q_sh, c / 2, HSK_pad / 2, gl_CooperativeMatrixLayoutRowMajor);
-                coopmat<FLOAT_TYPE, gl_ScopeWorkgroup, FA_CHUNK_D, Bc, gl_MatrixUseB> Kc;
+                coopmat<FLOAT_TYPE, gl_ScopeWorkgroup, FA_CHUNK_D1, Bc, gl_MatrixUseB> Kc;
 #if defined(BFLOAT16)
                 if (FA_U32) {
-                    coopMatLoadTensorNV(Kc, data_ku32, k_offset / 4, sliceTensorLayoutNV(tensorLayoutK, j * Bc, Bc, c, FA_CHUNK_D), tensorViewTranspose);
+                    coopMatLoadTensorNV(Kc, data_ku32, k_offset / 4, sliceTensorLayoutNV(tensorLayoutK, j * Bc, Bc, c, FA_CHUNK_D1), tensorViewTranspose);
                 } else {
-                    coopMatLoadTensorNV(Kc, data_k, k_offset, sliceTensorLayoutNV(tensorLayoutK, j * Bc, Bc, c, FA_CHUNK_D), tensorViewTranspose);
+                    coopMatLoadTensorNV(Kc, data_k, k_offset, sliceTensorLayoutNV(tensorLayoutK, j * Bc, Bc, c, FA_CHUNK_D1), tensorViewTranspose);
                 }
 #else
                 if (FA_U32) {
-                    coopMatLoadTensorNV(Kc, data_ku32, k_offset / 4, sliceTensorLayoutNV(tensorLayoutK, j * Bc, Bc, c, FA_CHUNK_D), tensorViewTranspose);
+                    coopMatLoadTensorNV(Kc, data_ku32, k_offset / 4, sliceTensorLayoutNV(tensorLayoutK, j * Bc, Bc, c, FA_CHUNK_D1), tensorViewTranspose);
                 } else if (USE_SPARSE) {
-                    coopMatLoadTensorNV(Kc, data_k, k_offset, sliceTensorLayoutNV(tensorLayoutK, j * Bc, Bc, c, FA_CHUNK_D), tensorViewTranspose FAGATHERK);
+                    coopMatLoadTensorNV(Kc, data_k, k_offset, sliceTensorLayoutNV(tensorLayoutK, j * Bc, Bc, c, FA_CHUNK_D1), tensorViewTranspose FAGATHERK);
                 } else if (bs_k > 1u) {
-                    coopMatLoadTensorNV(Kc, data_k, k_offset, sliceTensorLayoutNV(tensorLayoutK, j * Bc, Bc, c, FA_CHUNK_D), tensorViewTranspose FADECODEK);
+                    coopMatLoadTensorNV(Kc, data_k, k_offset, sliceTensorLayoutNV(tensorLayoutK, j * Bc, Bc, c, FA_CHUNK_D1), tensorViewTranspose FADECODEK);
                 } else {
-                    coopMatLoadTensorNV(Kc, data_k, k_offset, sliceTensorLayoutNV(tensorLayoutK, j * Bc, Bc, c, FA_CHUNK_D), tensorViewTranspose);
+                    coopMatLoadTensorNV(Kc, data_k, k_offset, sliceTensorLayoutNV(tensorLayoutK, j * Bc, Bc, c, FA_CHUNK_D1), tensorViewTranspose);
                 }
 #endif
                 S = coopMatMulAdd(Qc, Kc, S);
@@ -518,8 +522,6 @@ void main() {
         }
 
         if (FA_CHUNK_D != 0) {
-            coopMatReduceNV(rowsum, P, gl_CooperativeMatrixReduceRowNV, addReduce);
-            L = eM*L + rowsum;
             coopmat<ACC_TYPE, gl_ScopeWorkgroup, Br, HSV_pad, gl_MatrixUseAccumulator> eMdiag;
             coopMatReduceNV(eMdiag, eM, gl_CooperativeMatrixReduceRowNV, smearReduce);
             O *= coopmat<O_TYPE, gl_ScopeWorkgroup, Br, HSV_pad, gl_MatrixUseAccumulator>(eMdiag);
@@ -529,31 +531,50 @@ void main() {
             coopMatStore(Ph, fa_p_sh, 0, Bc / 2, gl_CooperativeMatrixLayoutRowMajor);
             barrier();
             uint32_t v_offset = iv2*p.nb22 + iv3*p.nb23;
+            // row sums by P x ones next to P x V (same f16 P, every column group gets whole-row sums, no cross-subgroup
+            // reduction)
+            coopmat<FLOAT_TYPE, gl_ScopeWorkgroup, FA_CHUNK_KV1, Bc, gl_MatrixUseB> OnesKV = coopmat<FLOAT_TYPE, gl_ScopeWorkgroup, FA_CHUNK_KV1, Bc, gl_MatrixUseB>(1.0);
+            rowsum = coopmat<ACC_TYPE, gl_ScopeWorkgroup, Br, Bc, gl_MatrixUseAccumulator>(0.0);
             [[dont_unroll]]
-            for (uint32_t bi = 0; bi < Bc / FA_CHUNK_KV; ++bi) {
-                const uint32_t b = bi * FA_CHUNK_KV;
-                coopmat<FLOAT_TYPE, gl_ScopeWorkgroup, Br, FA_CHUNK_KV, gl_MatrixUseA> Pc;
+            for (uint32_t bi = 0; bi < Bc / FA_CHUNK_KV1; ++bi) {
+                const uint32_t b = bi * FA_CHUNK_KV1;
+                coopmat<FLOAT_TYPE, gl_ScopeWorkgroup, Br, FA_CHUNK_KV1, gl_MatrixUseA> Pc;
                 coopMatLoad(Pc, fa_p_sh, b / 2, Bc / 2, gl_CooperativeMatrixLayoutRowMajor);
-                coopmat<FLOAT_TYPE, gl_ScopeWorkgroup, FA_CHUNK_KV, HSV_pad, gl_MatrixUseB> Vc;
+                rowsum = coopMatMulAdd(Pc, OnesKV, rowsum);
+                coopmat<FLOAT_TYPE, gl_ScopeWorkgroup, FA_CHUNK_KV1, HSV_pad, gl_MatrixUseB> Vc;
+                if (V_TRANS) {
+                    // keys contiguous: load the (HSV x keys) slice through the transposed view -> column-major B
+                    tensorLayoutNV<2, Clamp> tlVT = createTensorLayoutNV(2, Clamp);
+                    tlVT = setTensorLayoutDimensionNV(tlVT, HSV, KV);
+                    tlVT = setTensorLayoutStrideNV(tlVT, v_stride, 1);
+                    if (FA_U32) {
+                        coopMatLoadTensorNV(Vc, data_vu32, v_offset / 4, sliceTensorLayoutNV(tlVT, 0, HSV_pad, j * Bc + b, FA_CHUNK_KV1), tensorViewTranspose);
+                    } else {
+                        coopMatLoadTensorNV(Vc, data_v, v_offset, sliceTensorLayoutNV(tlVT, 0, HSV_pad, j * Bc + b, FA_CHUNK_KV1), tensorViewTranspose);
+                    }
+                    O = coopMatMulAdd(Pc, Vc, O);
+                    continue;
+                }
 #if defined(BFLOAT16)
                 if (FA_U32) {
-                    coopMatLoadTensorNV(Vc, data_vu32, v_offset / 4, sliceTensorLayoutNV(tensorLayoutV, j * Bc + b, FA_CHUNK_KV, 0, HSV_pad));
+                    coopMatLoadTensorNV(Vc, data_vu32, v_offset / 4, sliceTensorLayoutNV(tensorLayoutV, j * Bc + b, FA_CHUNK_KV1, 0, HSV_pad));
                 } else {
-                    coopMatLoadTensorNV(Vc, data_v, v_offset, sliceTensorLayoutNV(tensorLayoutV, j * Bc + b, FA_CHUNK_KV, 0, HSV_pad));
+                    coopMatLoadTensorNV(Vc, data_v, v_offset, sliceTensorLayoutNV(tensorLayoutV, j * Bc + b, FA_CHUNK_KV1, 0, HSV_pad));
                 }
 #else
                 if (FA_U32) {
-                    coopMatLoadTensorNV(Vc, data_vu32, v_offset / 4, sliceTensorLayoutNV(tensorLayoutV, j * Bc + b, FA_CHUNK_KV, 0, HSV_pad));
+                    coopMatLoadTensorNV(Vc, data_vu32, v_offset / 4, sliceTensorLayoutNV(tensorLayoutV, j * Bc + b, FA_CHUNK_KV1, 0, HSV_pad));
                 } else if (USE_SPARSE) {
-                    coopMatLoadTensorNV(Vc, data_v, v_offset, sliceTensorLayoutNV(tensorLayoutV, j * Bc + b, FA_CHUNK_KV, 0, HSV_pad) FAGATHERV);
+                    coopMatLoadTensorNV(Vc, data_v, v_offset, sliceTensorLayoutNV(tensorLayoutV, j * Bc + b, FA_CHUNK_KV1, 0, HSV_pad) FAGATHERV);
                 } else if (bs_v > 1u) {
-                    coopMatLoadTensorNV(Vc, data_v, v_offset, sliceTensorLayoutNV(tensorLayoutV, j * Bc + b, FA_CHUNK_KV, 0, HSV_pad) FADECODEV);
+                    coopMatLoadTensorNV(Vc, data_v, v_offset, sliceTensorLayoutNV(tensorLayoutV, j * Bc + b, FA_CHUNK_KV1, 0, HSV_pad) FADECODEV);
                 } else {
-                    coopMatLoadTensorNV(Vc, data_v, v_offset, sliceTensorLayoutNV(tensorLayoutV, j * Bc + b, FA_CHUNK_KV, 0, HSV_pad));
+                    coopMatLoadTensorNV(Vc, data_v, v_offset, sliceTensorLayoutNV(tensorLayoutV, j * Bc + b, FA_CHUNK_KV1, 0, HSV_pad));
                 }
 #endif
                 O = coopMatMulAdd(Pc, Vc, O);
             }
+            L = eM*L + rowsum;
             continue;
         }
 

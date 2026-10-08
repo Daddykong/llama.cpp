@@ -1185,6 +1185,9 @@ struct llm_graph_context {
     // b65 Quest: set by build_attn (KV path) for build_attn_mha
     mutable ggml_tensor * quest_kmm = nullptr;
     mutable ggml_tensor * quest_q   = nullptr;
+    // b65 (LLAMA_FA_PREFILL_MIN): f16 copy of the f32 KQ mask, made once per graph for the prompt-batch flash attention
+    mutable ggml_tensor * fa_mask_src = nullptr;
+    mutable ggml_tensor * fa_mask_f16 = nullptr;
 
     ggml_tensor * build_attn_mha(
             ggml_tensor * q,       // [n_embd_head_q, n_head_q, n_tokens]

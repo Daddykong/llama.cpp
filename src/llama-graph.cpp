@@ -2644,9 +2644,23 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
     ggml_tensor * cur;
 
-    const bool use_flash_attn = cparams.flash_attn && kq_b == nullptr;
+    // b65: LLAMA_FA_PREFILL_MIN=<n> - flash attention off (FA-off KV cache: V transposed, decode/MTP kernels unchanged),
+    // but prompt batches of at least n tokens run flash attention on that cache (Vulkan: coopmat2 chunked path)
+    static const int fa_prefill_min = getenv("LLAMA_FA_PREFILL_MIN") ? atoi(getenv("LLAMA_FA_PREFILL_MIN")) : 0;
+    const bool fa_prefill = !cparams.flash_attn && fa_prefill_min > 0 && q->ne[1] >= fa_prefill_min && v_mla == nullptr &&
+                            k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16 && arch != LLM_ARCH_GROK;
+    const bool use_flash_attn = (cparams.flash_attn || fa_prefill) && kq_b == nullptr;
     if (use_flash_attn) {
         GGML_ASSERT(kq_b == nullptr && "Flash attention does not support KQ bias yet");
+
+        if (kq_mask && kq_mask->type != GGML_TYPE_F16) {
+            if (fa_mask_src != kq_mask) {
+                fa_mask_src = kq_mask;
+                fa_mask_f16 = ggml_cast(ctx0, kq_mask, GGML_TYPE_F16);
+                cb(fa_mask_f16, "kq_mask_f16", -1);
+            }
+            kq_mask = fa_mask_f16;
+        }
 
         if (v_trans) {
             v = ggml_transpose(ctx0, v);

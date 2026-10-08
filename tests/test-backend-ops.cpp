@@ -8174,9 +8174,11 @@ struct test_flash_attn_ext : public test_case {
     const bool kv_view; // create K/V as views of a larger buffer (like a KV cache)
     const bool v_is_view_of_k;
     const int64_t n_kv_max;
+    bool v_trans = false; // b65: V as a transposed view of a [kv, hsv] tensor (the FA-off KV cache layout)
 
     std::string vars() override {
-        return VARS_TO_STR17(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute, kv_view, v_is_view_of_k, n_kv_max);
+        return VARS_TO_STR17(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute, kv_view, v_is_view_of_k, n_kv_max) +
+               (v_trans ? std::string(",v_trans=1") : std::string());
     }
 
     double max_nmse_err() override {
@@ -8227,7 +8229,12 @@ struct test_flash_attn_ext : public test_case {
         ggml_set_name(k, "k");
 
         ggml_tensor * v = nullptr;
-        if (v_is_view_of_k) {
+        if (v_trans) {
+            // keys contiguous, like the transposed V cache: a [kv(+pad), hsv, nh, nr] tensor viewed as [hsv, kv, nh, nr]
+            ggml_tensor * vt0 = ggml_new_tensor_4d(ctx, type_V, kv_view ? GGML_PAD(kv, 256) : kv, hsv_padded, nh, nr23[1]);
+            ggml_tensor * vt = ggml_view_4d(ctx, vt0, kv, hsv_padded, nh, nr23[1], vt0->nb[1], vt0->nb[2], vt0->nb[3], 0);
+            v = ggml_transpose(ctx, vt);
+        } else if (v_is_view_of_k) {
             // the V cache is a sub-view of the K cache. this is used by some MLA-based models
             // for more info:
             //   - https://github.com/ggml-org/llama.cpp/pull/13435
@@ -8282,6 +8289,14 @@ struct test_flash_attn_ext : public test_case {
     bool grad_precise() override {
         return true;
     }
+};
+
+// b65: transposed V (see test_flash_attn_ext::v_trans)
+struct test_flash_attn_ext_vtrans : public test_flash_attn_ext {
+    test_flash_attn_ext_vtrans(int64_t hsk, int64_t hsv, int64_t nh, std::array<int64_t, 2> nr23, int64_t kv, int64_t nb,
+                               bool mask, bool sinks, float max_bias, float logit_softcap, ggml_prec prec,
+                               ggml_type type_K, ggml_type type_V)
+        : test_flash_attn_ext(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V) { v_trans = true; }
 };
 
 // large Q values, so the online softmax has to rescale the partial results
@@ -11589,6 +11604,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 2},  1025,   1, true, true,  8, 30, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1},  1025,  64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1}, 16384,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+    // b65: transposed f16 V (FA-off KV cache layout) at prompt batches: aligned / unaligned KV, GQA, ALiBi, softcap, sinks
+    for (int64_t hs : {64, 128, 256}) {
+        for (int64_t kv : {256, 1024, 1000, 4113}) {
+            for (int64_t nb : {2, 7, 32, 512}) {
+                test_cases.emplace_back(new test_flash_attn_ext_vtrans(hs, hs, 4, {6, 1}, kv, nb, true, false, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+            }
+        }
+        test_cases.emplace_back(new test_flash_attn_ext_vtrans(hs, hs, 4, {1, 1}, 1024, 64, true,  false, 8.0f, 0.0f,  GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+        test_cases.emplace_back(new test_flash_attn_ext_vtrans(hs, hs, 4, {1, 1}, 1024, 64, true,  true,  0.0f, 0.0f,  GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+        test_cases.emplace_back(new test_flash_attn_ext_vtrans(hs, hs, 4, {1, 1}, 1024, 64, true,  false, 0.0f, 50.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+        test_cases.emplace_back(new test_flash_attn_ext_vtrans(hs, hs, 4, {2, 1}, 1024, 64, false, false, 0.0f, 0.0f,  GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    }
 
     // MLA shape: the V cache is a sub-view of the K cache, with quantized KV
     test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {8, 1},  113,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, true));
@@ -11869,6 +11896,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // flash attention and the FA-off K x Q / V x P matmuls
     for (int kv : {512, 4096, 8192, 32768}) {
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+        test_cases.emplace_back(new test_flash_attn_ext_vtrans(256, 256, 4, {6, 1}, kv, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, kv, 512, 256, {4, 1}, {6, 1}, {0, 2, 1, 3}));
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 256, 512, kv, {4, 1}, {6, 1}, {0, 1, 2, 3}, 2*kv));
     }
