@@ -157,20 +157,21 @@ void main() {
                 int32_t a[8];
                 vec3 cf;
                 decode(row, jb, a, cf);
+                // every supported type has cf.x == cf.y (one scale per 32-value block): one integer sum per block
                 [[unroll]] for (uint c = 0; c < CT; ++c) {
                     const uint j = cg * CT + c;
                     const ivec4 bl = sb_lo[kk][j];
                     const ivec4 bh = sb_hi[kk][j];
-                    int32_t s_lo = dotPacked4x8EXT(a[0], bl.x);
-                    s_lo += dotPacked4x8EXT(a[1], bl.y);
-                    s_lo += dotPacked4x8EXT(a[2], bl.z);
-                    s_lo += dotPacked4x8EXT(a[3], bl.w);
-                    int32_t s_hi = dotPacked4x8EXT(a[4], bh.x);
-                    s_hi += dotPacked4x8EXT(a[5], bh.y);
-                    s_hi += dotPacked4x8EXT(a[6], bh.z);
-                    s_hi += dotPacked4x8EXT(a[7], bh.w);
+                    int32_t s = dotPacked4x8EXT(a[0], bl.x);
+                    s += dotPacked4x8EXT(a[1], bl.y);
+                    s += dotPacked4x8EXT(a[2], bl.z);
+                    s += dotPacked4x8EXT(a[3], bl.w);
+                    s += dotPacked4x8EXT(a[4], bh.x);
+                    s += dotPacked4x8EXT(a[5], bh.y);
+                    s += dotPacked4x8EXT(a[6], bh.z);
+                    s += dotPacked4x8EXT(a[7], bh.w);
                     const vec2 ds = sb_ds[kk][j];
-                    acc[r][c] += ds.x * (cf.x * float(s_lo) + cf.y * float(s_hi)) + cf.z * ds.y;
+                    acc[r][c] = fma(float(s), ds.x * cf.x, fma(cf.z, ds.y, acc[r][c]));
                 }
             }
         }
