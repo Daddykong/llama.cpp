@@ -5034,7 +5034,11 @@ vk_device ggml_vk_get_device(size_t idx) {
                     found_fp32_128 && found_fp32_256 &&
                     coopmat2_props.cooperativeMatrixFlexibleDimensionsMaxDimension >= 512) {
                     device->coopmat2 = true;
-                    device->coopmat2_mm = !(getenv("GGML_VK_CM2_MM") && atoi(getenv("GGML_VK_CM2_MM")) == 0);
+                    // b65: on Intel (mesa-anv2) the coopmat2 quant matmuls run ~40x slower than the coopmat1/int-dot
+                    // ones (per-element decode callbacks; X27a: 512-token Q4_0 17408x5120 132 ms vs 3.1 ms), so there
+                    // the matmuls stay on coopmat1 and only flash attention uses coopmat2. GGML_VK_CM2_MM=0/1 overrides.
+                    device->coopmat2_mm = getenv("GGML_VK_CM2_MM") ? atoi(getenv("GGML_VK_CM2_MM")) != 0
+                                                                   : device->vendor_id != VK_VENDOR_ID_INTEL;
                     device->coopmat2_bf16_support = found_bf16_128 && found_bf16_256;
                     device->coopmat2_decode_vector = coopmat2_decode_vector_support && coopmat2_decode_vector_features.cooperativeMatrixDecodeVector;
                 }
