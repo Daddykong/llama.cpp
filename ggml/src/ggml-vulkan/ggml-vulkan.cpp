@@ -3544,19 +3544,24 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         const uint64_t     wl[4] = { mul_mmvq_wide_q4_0r_len,  mul_mmvq_wide_q4_1r_len,  mul_mmvq_wide_q5_kr_len,  mul_mmvq_wide_q8_0r_len };
         const char *       wn[4] = { "mul_mmvq_wide_q4_0r", "mul_mmvq_wide_q4_1r", "mul_mmvq_wide_q5_kr", "mul_mmvq_wide_q8_0r" };
         const uint32_t nc[3] = { 16, 32, 64 };
-        // default: 8 columns per invocation, RT = 1/2/4 -> 128 rows per workgroup for every column tile, 8-block k-chunks.
-        // GGML_VK_MMVQ_WIDE_CFG="ct:rt_mul:kcb" for tuning (columns per invocation, factor on RT, k-chunk blocks)
-        uint32_t w_ct = 8, w_rtm = 1, w_kcb = 8;
-        if (const char * cfg = getenv("GGML_VK_MMVQ_WIDE_CFG")) {
-            sscanf(cfg, "%u:%u:%u", &w_ct, &w_rtm, &w_kcb);
+        // per column tile "ct:rt_mul:kcb" (columns per invocation, factor on the base RT of 128 rows per workgroup at
+        // 8 columns per invocation, k-chunk blocks). Defaults from the B65 sweep (MTP-w2, 2026-10-07): 16 and 32
+        // columns 4:2:16, 64 columns 8:1:8. GGML_VK_MMVQ_WIDE_CFG (all tiles) / GGML_VK_MMVQ_WIDE_CFG16|32|64 override.
+        uint32_t w_ct[3] = { 4, 4, 8 }, w_rtm[3] = { 2, 2, 1 }, w_kcb[3] = { 16, 16, 8 };
+        for (uint32_t c = 0; c < 3; ++c) {
+            const char * all = getenv("GGML_VK_MMVQ_WIDE_CFG");
+            const char * one = getenv(c == 0 ? "GGML_VK_MMVQ_WIDE_CFG16" : (c == 1 ? "GGML_VK_MMVQ_WIDE_CFG32" : "GGML_VK_MMVQ_WIDE_CFG64"));
+            if (const char * cfg = one ? one : all) {
+                sscanf(cfg, "%u:%u:%u", &w_ct[c], &w_rtm[c], &w_kcb[c]);
+            }
         }
         for (uint32_t t = 0; t < 4; ++t) {
             for (uint32_t c = 0; c < 3; ++c) {
-                const uint32_t ct = std::min(w_ct, nc[c]);
-                const uint32_t rt = std::max(1u, (128u * nc[c]) / (256u * ct)) * w_rtm;
+                const uint32_t ct = std::min(w_ct[c], nc[c]);
+                const uint32_t rt = std::max(1u, (128u * nc[c]) / (256u * ct)) * w_rtm[c];   // same meaning as the MTP-w2 sweep
                 device->mmvq_wide_rows[c] = (256u * ct / nc[c]) * rt;
                 ggml_vk_create_pipeline2(device, device->pipeline_mmvq_wide[t][c], std::string(wn[t]) + "_" + std::to_string(nc[c]), wl[t], wd[t], "main", 3,
-                                        7 * sizeof(uint32_t), {1, 1, 1}, {nc[c], rt, ct, w_kcb}, 1);
+                                        7 * sizeof(uint32_t), {1, 1, 1}, {nc[c], rt, ct, w_kcb[c]}, 1);
             }
         }
     }
@@ -8251,7 +8256,7 @@ static bool ggml_vk_mmvq_wide(ggml_backend_vk_context * ctx, vk_context& subctx,
     const uint32_t nc = ci == 0 ? 16u : (ci == 1 ? 32u : 64u);
 
     // k-split when the row x column tiles would not fill the GPU (GGML_VK_MMVQ_WIDE_WG: target workgroups)
-    static const uint32_t target_wg = getenv("GGML_VK_MMVQ_WIDE_WG") ? (uint32_t) atoi(getenv("GGML_VK_MMVQ_WIDE_WG")) : 160u;
+    static const uint32_t target_wg = getenv("GGML_VK_MMVQ_WIDE_WG") ? (uint32_t) atoi(getenv("GGML_VK_MMVQ_WIDE_WG")) : 320u;
     const uint32_t gx = CEIL_DIV(m, ctx->device->mmvq_wide_rows[ci]);
     const uint32_t gy = CEIL_DIV((uint32_t) n, nc);
     const uint32_t nblk = k / 32;

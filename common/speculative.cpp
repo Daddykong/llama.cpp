@@ -1936,6 +1936,9 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
     // enable trace logging if LLAMA_TRACE is set
     const bool verbose;
 
+    static constexpr int ADAPT_MAX = 128;   // b65 [mtp]: longest draft the adaptive policy tracks
+    static constexpr int ADAPT_NB  = 7;     // verify-size buckets for the learned cost
+
     struct seq_info {
         // the last position in the prompt that was added to the ngram container
         size_t i_last = 0;
@@ -1946,27 +1949,40 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
         // consecutive accept rounds with low acceptance fraction (< 0.5)
         int n_low = 0;
 
-        // b65 [mtp] adaptive draft length (LLAMA_NGRAM_ADAPT=1): decayed counts of accepted ngram tokens and of
-        // rejections (a draft that was not accepted to its end), and of tokens per step of the other drafter (MTP)
-        double a_succ = 0.0;
-        double a_fail = 0.0;
-        double o_tok  = 0.0;
-        double o_n    = 0.0;
+        // b65 [mtp] adaptive draft length (LLAMA_NGRAM_ADAPT=1), all learned per request with decay:
+        //   elig[i] / accd[i]: ngram drafts that offered token i with tokens 1..i-1 accepted / that also had i accepted
+        //   (hazard of the acceptance run at i, so long copy runs and short novel runs are both learned)
+        //   cost_ratio[b]: measured step time / prior verify cost, per verify-size bucket; g_ratio from MTP steps
+        //   o_rate: tokens per ms of the steps the other drafter (MTP) made
+        double elig[ADAPT_MAX + 1] = {};
+        double accd[ADAPT_MAX + 1] = {};
+        double g_ratio = 0.0;
+        double g_w = 0.0;
+        double cost_ratio[ADAPT_NB] = {};
+        double cost_w[ADAPT_NB] = {};
+        double o_rate = 0.0;
+        double o_w = 0.0;
+        int64_t t_draft = 0;
     };
 
     std::vector<seq_info> sinfos;
 
-    // b65 [mtp] adaptive ngram draft length. A long ngram draft is verified as one batch of L+1 tokens, and the cost
-    // of that batch is not linear in L (on the B65: 3 tokens ~44 ms, 8 ~111 ms, 9-64 ~320-350 ms, 65 ~520 ms with
-    // the matmul path). With q = estimated per-token acceptance of ngram drafts (decayed counts + a prior), the
-    // expected tokens of a step that drafts L tokens are 1 + sum_{i=1..L} q^i; the drafter returns the L (up to the
-    // n-gram chain found) with the best tokens per ms of verify, or no draft when the other drafter's (MTP) recent
-    // tokens per step / cost(3) is better. Cost points: LLAMA_NGRAM_COST="n:ms,n:ms,..." (verify tokens incl. the
-    // sampled one), piecewise linear; default = B65 measurements.
+    // b65 [mtp] adaptive ngram draft length. A draft of L tokens is verified as one batch of L+1 tokens whose cost
+    // is not linear in L (B65: 4 tokens ~50 ms, 9-16 ~100-150 ms, 64 ~330 ms, 65 ~520 ms). For each draft the
+    // drafter returns the L (up to the n-gram chain found) with the most expected tokens per ms,
+    //   (1 + sum_{i<=L} P(accepted to i)) / cost(L+1),
+    // where P(accepted to i) is the learned survival of earlier ngram drafts (acceptance runs are long in copy/edit
+    // text and short in novel text, so no independence assumption), and cost = prior table (LLAMA_NGRAM_COST,
+    // "n:ms;n:ms", verify graph ms) x the learned ratio of measured step time to that prior for the size bucket.
+    // No draft when the other drafter's (MTP) measured tokens per ms is higher.
     const bool adapt = std::getenv("LLAMA_NGRAM_ADAPT") != nullptr && std::atoi(std::getenv("LLAMA_NGRAM_ADAPT")) != 0;
     std::vector<std::pair<int, double>> cost_pts;
 
-    double verify_cost(int n_tok) const {
+    static int cost_bucket(int n_tok) {
+        return n_tok <= 4 ? 0 : n_tok <= 8 ? 1 : n_tok <= 16 ? 2 : n_tok <= 32 ? 3 : n_tok <= 48 ? 4 : n_tok <= 64 ? 5 : 6;
+    }
+
+    double prior_cost(int n_tok) const {
         if (cost_pts.empty()) {
             return (double) n_tok;
         }
@@ -1980,23 +1996,47 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
                 return a.second + (b.second - a.second) * (double) (n_tok - a.first) / (double) (b.first - a.first);
             }
         }
-        // past the last point: linear in tokens from the last point
         const auto & l = cost_pts.back();
         return l.second * (double) n_tok / (double) l.first;
     }
 
+    // step time of a verify of n_tok tokens: prior x learned ratio of the bucket, else the ratio learned from the
+    // MTP steps (so the prior table only fixes the shape), else 1.1 (host-side time on top of the GPU graph)
+    double step_cost(const seq_info & si, int n_tok) const {
+        const int b = cost_bucket(n_tok);
+        const double g = si.g_w > 0.5 ? si.g_ratio / si.g_w : 1.1;
+        const double ratio = (si.cost_ratio[b] + g) / (si.cost_w[b] + 1.0);
+        return prior_cost(n_tok) * ratio;
+    }
+
+    // P(token i is accepted | tokens 1..i-1 were), weight-1 prior = the estimate at i-1 (0.97 at i = 1), so
+    // positions never drafted yet inherit the learned rate of the run so far (exploration in copy text)
+    double hazard(const seq_info & si, int i, double h_prev) const {
+        return (si.accd[i] + h_prev) / (si.elig[i] + 1.0);
+    }
+
+    double survive(const seq_info & si, int i) const {
+        double p = 1.0, h = 0.97;
+        for (int j = 1; j <= i; ++j) {
+            h = hazard(si, j, h);
+            p *= h;
+        }
+        return p;
+    }
+
     // best draft length <= n_avail for this sequence, 0 = do not draft
     int adapt_len(const seq_info & si, int n_avail) const {
-        const double q = std::min(0.995, (si.a_succ + 8.0) / (si.a_succ + si.a_fail + 9.0));
-        const double other_tok = si.o_n > 0.5 ? si.o_tok / si.o_n : 2.5;   // tokens per MTP step incl. the sampled one
-        const double r_other = other_tok / verify_cost(3);
+        n_avail = std::min(n_avail, ADAPT_MAX);
+        // other drafter: measured tokens per ms, prior 2.5 tokens per 3-token verify step
+        const double r_other = (si.o_rate * si.o_w + (2.5 / step_cost(si, 3)) * 2.0) / (si.o_w + 2.0);
         int best_l = 0;
         double best_r = r_other;
-        double e = 0.0, qp = 1.0;
+        double e = 0.0, sv = 1.0, h = 0.97;
         for (int l = 1; l <= n_avail; ++l) {
-            qp *= q;
-            e += qp;
-            const double r = (1.0 + e) / verify_cost(l + 1);
+            h = hazard(si, l, h);
+            sv *= h;
+            e += sv;
+            const double r = (1.0 + e) / step_cost(si, l + 1);
             if (r > best_r * 1.0001) {
                 best_r = r;
                 best_l = l;
@@ -2029,7 +2069,9 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
 
         if (adapt) {
             const char * c = std::getenv("LLAMA_NGRAM_COST");
-            std::string cs = c ? c : "1:39,3:44,4:51,8:111,9:316,32:327,48:337,64:350,65:521,128:1000";
+            // default: B65 verify graph ms by token count with mul_mmvq_wide (MTP-w2 sweep, 2026-10-08)
+            std::string cs = c ? c : "1:38;3:43;4:50;8:112;9:100;16:105;17:170;32:175;33:290;64:300;65:525;128:1040";
+            std::replace(cs.begin(), cs.end(), ';', ',');
             size_t pos = 0;
             while (pos < cs.size()) {
                 size_t e = cs.find(',', pos);
@@ -2051,8 +2093,8 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
 
         sinfo.i_last = 0;
         sinfo.n_draft_last = 0;
-        // b65 [mtp]: each request starts from the prior again
-        sinfo.a_succ = sinfo.a_fail = sinfo.o_tok = sinfo.o_n = 0.0;
+        // b65 [mtp]: each request starts from the priors again
+        sinfo = seq_info{};
 
         const size_t n = mod.get_n();
         if (prompt.size() < n) {
@@ -2085,6 +2127,7 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
         const auto & prompt = *dparams.prompt;
 
         sinfo.n_draft_last = 0;
+        sinfo.t_draft = ggml_time_us();
 
         const size_t cur_len = prompt.size();
         if (cur_len < mod.get_n()) {
@@ -2131,8 +2174,8 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
         if (adapt && !result.empty()) {
             const int l = adapt_len(sinfo, (int) result.size());
             if (verbose) {
-                SPC_TRC("ngram_mod adapt: chain %zu -> draft %d (succ %.1f fail %.1f other %.2f)\n",
-                        result.size(), l, sinfo.a_succ, sinfo.a_fail, sinfo.o_n > 0 ? sinfo.o_tok / sinfo.o_n : 0.0);
+                SPC_TRC("ngram_mod adapt: chain %zu -> draft %d (P8 %.2f P32 %.2f P63 %.2f, mtp %.4f tok/ms, cost64 %.0f ms)\n",
+                        result.size(), l, survive(sinfo, 8), survive(sinfo, 32), survive(sinfo, 63), sinfo.o_rate, step_cost(sinfo, 64));
             }
             result.resize(l);
         }
@@ -2162,13 +2205,31 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
     void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) override {
         if (adapt) {
             auto & si = sinfos[seq_id];
+            const double dt_ms = si.t_draft > 0 ? (double) (ggml_time_us() - si.t_draft) / 1000.0 : 0.0;
             if (is_other) {
-                si.o_tok = 0.95 * si.o_tok + (1.0 + n_accepted);
-                si.o_n   = 0.95 * si.o_n + 1.0;
+                if (dt_ms > 0.0) {
+                    si.o_rate = (si.o_rate * si.o_w * 0.95 + (1.0 + n_accepted) / dt_ms) / (si.o_w * 0.95 + 1.0);
+                    si.o_w = si.o_w * 0.95 + 1.0;
+                    si.g_ratio = si.g_ratio * 0.95 + dt_ms / prior_cost(3);
+                    si.g_w = si.g_w * 0.95 + 1.0;
+                }
             } else if (si.n_draft_last > 0) {
-                si.a_succ = 0.9 * si.a_succ + n_accepted;
-                si.a_fail = 0.9 * si.a_fail + (n_accepted < si.n_draft_last ? 1.0 : 0.0);
+                const int L = (int) std::min<size_t>(si.n_draft_last, ADAPT_MAX);
+                for (int i = 1; i <= ADAPT_MAX; ++i) {
+                    si.elig[i] *= 0.97;
+                    si.accd[i] *= 0.97;
+                }
+                for (int i = 1; i <= L && i <= n_accepted + 1; ++i) {
+                    si.elig[i] += 1.0;
+                    si.accd[i] += i <= n_accepted ? 1.0 : 0.0;
+                }
+                if (dt_ms > 0.0) {
+                    const int b = cost_bucket(L + 1);
+                    si.cost_ratio[b] = si.cost_ratio[b] * 0.8 + dt_ms / prior_cost(L + 1);
+                    si.cost_w[b] = si.cost_w[b] * 0.8 + 1.0;
+                }
             }
+            si.t_draft = 0;
         }
         if (is_other) {
             return;
