@@ -3629,10 +3629,12 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 while (kc > 8 && blk * rpt * (kc / 8 + 1) * 16 > shmem) kc /= 2;
                 device->mul_mat_vec_gqa_vxps_rpt = rpt;
                 ggml_vk_create_pipeline2(device, device->pipeline_mul_mat_vec_gqa_vxps_f16_f32[g][t], "mul_mat_vec_gqa_vxps_f16_f32" + sfx, mul_mat_vec_gqa_vxps_f16_f32_len, mul_mat_vec_gqa_vxps_f16_f32_data, "main", 3, sizeof(vk_mat_vec_vxp_push_constants), {1, 1, 1}, {blk, g + 1, t + 1, kc, rpt}, 1, true, false, sg);
-                {   // mode 4: + B tile (GQA*NTOK*KC floats) in shared memory
-                    uint32_t kcl = kc, rptl = rpt;
+                {   // mode 4: + B tile (GQA*NTOK*KC floats) in shared memory. 3-4 tokens default to KC 32 (KC 64 spills
+                    // on Xe2 there); KC only changes the tiling, never the fma order, so the result is the same
+                    uint32_t kcl = getenv("GGML_VK_VXP_KC") ? kc : (t >= 2 ? 32u : 64u), rptl = rpt;
+                    if (t >= 2 && getenv("GGML_VK_VXP_KC_N34")) kcl = std::max(8u, (uint32_t)atoi(getenv("GGML_VK_VXP_KC_N34")) / 8 * 8);
                     auto lsz = [&](uint32_t c, uint32_t r) { return blk * r * (c / 8 + 1) * 16 + (g + 1) * 4 * c * 4; };   // sized for 4 tokens: same tiling for every token count
-                    while (rptl > 1 && lsz(kcl, rptl) > shmem) rptl--;
+                    while (rptl > 1 && lsz(std::max(kcl, kc), rptl) > shmem) rptl--;   // same RPT for every token count
                     while (kcl > 8 && lsz(kcl, rptl) > shmem) kcl /= 2;
                     device->mul_mat_vec_gqa_vxpl_rpt[g][t] = rptl;
                     ggml_vk_create_pipeline2(device, device->pipeline_mul_mat_vec_gqa_vxpl_f16_f32[g][t], "mul_mat_vec_gqa_vxpl_f16_f32" + sfx, mul_mat_vec_gqa_vxpl_f16_f32_len, mul_mat_vec_gqa_vxpl_f16_f32_data, "main", 3, sizeof(vk_mat_vec_vxp_push_constants), {1, 1, 1}, {blk, g + 1, t + 1, kcl, rptl}, 1, true, false, sg);
@@ -7948,8 +7950,10 @@ static void ggml_vk_mul_mat_vec_gqa_vxp(ggml_backend_vk_context * ctx, vk_contex
     ggml_pipeline_request_descriptor_sets(ctx, pipeline2, 1);
 
     const size_t part_size = sizeof(float) * (size_t)nslices * nch_b * ntok * rows;
+    // grow in big steps (4 tokens, +64 slices): every regrow submits and waits for the whole queue
+    const size_t part_alloc = sizeof(float) * (size_t)(nslices + 64) * nch_b * std::max(ntok, 4u) * rows;
     if (ctx->prealloc_size_split_k < part_size) {
-        ctx->prealloc_size_split_k = part_size;
+        ctx->prealloc_size_split_k = std::min<size_t>(part_alloc, ctx->device->properties.limits.maxStorageBufferRange);
         ggml_vk_preallocate_buffers(ctx, subctx);
     }
 
@@ -8051,7 +8055,13 @@ static void ggml_vk_mul_mat_vec_gqa_f16_f32(ggml_backend_vk_context * ctx, vk_co
         return;
     }
     static const bool mask_skip_env = getenv("GGML_VK_ATTN_MASK_SKIP") != nullptr && atoi(getenv("GGML_VK_ATTN_MASK_SKIP")) != 0;
-    if (split && ggml_vk_gqa_vxp_mode() != 0 && !mask_skip_env && ggml_vk_gqa_vxp_ok(ctx, src0, src1)) {   // b65
+    // b65 vxp: real GQA only (the 2-4 token non-GQA f16 matvecs, e.g. the 48-row ssm projections, stay on split);
+    // 1 token stays on the split kernel (faster there on Xe2) unless GGML_VK_GQA_VXP_N1=1 or batch-invariant mode,
+    // where every token count must take the same kernel
+    static const bool vxp_n1 = (getenv("GGML_VK_GQA_VXP_N1") != nullptr && atoi(getenv("GGML_VK_GQA_VXP_N1")) != 0) ||
+                               (getenv("GGML_VK_BATCH_INVARIANT") != nullptr && atoi(getenv("GGML_VK_BATCH_INVARIANT")) != 0);
+    if (split && ggml_vk_gqa_vxp_mode() != 0 && !mask_skip_env && gqa > 1 && (ntok > 1 || vxp_n1) &&
+        ggml_vk_gqa_vxp_ok(ctx, src0, src1)) {   // b65
         ggml_vk_mul_mat_vec_gqa_vxp(ctx, subctx, src0, src1, dst);
         return;
     }
