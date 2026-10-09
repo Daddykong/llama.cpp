@@ -9509,6 +9509,9 @@ struct test_b65_kq_quant : public test_case {
         ggml_tensor * cache = ggml_new_tensor_2d(ctx, type, d * heads_kv, n_kv);
         ggml_tensor * k = ggml_view_3d(ctx, cache, d, n_kv, heads_kv, cache->nb[1], ggml_row_size(type, d), 0);
         ggml_tensor * q = ggml_permute(ctx, ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d, heads, n_tok), 0, 2, 1, 3);
+        if (n_tok >= 5) {
+            k = ggml_cast(ctx, k, GGML_TYPE_F16);   // b65 kv4: the graph's prompt path (LLAMA_B65_KV_DEQ_MIN_TOK 5)
+        }
         return ggml_mul_mat(ctx, k, q);
     }
 };
@@ -9525,6 +9528,13 @@ struct test_b65_vxq : public test_case {
     test_b65_vxq(ggml_type type, int64_t d, int64_t heads, int64_t heads_kv, int64_t n_kv, int64_t n_tok, int deq = 0)
         : type(type), d(d), heads(heads), heads_kv(heads_kv), n_kv(n_kv), n_tok(n_tok), deq(deq) {}
     std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "B65_VXQ"; }
+    void initialize_tensors(ggml_context * ctx) override {   // a transposed quantized view has no sensible byte size
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->view_src == nullptr) {
+                init_tensor_uniform(t);
+            }
+        }
+    }
     double max_nmse_err() override { return 5e-4; }
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * cache = ggml_new_tensor_2d(ctx, type, d * heads_kv, n_kv);
@@ -9533,9 +9543,33 @@ struct test_b65_vxq : public test_case {
         if (!deq) {
             return ggml_out_prod(ctx, v, ggml_transpose(ctx, kq));
         }
-        ggml_tensor * vf = ggml_cpy(ctx, v, ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d, n_kv, heads_kv));
-        ggml_tensor * vt = ggml_cpy(ctx, ggml_transpose(ctx, vf), ggml_new_tensor_3d(ctx, GGML_TYPE_F16, n_kv, d, heads_kv));
+        ggml_tensor * vt = ggml_cast(ctx, ggml_transpose(ctx, v), GGML_TYPE_F16);   // the graph's prompt path
         return ggml_mul_mat(ctx, vt, kq);
+    }
+};
+
+// b65 kv4: a quantized KV-cache view to contiguous f16 (prompt path): K view [d, n_kv, kv_heads] (tr = 0) or the
+// transposed V view [n_kv, d, kv_heads] (tr = 1)
+struct test_b65_kv_deq : public test_case {
+    const ggml_type type;
+    const int64_t d, heads_kv, n_kv;
+    const int tr;
+    std::string vars() override { return VARS_TO_STR5(type, d, heads_kv, n_kv, tr); }
+    test_b65_kv_deq(ggml_type type, int64_t d, int64_t heads_kv, int64_t n_kv, int tr)
+        : type(type), d(d), heads_kv(heads_kv), n_kv(n_kv), tr(tr) {}
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "B65_KV_DEQ"; }
+    void initialize_tensors(ggml_context * ctx) override {   // a transposed quantized view has no sensible byte size
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->view_src == nullptr) {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+    double max_nmse_err() override { return 1e-6; }
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * cache = ggml_new_tensor_2d(ctx, type, d * heads_kv, n_kv);
+        ggml_tensor * v = ggml_view_3d(ctx, cache, d, n_kv, heads_kv, cache->nb[1], ggml_row_size(type, d), 0);
+        return ggml_cast(ctx, tr ? ggml_transpose(ctx, v) : v, GGML_TYPE_F16);
     }
 };
 
@@ -9574,7 +9608,12 @@ static void add_b65_sparse_t_cases(std::vector<std::unique_ptr<test_case>> & tes
     test_cases.emplace_back(new test_b65_sm_mm(1000, 100, 128, 6, 1, true));
     test_cases.emplace_back(new test_b65_sm_mm(4096, 512, 256, 24, 4, true));
     // b65 kv4: quantized V cache, FA off (Qwen3.8-27B: d 256, 24 heads on 4 KV heads)
-    for (ggml_type vt : { GGML_TYPE_Q8_0, GGML_TYPE_Q4_0 }) {
+    for (ggml_type vt : { GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, GGML_TYPE_IQ4_NL }) {
+        for (int tr : { 0, 1 }) {
+            test_cases.emplace_back(new test_b65_kv_deq(vt, 256, 4, 1000, tr));
+            test_cases.emplace_back(new test_b65_kv_deq(vt, 256, 4, 4096, tr));
+            test_cases.emplace_back(new test_b65_kv_deq(vt, 128, 2, 77, tr));
+        }
         for (int64_t n_kv : { 64, 1000, 4096, 33024 }) {
             for (int64_t n_tok : { 1, 2, 3, 4 }) {
                 test_cases.emplace_back(new test_b65_vxq(vt, 256, 24, 4, n_kv, n_tok));

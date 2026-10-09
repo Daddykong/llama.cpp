@@ -523,6 +523,48 @@ static void ggml_compute_forward_dup_from_q(
     }
 }
 
+// b65 kv4: a quantized view whose blocks run along dim 0 or (transposed view) dim 1, to f16 / f32 of the same shape
+// (reference for the Vulkan prompt-path KV dequant; any dst strides)
+static void ggml_compute_forward_dup_from_q_view(
+        const ggml_compute_params * params,
+              ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    GGML_ASSERT(ggml_are_same_shape(src0, dst));
+    const ggml_type type = src0->type;
+    ggml_to_float_t const to_float = ggml_get_type_traits(type)->to_float;
+    const int64_t qk = ggml_blck_size(type);
+    const size_t ts = ggml_type_size(type);
+    const int pd = src0->nb[0] == ts ? 0 : 1;
+    GGML_ASSERT(src0->nb[pd] == ts && src0->ne[pd] % qk == 0);
+
+    const int64_t ne0 = src0->ne[0], ne1 = src0->ne[1], ne2 = src0->ne[2], ne3 = src0->ne[3];
+    const int64_t nr = ne1 * ne2 * ne3;
+    const int64_t dr = (nr + params->nth - 1) / params->nth;
+    const int64_t ir0 = dr * params->ith;
+    const int64_t ir1 = MIN(ir0 + dr, nr);
+
+    std::vector<float> buf(qk);
+    for (int64_t ir = ir0; ir < ir1; ++ir) {
+        const int64_t i1 = ir % ne1, i2 = (ir / ne1) % ne2, i3 = ir / (ne1 * ne2);
+        const char * last = nullptr;
+        for (int64_t i0 = 0; i0 < ne0; ++i0) {
+            const char * blk = (const char *) src0->data + i2 * src0->nb[2] + i3 * src0->nb[3] +
+                               (pd == 0 ? (i0 / qk) * src0->nb[0] + i1 * src0->nb[1] : i0 * src0->nb[0] + (i1 / qk) * src0->nb[1]);
+            if (blk != last) {
+                to_float(blk, buf.data(), qk);
+                last = blk;
+            }
+            const float v = buf[(pd == 0 ? i0 : i1) % qk];
+            char * d = (char *) dst->data + i0 * dst->nb[0] + i1 * dst->nb[1] + i2 * dst->nb[2] + i3 * dst->nb[3];
+            if (dst->type == GGML_TYPE_F16) {
+                *(ggml_fp16_t *) d = GGML_CPU_FP32_TO_FP16(v);
+            } else {
+                *(float *) d = v;
+            }
+        }
+    }
+}
+
 void ggml_compute_forward_dup(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
@@ -564,6 +606,12 @@ void ggml_compute_forward_dup(
             } break;
         default:
             {
+                if (ggml_is_quantized(src0->type) && (dst->type == GGML_TYPE_F16 || dst->type == GGML_TYPE_F32) &&
+                    ggml_are_same_shape(src0, dst) &&
+                    (dst->type == GGML_TYPE_F16 || src0->nb[0] != ggml_type_size(src0->type))) {   // b65 kv4
+                    ggml_compute_forward_dup_from_q_view(params, dst);
+                    break;
+                }
                 if (ggml_is_quantized(src0->type) && dst->type == GGML_TYPE_F32) {
                     ggml_compute_forward_dup_from_q(params, dst);
                     break;

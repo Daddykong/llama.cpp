@@ -24,6 +24,9 @@ layout (push_constant) uniform parameter
 } p;
 
 void main() {
+#if defined(DATA_A_IQ4_NL)
+    init_iq_shmem(gl_WorkGroupSize);
+#endif
     const uint row = gl_GlobalInvocationID.x / LPR;
     const uint j   = gl_GlobalInvocationID.x % LPR;
     const uint h   = gl_WorkGroupID.y;
@@ -42,8 +45,8 @@ void main() {
         }
     }
 
-#if defined(DATA_A_Q8_0)
-    const uint a_base = p.a_offset + h * p.a_chan_stride + rr * p.a_row_stride;   // q8_0 blocks
+#if defined(DATA_A_Q8_0) || defined(DATA_A_Q4_0) || defined(DATA_A_IQ4_NL)
+    const uint a_base = p.a_offset + h * p.a_chan_stride + rr * p.a_row_stride;   // q8_0 / q4_0 / iq4_nl blocks
 #else
     const uint a_base = (p.a_offset + h * p.a_chan_stride + rr * p.a_row_stride) / 4;
 #endif
@@ -51,6 +54,32 @@ void main() {
     const uint b_cs = p.b_chan_stride / 4;
     const uint b_ts = p.b_tok_stride / 4;
 
+#if defined(DATA_A_Q4_0) || defined(DATA_A_IQ4_NL)
+    // b65 kv4: 4-bit K cache. Four lanes per block, 8 elements each: the low and high nibbles of 4 bytes (elements
+    // m..m+3 and m+16..m+19, m = 4*(j%4)); 64 elements (two blocks) per iteration of the 8 lanes. ncols % 64 == 0.
+    for (uint e64 = 0; live && e64 < p.ncols / 64; ++e64) {
+        const uint ib = a_base + e64 * 2 + j / 4;
+        const uint w = (j % 4) * 2;
+        const float dq = float(data_a_packed16[ib].d);
+        const uint q = uint(data_a_packed16[ib].qs[w]) | (uint(data_a_packed16[ib].qs[w + 1]) << 16);
+#if defined(DATA_A_IQ4_NL)
+        const vec4 alo = vec4(kvalues_iq4nl[q & 0xFu], kvalues_iq4nl[(q >> 8) & 0xFu],
+                              kvalues_iq4nl[(q >> 16) & 0xFu], kvalues_iq4nl[(q >> 24) & 0xFu]) * dq;
+        const vec4 ahi = vec4(kvalues_iq4nl[(q >> 4) & 0xFu], kvalues_iq4nl[(q >> 12) & 0xFu],
+                              kvalues_iq4nl[(q >> 20) & 0xFu], kvalues_iq4nl[(q >> 28) & 0xFu]) * dq;
+#else
+        const vec4 alo = (vec4(q & 0xFu, (q >> 8) & 0xFu, (q >> 16) & 0xFu, (q >> 24) & 0xFu) - 8.0) * dq;
+        const vec4 ahi = (vec4((q >> 4) & 0xFu, (q >> 12) & 0xFu, (q >> 20) & 0xFu, (q >> 28) & 0xFu) - 8.0) * dq;
+#endif
+        const uint k4 = e64 * 16 + (j / 4) * 8 + (j % 4);
+        [[unroll]] for (uint t = 0; t < NTOK; ++t) {
+            [[unroll]] for (uint c = 0; c < GQA; ++c) {
+                const uint bb = b_base + c * b_cs + t * b_ts + k4;
+                acc[t * GQA + c] += dot(alo, data_b_v4[bb]) + dot(ahi, data_b_v4[bb + 4]);
+            }
+        }
+    }
+#else
     for (uint k4 = j; live && k4 < p.ncols / 4; k4 += LPR) {
 #if defined(DATA_A_Q8_0)
         const uint ib = a_base + k4 / 8;
@@ -68,6 +97,7 @@ void main() {
             }
         }
     }
+#endif
     [[unroll]] for (uint i = 0; i < NTOK * GQA; ++i) acc[i] = subgroupClusteredAdd(acc[i], LPR);
     if (j == 0 && row < p.nrows) {
         [[unroll]] for (uint t = 0; t < NTOK; ++t) {

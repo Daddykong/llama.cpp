@@ -8,33 +8,39 @@
 // b65 kv4: V x P with a quantized V cache (flash attention off), pass 1 of 2.
 //   part[s, h*GQA + c, t, i] = sum_{k in slice s} V[i, k, h] * P[t, k, h*GQA + c]
 // i.e. ggml_out_prod(v, transpose(kq)). A quantized V cache cannot be stored transposed (its blocks run along the head
-// dim), so V rows are tokens: d elements in d/32 blocks. A workgroup is d/2 lanes on one KV head and one k-slice;
-// lane l owns elements 2l, 2l+1 of every row (one 16-bit load + the block scale) and walks the slice's tokens in order,
-// with the slice's probabilities staged through shared memory (uniform reads). Every output is a fixed-order fma chain
-// over its slice, summed over the slices in order by pass 2 (mul_mat_vec_gqa_vxp_reduce.comp). The slicing depends
-// only on k and the head count, never on the token count, so 1-4 token steps give bit-identical results.
+// dim), so V rows are tokens: d elements in d/32 blocks (q8_0, q4_0 or iq4_nl), read through a 16-bit view.
+// A workgroup is one KV head and one k-slice: 128 lanes = R row groups of 256/EPL lanes; lane li of a row group owns
+// elements EPL*li .. EPL*li+EPL-1 of every row, row group rg takes the slice's tokens rg, rg+R, ... in order, with the
+// probabilities staged through shared memory (uniform reads). The R partial sums are added in a fixed order at the end;
+// pass 2 (mul_mat_vec_gqa_vxp_reduce.comp) adds the slices in order. EPL/R and the slicing depend only on the
+// pipeline's (GQA, NTOK) choice and on k and the head count; with EPL fixed for every NTOK (batch-invariant mode)
+// 1-4 token steps give bit-identical results.
 
-layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
 
-layout(constant_id = 0) const uint WG = 128;    // lanes = d/2 (d <= 2*WG; lanes past d/2 idle)
+layout(constant_id = 0) const uint EPL = 2;     // elements per lane: 2, 4 or 8 (R = EPL/2 row groups)
 layout(constant_id = 1) const uint GQA = 1;     // B channels per A channel, 1..8
 layout(constant_id = 2) const uint NTOK = 1;    // columns of B, 1..4
 layout(constant_id = 3) const uint KC = 64;     // tokens per staged probability tile
 
+#define WG 128u
+const uint LPR = 256u / EPL;   // lanes per row (head dim up to 256)
+const uint R = WG / LPR;       // row groups
+
 #if defined(DATA_A_Q8_0)
-struct blk_t { float16_t d; int16_t qs[16]; };     // 34 bytes
-#elif defined(DATA_A_Q4_0)
-struct blk_t { float16_t d; uint16_t qs[8]; };     // 18 bytes
+#define BU 17u
+#else
+#define BU 9u
 #endif
 
-layout (binding = 0) readonly buffer A {blk_t data_a[];};
+layout (binding = 0) readonly buffer A {uint16_t data_a[];};
 layout (binding = 1) readonly buffer B {float data_b[];};
 layout (binding = 2) writeonly buffer D {float data_d[];};
 
 layout (push_constant) uniform parameter
 {
     uint ncols;          // k (tokens of the cache)
-    uint nrows;          // d (head dim), multiple of 32, <= 2*WG
+    uint nrows;          // d (head dim), multiple of 32, <= 256
     uint a_row_stride;   // in blocks: one token row of the cache
     uint a_chan_stride;  // in blocks: one KV head
     uint b_chan_stride;  // in f32: one query head of P
@@ -46,31 +52,62 @@ layout (push_constant) uniform parameter
 } p;
 
 shared float btile[GQA * NTOK * KC];
+shared float red[WG * EPL];
 
-vec2 load_pair(const uint ib, const uint l) {
+#if defined(DATA_A_IQ4_NL)
+shared float kvalues[16];
+const float kvalues_const[16] = float[16](-127.0, -104.0, -83.0, -65.0, -49.0, -35.0, -22.0, -10.0,
+                                          1.0, 13.0, 25.0, 38.0, 53.0, 69.0, 89.0, 113.0);
+#endif
+
+// EPL elements starting at in-block element e (a multiple of EPL) of block ib
+void load_row(const uint ib, const uint e, out float v[EPL]) {
+    const uint u = (p.a_offset + ib) * BU;
+    const float d = unpackHalf2x16(uint(data_a[u])).x;
 #if defined(DATA_A_Q8_0)
-    const int q = int(data_a[ib].qs[l % 16]);           // elements 2l, 2l+1 of the block
-    return vec2(float((q << 24) >> 24), float(q >> 8)) * float(data_a[ib].d);
-#elif defined(DATA_A_Q4_0)
-    const uint e = (2 * l) % 32;                        // element in the block: e, e+1
-    const uint q = uint(data_a[ib].qs[(e % 16) / 2]);   // bytes e%16, e%16+1
+    [[unroll]] for (uint w = 0; w < EPL / 2; ++w) {
+        const int q = int(int16_t(data_a[u + 1 + e / 2 + w]));
+        v[2 * w]     = float((q << 24) >> 24) * d;
+        v[2 * w + 1] = float(q >> 8) * d;
+    }
+#else
     const uint sh = e < 16 ? 0u : 4u;
-    return vec2(float(int((q >> sh) & 0xFu) - 8), float(int((q >> (8 + sh)) & 0xFu) - 8)) * float(data_a[ib].d);
+    [[unroll]] for (uint w = 0; w < EPL / 2; ++w) {
+        const uint q = uint(data_a[u + 1 + (e % 16) / 2 + w]);
+        const uint n0 = (q >> sh) & 0xFu, n1 = (q >> (8 + sh)) & 0xFu;
+#if defined(DATA_A_IQ4_NL)
+        v[2 * w]     = kvalues[n0] * d;
+        v[2 * w + 1] = kvalues[n1] * d;
+#else
+        v[2 * w]     = float(int(n0) - 8) * d;
+        v[2 * w + 1] = float(int(n1) - 8) * d;
+#endif
+    }
 #endif
 }
 
 void main() {
     const uint l  = gl_LocalInvocationID.x;
+    const uint rg = l / LPR;
+    const uint li = l % LPR;
     const uint s  = gl_WorkGroupID.x;
     const uint h  = gl_WorkGroupID.y;
     const uint k0 = s * p.slice;
     const uint k1 = min(k0 + p.slice, p.ncols);
-    const bool live = 2 * l < p.nrows;
+    const uint e0 = EPL * li;              // first element (head dim) of this lane
+    const bool live = e0 < p.nrows;
 
-    vec2 acc[GQA * NTOK];
-    [[unroll]] for (uint i = 0; i < GQA * NTOK; ++i) acc[i] = vec2(0.0);
+#if defined(DATA_A_IQ4_NL)
+    if (l < 16) {
+        kvalues[l] = kvalues_const[l];
+    }
+#endif
 
-    const uint a_base = p.a_offset + h * p.a_chan_stride + (2 * l) / 32;
+    float acc[EPL * GQA * NTOK];
+    [[unroll]] for (uint i = 0; i < EPL * GQA * NTOK; ++i) acc[i] = 0.0;
+
+    const uint a_base = h * p.a_chan_stride + e0 / 32;
+    const uint eb = e0 % 32;
     const uint b_base = p.b_offset + h * GQA * p.b_chan_stride;
 
     for (uint kt = k0; kt < k1; kt += KC) {
@@ -84,33 +121,49 @@ void main() {
         }
         barrier();
         if (live) {
-            uint kk = 0;
-            for (; kk + 4 <= kn; kk += 4) {
-                vec2 v[4];
-                [[unroll]] for (uint u = 0; u < 4; ++u) v[u] = load_pair(a_base + (kt + kk + u) * p.a_row_stride, l);
-                [[unroll]] for (uint u = 0; u < 4; ++u) {
-                    [[unroll]] for (uint ct = 0; ct < GQA * NTOK; ++ct) {
-                        const float pb = btile[ct * KC + kk + u];
-                        acc[ct] = fma(v[u], vec2(pb), acc[ct]);
-                    }
+            uint kk = rg;
+            for (; kk + R < kn; kk += 2 * R) {
+                float v0[EPL], v1[EPL];
+                load_row(a_base + (kt + kk) * p.a_row_stride, eb, v0);
+                load_row(a_base + (kt + kk + R) * p.a_row_stride, eb, v1);
+                [[unroll]] for (uint ct = 0; ct < GQA * NTOK; ++ct) {
+                    const float pb = btile[ct * KC + kk];
+                    [[unroll]] for (uint j = 0; j < EPL; ++j) acc[ct * EPL + j] = fma(v0[j], pb, acc[ct * EPL + j]);
+                }
+                [[unroll]] for (uint ct = 0; ct < GQA * NTOK; ++ct) {
+                    const float pb = btile[ct * KC + kk + R];
+                    [[unroll]] for (uint j = 0; j < EPL; ++j) acc[ct * EPL + j] = fma(v1[j], pb, acc[ct * EPL + j]);
                 }
             }
-            for (; kk < kn; ++kk) {
-                const vec2 v = load_pair(a_base + (kt + kk) * p.a_row_stride, l);
+            if (kk < kn) {
+                float v0[EPL];
+                load_row(a_base + (kt + kk) * p.a_row_stride, eb, v0);
                 [[unroll]] for (uint ct = 0; ct < GQA * NTOK; ++ct) {
-                    acc[ct] = fma(v, vec2(btile[ct * KC + kk]), acc[ct]);
+                    const float pb = btile[ct * KC + kk];
+                    [[unroll]] for (uint j = 0; j < EPL; ++j) acc[ct * EPL + j] = fma(v0[j], pb, acc[ct * EPL + j]);
                 }
             }
         }
     }
 
-    if (live) {
-        // part layout [slice][hq][t][i], as mul_mat_vec_gqa_vxp_reduce.comp reads it
-        [[unroll]] for (uint c = 0; c < GQA; ++c) {
-            [[unroll]] for (uint t = 0; t < NTOK; ++t) {
-                const uint o = ((s * p.nchan_b + h * GQA + c) * NTOK + t) * p.nrows + 2 * l;
-                data_d[o]     = acc[c * NTOK + t].x;
-                data_d[o + 1] = acc[c * NTOK + t].y;
+    // part layout [slice][hq][t][i], as mul_mat_vec_gqa_vxp_reduce.comp reads it; row groups added in order 0..R-1
+    [[unroll]] for (uint c = 0; c < GQA; ++c) {
+        [[unroll]] for (uint t = 0; t < NTOK; ++t) {
+            const uint ct = c * NTOK + t;
+            const uint o = ((s * p.nchan_b + h * GQA + c) * NTOK + t) * p.nrows;
+            if (R == 1) {
+                if (live) {
+                    [[unroll]] for (uint j = 0; j < EPL; ++j) data_d[o + e0 + j] = acc[ct * EPL + j];
+                }
+            } else {
+                barrier();
+                [[unroll]] for (uint j = 0; j < EPL; ++j) red[rg * 256 + e0 + j] = acc[ct * EPL + j];
+                barrier();
+                for (uint i = l; i < p.nrows; i += WG) {
+                    float sum = red[i];
+                    for (uint r = 1; r < R; ++r) sum += red[r * 256 + i];
+                    data_d[o + i] = sum;
+                }
             }
         }
     }

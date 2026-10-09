@@ -292,6 +292,12 @@ private:
     // pre-computed hadamard martrices
     std::unordered_map<int64_t, std::vector<float>> attn_rot_hadamard;
 
+    // b65 kv4: device-resident copies of the Hadamard matrices (LLAMA_B65_ROT_DEVICE, default on): the rotation then
+    // needs no host input upload per graph (X29b: rotation cost ~13 ms/token outside the GPU kernels on the B65)
+    std::unordered_map<int64_t, ggml_tensor *> attn_rot_dev;
+    ggml_context_ptr attn_rot_dev_ctx;
+    ggml_backend_buffer_ptr attn_rot_dev_buf;
+
     // env: LLAMA_KV_CACHE_DEBUG
     int debug = 0;
 

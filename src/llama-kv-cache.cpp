@@ -398,6 +398,33 @@ llama_kv_cache::llama_kv_cache(
 
             ggml_gen_hadamard(tmp);
         }
+
+        // b65 kv4: one device copy of each matrix next to the KV cache (single KV buffer only)
+        const char * rot_dev_env = getenv("LLAMA_B65_ROT_DEVICE");
+        const bool rot_dev = rot_dev_env ? atoi(rot_dev_env) != 0 : true;
+        if (rot_dev && !hparams.no_alloc && ctxs_bufs.size() == 1) {
+            ggml_init_params params = {
+                /* .mem_size   = */ attn_rot_hadamard.size()*ggml_tensor_overhead(),
+                /* .mem_buffer = */ nullptr,
+                /* .no_alloc   = */ true,
+            };
+            attn_rot_dev_ctx.reset(ggml_init(params));
+            for (const auto & [n, _] : attn_rot_hadamard) {
+                ggml_tensor * t = ggml_new_tensor_2d(attn_rot_dev_ctx.get(), GGML_TYPE_F32, n, n);
+                ggml_format_name(t, "attn_rot_dev_%d", (int) n);
+                attn_rot_dev[n] = t;
+            }
+            ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(ctxs_bufs[0].second.get());
+            attn_rot_dev_buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(attn_rot_dev_ctx.get(), buft));
+            if (attn_rot_dev_buf) {
+                for (const auto & [n, t] : attn_rot_dev) {
+                    ggml_backend_tensor_set(t, attn_rot_hadamard.at(n).data(), 0, ggml_nbytes(t));
+                }
+                LLAMA_LOG_INFO("%s: Hadamard rotation matrices kept in %s (b65 kv4)\n", __func__, ggml_backend_buffer_name(attn_rot_dev_buf.get()));
+            } else {
+                attn_rot_dev.clear();
+            }
+        }
     }
 
     const char * LLAMA_KV_CACHE_DEBUG = getenv("LLAMA_KV_CACHE_DEBUG");
@@ -1693,6 +1720,9 @@ ggml_tensor * llama_kv_cache::build_input_k_rot(ggml_context * ctx) const {
         } while (n_embd_head_k_all % nrot == 0);
         nrot /= 2;
 
+        if (attn_rot_dev.count(nrot)) {   // b65 kv4: device copy, not an input
+            return attn_rot_dev.at(nrot);
+        }
         res = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, nrot, nrot);
         ggml_set_input(res);
         ggml_set_name(res, "attn_inp_k_rot");
@@ -1713,6 +1743,9 @@ ggml_tensor * llama_kv_cache::build_input_v_rot(ggml_context * ctx) const {
         //} while (hparams.n_embd_head_v() % nrot == 0);
         //nrot /= 2;
 
+        if (attn_rot_dev.count(nrot)) {   // b65 kv4: device copy, not an input
+            return attn_rot_dev.at(nrot);
+        }
         res = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, nrot, nrot);
         ggml_set_input(res);
         ggml_set_name(res, "attn_inp_v_rot");
@@ -2059,6 +2092,9 @@ void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch 
 }
 
 void llama_kv_cache::set_input_k_rot(ggml_tensor * dst) const {
+    if (!ggml_backend_buffer_is_host(dst->buffer) && attn_rot_dev.count(dst->ne[0]) && attn_rot_dev.at(dst->ne[0]) == dst) {
+        return;   // b65 kv4: the device copy already holds it
+    }
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
 
     const auto n_rot = dst->ne[0];
@@ -2068,6 +2104,9 @@ void llama_kv_cache::set_input_k_rot(ggml_tensor * dst) const {
 }
 
 void llama_kv_cache::set_input_v_rot(ggml_tensor * dst) const {
+    if (!ggml_backend_buffer_is_host(dst->buffer) && attn_rot_dev.count(dst->ne[0]) && attn_rot_dev.at(dst->ne[0]) == dst) {
+        return;   // b65 kv4: the device copy already holds it
+    }
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
 
     const auto n_rot = dst->ne[0];

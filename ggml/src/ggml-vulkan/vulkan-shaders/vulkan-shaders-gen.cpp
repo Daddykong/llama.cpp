@@ -906,6 +906,8 @@ void process_shaders() {
     string_to_spv("mul_mat_vec_gqa_rows_f16_f32",  "mul_mat_vec_gqa_rows.comp",  {{"A_TYPE", "float16_t"}, {"A_TYPEV4", "f16vec4"}, {"B_TYPE", "float"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}});
     string_to_spv("mul_mat_vec_gqa_rows2_f16_f32", "mul_mat_vec_gqa_rows2.comp", {{"A_TYPE", "float16_t"}, {"A_TYPEV4", "f16vec4"}, {"B_TYPE", "float"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}});
     string_to_spv("mul_mat_vec_gqa_rows2_q8_0_f32", "mul_mat_vec_gqa_rows2.comp", {{"DATA_A_Q8_0", "1"}, {"FLOAT_TYPE", "float"}, {"B_TYPE", "float"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}});   // b65
+    string_to_spv("mul_mat_vec_gqa_rows2_q4_0_f32", "mul_mat_vec_gqa_rows2.comp", {{"DATA_A_Q4_0", "1"}, {"FLOAT_TYPE", "float"}, {"B_TYPE", "float"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}});   // b65 kv4
+    string_to_spv("mul_mat_vec_gqa_rows2_iq4_nl_f32", "mul_mat_vec_gqa_rows2.comp", {{"DATA_A_IQ4_NL", "1"}, {"FLOAT_TYPE", "float"}, {"B_TYPE", "float"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}});   // b65 kv4
     string_to_spv("mul_mat_vec_gqa_split2_f16_f32", "mul_mat_vec_gqa_split2.comp", {{"A_TYPE", "float16_t"}, {"A_TYPEV4", "f16vec4"}, {"B_TYPE", "float"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}});
     string_to_spv("mul_mat_vec_gqa_split_f16_f32", "mul_mat_vec_gqa_split.comp", {{"A_TYPE", "float16_t"}, {"A_TYPEV4", "f16vec4"}, {"B_TYPE", "float"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}});
     string_to_spv("mul_mat_vec_gqa_splitk_f16_f32", "mul_mat_vec_gqa_splitk.comp", {{"A_TYPE", "float16_t"}, {"A_TYPEV4", "f16vec4"}, {"B_TYPE", "float"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}});   // b65 [mtp]
@@ -917,6 +919,11 @@ void process_shaders() {
     string_to_spv("mul_mat_vec_gqa_vxp_reduce", "mul_mat_vec_gqa_vxp_reduce.comp", {});   // b65
     string_to_spv("mul_mat_vec_gqa_vxq_q8_0_f32", "mul_mat_vec_gqa_vxq.comp", {{"DATA_A_Q8_0", "1"}});   // b65 kv4: V x P, quantized V (untransposed)
     string_to_spv("mul_mat_vec_gqa_vxq_q4_0_f32", "mul_mat_vec_gqa_vxq.comp", {{"DATA_A_Q4_0", "1"}});   // b65 kv4
+    string_to_spv("mul_mat_vec_gqa_vxq_iq4_nl_f32", "mul_mat_vec_gqa_vxq.comp", {{"DATA_A_IQ4_NL", "1"}});   // b65 kv4
+    for (const std::string t : {"q8_0", "q4_0", "iq4_nl"}) {   // b65 kv4: quantized KV view -> f16 (prompt batches)
+        string_to_spv("kv_deq_f16_" + t, "kv_deq_f16.comp", {{"DATA_A_" + to_uppercase(t), "1"}});
+        string_to_spv("kv_deq_f16_t_" + t, "kv_deq_f16.comp", {{"DATA_A_" + to_uppercase(t), "1"}, {"TRANSPOSED", "1"}});
+    }
 
     // Norms
     string_to_spv("norm_f32", "norm.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));

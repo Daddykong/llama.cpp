@@ -2703,6 +2703,14 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
         cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
     } else {
+        // b65 kv4: prompt batches (> LLAMA_B65_KV_DEQ_MIN_TOK - 1 tokens, default 5+) on a quantized K cache: dequantize
+        // the K view to f16 first (one pass, an op output freed after use), so K x Q is the same f16 matmul as on a 16-bit
+        // cache; the strided int8 matmul cost 7-10% prompt speed at 32-64K (K8PP). 0 = off.
+        static const int kv_deq_min = getenv("LLAMA_B65_KV_DEQ_MIN_TOK") ? atoi(getenv("LLAMA_B65_KV_DEQ_MIN_TOK")) : 5;
+        if (kv_deq_min > 0 && q->ne[1] >= kv_deq_min && ggml_is_quantized(k->type) && k->ne[3] == 1) {
+            k = ggml_cast(ctx0, k, GGML_TYPE_F16);
+            cb(k, "k_deq", il);
+        }
         ggml_tensor * kq = ggml_mul_mat(ctx0, k, q);
         cb(kq, "kq", il);
 
@@ -2779,11 +2787,10 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             if (kq->ne[1] <= vxq_max && kq->type == GGML_TYPE_F32 && gqa >= 1 && gqa <= 8 && kq->ne[2] % v->ne[2] == 0) {
                 kqv = ggml_out_prod(ctx0, v, ggml_transpose(ctx0, kq));
             } else {
-                ggml_tensor * vf = ggml_cpy(ctx0, v, ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, v->ne[0], v->ne[1], v->ne[2], v->ne[3]));   // (ggml_cast has no src[1]: CPU dup_from_q needs it)
-                cb(vf, "v_deq", il);
-                v = ggml_cpy(ctx0, ggml_transpose(ctx0, vf),
-                             ggml_new_tensor_4d(ctx0, GGML_TYPE_F16, vf->ne[1], vf->ne[0], vf->ne[2], vf->ne[3]));
-                cb(v, "v_cont", il);
+                // one pass to a transposed f16 V (an op output, freed after the matmul; KV4-1's ggml_cpy into new
+                // tensors kept every layer's f32 + f16 copies alive: a 13 GB compute buffer at 128K)
+                v = ggml_cast(ctx0, ggml_transpose(ctx0, v), GGML_TYPE_F16);
+                cb(v, "v_deq", il);
                 if (kq->type != GGML_TYPE_F32 && kq->type != GGML_TYPE_F16) {
                     kq = ggml_cast(ctx0, kq, GGML_TYPE_F32);
                 }

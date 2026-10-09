@@ -59,6 +59,14 @@ struct vk_mat_vec_vxp_push_constants {
     uint32_t slice;
     uint32_t nchan_b;
 };
+// b65 kv4: quantized KV view -> f16 (kv_deq_f16.comp)
+struct vk_kv_deq_push_constants {
+    uint32_t ne0, ne1, ne2;
+    uint32_t s0, s1, s2;
+    uint32_t a_offset;
+    uint32_t d_offset;
+    uint32_t transposed;
+};
 struct vk_mat_vec_vxp_reduce_push_constants {
     uint32_t nrows;
     uint32_t ntok;

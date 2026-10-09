@@ -1,0 +1,124 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+
+// b65 kv4: a quantized KV-cache view (q8_0 / q4_0 / iq4_nl) to a contiguous f16 tensor, for prompt batches (FA off):
+// the f16 matmul then runs as on a 16-bit cache, with no full-cache f32 copy (KV4-1's 13 GB compute buffer) and none of
+// the strided int8 matmul's prompt cost (K8PP).
+//   TRANSPOSED = 0: K view [d, n_kv, heads], blocks along dim 0           -> dst [d, n_kv, heads]
+//   TRANSPOSED = 1: transposed V view [n_kv, d, heads], blocks along dim 1 -> dst [n_kv, d, heads] (V^T for V x P)
+// The source is read through a 16-bit view: a block is 17 (q8_0) or 9 (q4_0, iq4_nl) 16-bit words, the f16 scale first.
+// Four lanes per block, 8 elements each. The transposed form goes through a 32 x 64 shared tile so both the block
+// reads and the f16 row writes are contiguous.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+#if defined(DATA_A_Q8_0)
+#define BU 17u
+#else
+#define BU 9u
+#endif
+
+layout (binding = 0) readonly buffer A {uint16_t data_a[];};
+layout (binding = 1) writeonly buffer D {float16_t data_d[];};
+
+layout (push_constant) uniform parameter
+{
+    uint ne0; uint ne1; uint ne2;
+    uint s0; uint s1; uint s2;     // source strides in blocks (the packed dim's stride is per block of 32)
+    uint a_offset;                 // in 16-bit words
+    uint d_offset;                 // in f16 elements
+    uint transposed;
+} p;
+
+#if defined(DATA_A_IQ4_NL)
+shared float kvalues[16];
+const float kvalues_const[16] = float[16](-127.0, -104.0, -83.0, -65.0, -49.0, -35.0, -22.0, -10.0,
+                                          1.0, 13.0, 25.0, 38.0, 53.0, 69.0, 89.0, 113.0);
+#endif
+
+#if !defined(TRANSPOSED)
+#define TRANSPOSED 0
+#endif
+
+// elements 8*qd .. 8*qd+7 of block ib
+void deq8(const uint ib, const uint qd, out float v[8]) {
+    const uint u = p.a_offset + ib * BU;
+    const float d = unpackHalf2x16(uint(data_a[u])).x;
+#if defined(DATA_A_Q8_0)
+    [[unroll]] for (uint w = 0; w < 4; ++w) {
+        const int q = int(int16_t(data_a[u + 1 + 4 * qd + w]));
+        v[2 * w]     = float((q << 24) >> 24) * d;
+        v[2 * w + 1] = float(q >> 8) * d;
+    }
+#else
+    const uint sh = qd < 2 ? 0u : 4u;
+    [[unroll]] for (uint w = 0; w < 4; ++w) {
+        const uint q = uint(data_a[u + 1 + 4 * (qd % 2) + w]);
+        const uint n0 = (q >> sh) & 0xFu, n1 = (q >> (8 + sh)) & 0xFu;
+#if defined(DATA_A_IQ4_NL)
+        v[2 * w]     = kvalues[n0] * d;
+        v[2 * w + 1] = kvalues[n1] * d;
+#else
+        v[2 * w]     = float(int(n0) - 8) * d;
+        v[2 * w + 1] = float(int(n1) - 8) * d;
+#endif
+    }
+#endif
+}
+
+#if TRANSPOSED
+shared float tile[32][65];
+#endif
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+#if defined(DATA_A_IQ4_NL)
+    if (tid < 16) {
+        kvalues[tid] = kvalues_const[tid];
+    }
+    barrier();
+#endif
+    float v[8];
+#if TRANSPOSED
+    // tile: tokens n0 .. n0+63 (dim 0) x one block column bc (32 values of dim 1) of head i2
+    const uint n0 = gl_WorkGroupID.x * 64;
+    const uint bc = gl_WorkGroupID.y;
+    const uint i2 = gl_WorkGroupID.z;
+    {
+        const uint r = tid / 4, qd = tid % 4;
+        if (n0 + r < p.ne0) {
+            deq8((n0 + r) * p.s0 + bc + i2 * p.s2, qd, v);
+            [[unroll]] for (uint j = 0; j < 8; ++j) tile[8 * qd + j][r] = v[j];
+        }
+    }
+    barrier();
+    {
+        const uint dd = tid / 8, c = (tid % 8) * 8;
+        const uint o = p.d_offset + (i2 * p.ne1 + bc * 32 + dd) * p.ne0 + n0 + c;
+        [[unroll]] for (uint j = 0; j < 8; ++j) {
+            if (n0 + c + j < p.ne0) {
+                data_d[o + j] = float16_t(tile[dd][c + j]);
+            }
+        }
+    }
+#else
+    const uint g = (gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x) * 256 + tid;   // block quarter
+    const uint nb0 = p.ne0 / 32;
+    const uint blk = g / 4, qd = g % 4;
+    if (blk >= nb0 * p.ne1 * p.ne2) {
+        return;
+    }
+    const uint b0 = blk % nb0;
+    const uint i1 = (blk / nb0) % p.ne1;
+    const uint i2 = blk / (nb0 * p.ne1);
+    deq8(b0 + i1 * p.s1 + i2 * p.s2, qd, v);
+    const uint o = p.d_offset + (i2 * p.ne1 + i1) * p.ne0 + b0 * 32 + 8 * qd;
+    [[unroll]] for (uint j = 0; j < 8; ++j) {
+        data_d[o + j] = float16_t(v[j]);
+    }
+#endif
+}
