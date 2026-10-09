@@ -3568,13 +3568,14 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         // columns present, so 5-8 tokens on the 16-column tile cost as much as 16 (VCLIFF-1: 111 vs 105 ms per 4.4K
         // graph) and 33-48 on the 64-column tile as much as 64 (248 vs 259 ms).
         // per tile "ct:rt:kcb" = columns per invocation, rows per invocation, k-chunk blocks. Defaults: the MTP-w3/w4
-        // sweep shapes (16: 4 x 4 x 16, 32 and 64: 8 x 4 x 8), 8 columns 4 x 2 x 16, 24-56 columns 8 x 4 x 8.
+        // sweep shapes (16: 4 x 4 x 16, 32 and 64: 8 x 4 x 8), 8 columns 2 x 4 x 16, 24-56 columns 8 x 4 x 8 (VCLIFF-5).
+        // GGML_VK_MMVQ_WIDE_UNROLL=1: full k-chunks as an unrolled loop (experiment).
         // GGML_VK_MMVQ_WIDE_CFG (all tiles) / GGML_VK_MMVQ_WIDE_CFG<nc> (one tile) override.
         uint32_t w_ct[8], w_rt[8], w_kcb[8];
         for (uint32_t c = 0; c < 8; ++c) {
             const uint32_t nc = 8 * (c + 1);
-            w_ct[c] = nc <= 16 ? 4 : 8;
-            w_rt[c] = nc == 8 ? 2 : 4;
+            w_ct[c] = nc == 8 ? 2 : (nc == 16 ? 4 : 8);
+            w_rt[c] = 4;
             w_kcb[c] = nc <= 16 ? 16 : 8;
             const char * all = getenv("GGML_VK_MMVQ_WIDE_CFG");
             const char * one = getenv(("GGML_VK_MMVQ_WIDE_CFG" + std::to_string(nc)).c_str());
@@ -3588,11 +3589,12 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             w_rt[c] = std::max(1u, w_rt[c]);
             device->mmvq_wide_rows[c] = (256u / (nc / w_ct[c])) * w_rt[c];
         }
+        const uint32_t wide_unroll = getenv("GGML_VK_MMVQ_WIDE_UNROLL") ? (uint32_t) atoi(getenv("GGML_VK_MMVQ_WIDE_UNROLL")) : 0u;
         for (uint32_t t = 0; t < 4; ++t) {
             for (uint32_t c = 0; c < 8; ++c) {
                 const uint32_t nc = 8 * (c + 1);
                 ggml_vk_create_pipeline2(device, device->pipeline_mmvq_wide[t][c], std::string(wn[t]) + "_" + std::to_string(nc), wl[t], wd[t], "main", 3,
-                                        7 * sizeof(uint32_t), {1, 1, 1}, {nc, w_rt[c], w_ct[c], w_kcb[c]}, 1);
+                                        7 * sizeof(uint32_t), {1, 1, 1}, {nc, w_rt[c], w_ct[c], w_kcb[c], wide_unroll}, 1);
             }
         }
     }

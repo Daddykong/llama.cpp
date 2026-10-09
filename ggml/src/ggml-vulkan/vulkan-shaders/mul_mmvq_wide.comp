@@ -21,6 +21,7 @@ layout(constant_id = 0) const uint NC = 64;   // column tile (multiple of 8, <= 
 layout(constant_id = 1) const uint RT = 4;    // rows per invocation
 layout(constant_id = 2) const uint CT = 8;    // columns per invocation (divides NC)
 layout(constant_id = 3) const uint KCB = 8;   // q8_1 blocks (32 values each) per staged k-chunk
+layout(constant_id = 4) const uint KK_UNROLL = 0;   // b65 [vcliff]: 1 = full k-chunks as an unrolled loop (loads hoisted)
 
 layout (binding = 0) readonly buffer A_R128 {uvec4 data_a_r128[];};
 layout (binding = 0) readonly buffer A_R32 {uint data_a_r32[];};
@@ -153,30 +154,60 @@ void main() {
             }
         }
         barrier();
-        for (uint kk = 0; kk < nk; ++kk) {
-            const uint jb = kb0 + kc + kk;
-            // decode the RT weight blocks once, then each column's q8_1 block is read from shared memory once
-            int32_t a[RT][8];
-            vec3 cf[RT];
-            [[unroll]] for (uint r = 0; r < RT; ++r) {
-                decode(min(row0 + r, p.nrows - 1), jb, a[r], cf[r]);
-            }
-            // every supported type has cf.x == cf.y (one scale per 32-value block): one integer sum per block
-            [[unroll]] for (uint c = 0; c < CT; ++c) {
-                const uint j = cg * CT + c;
-                const ivec4 bl = sb_lo[kk][j];
-                const ivec4 bh = sb_hi[kk][j];
-                const vec2 ds = sb_ds[kk][j];
+        if (KK_UNROLL != 0 && nk == KCB) {
+            [[unroll]] for (uint kk = 0; kk < KCB; ++kk) {
+                const uint jb = kb0 + kc + kk;
+                // decode the RT weight blocks once, then each column's q8_1 block is read from shared memory once
+                int32_t a[RT][8];
+                vec3 cf[RT];
                 [[unroll]] for (uint r = 0; r < RT; ++r) {
-                    int32_t sm = dotPacked4x8EXT(a[r][0], bl.x);
-                    sm += dotPacked4x8EXT(a[r][1], bl.y);
-                    sm += dotPacked4x8EXT(a[r][2], bl.z);
-                    sm += dotPacked4x8EXT(a[r][3], bl.w);
-                    sm += dotPacked4x8EXT(a[r][4], bh.x);
-                    sm += dotPacked4x8EXT(a[r][5], bh.y);
-                    sm += dotPacked4x8EXT(a[r][6], bh.z);
-                    sm += dotPacked4x8EXT(a[r][7], bh.w);
-                    acc[r][c] = fma(float(sm), ds.x * cf[r].x, fma(cf[r].z, ds.y, acc[r][c]));
+                    decode(min(row0 + r, p.nrows - 1), jb, a[r], cf[r]);
+                }
+                // every supported type has cf.x == cf.y (one scale per 32-value block): one integer sum per block
+                [[unroll]] for (uint c = 0; c < CT; ++c) {
+                    const uint j = cg * CT + c;
+                    const ivec4 bl = sb_lo[kk][j];
+                    const ivec4 bh = sb_hi[kk][j];
+                    const vec2 ds = sb_ds[kk][j];
+                    [[unroll]] for (uint r = 0; r < RT; ++r) {
+                        int32_t sm = dotPacked4x8EXT(a[r][0], bl.x);
+                        sm += dotPacked4x8EXT(a[r][1], bl.y);
+                        sm += dotPacked4x8EXT(a[r][2], bl.z);
+                        sm += dotPacked4x8EXT(a[r][3], bl.w);
+                        sm += dotPacked4x8EXT(a[r][4], bh.x);
+                        sm += dotPacked4x8EXT(a[r][5], bh.y);
+                        sm += dotPacked4x8EXT(a[r][6], bh.z);
+                        sm += dotPacked4x8EXT(a[r][7], bh.w);
+                        acc[r][c] = fma(float(sm), ds.x * cf[r].x, fma(cf[r].z, ds.y, acc[r][c]));
+                    }
+                }
+            }
+        } else {
+            for (uint kk = 0; kk < nk; ++kk) {
+                const uint jb = kb0 + kc + kk;
+                // decode the RT weight blocks once, then each column's q8_1 block is read from shared memory once
+                int32_t a[RT][8];
+                vec3 cf[RT];
+                [[unroll]] for (uint r = 0; r < RT; ++r) {
+                    decode(min(row0 + r, p.nrows - 1), jb, a[r], cf[r]);
+                }
+                // every supported type has cf.x == cf.y (one scale per 32-value block): one integer sum per block
+                [[unroll]] for (uint c = 0; c < CT; ++c) {
+                    const uint j = cg * CT + c;
+                    const ivec4 bl = sb_lo[kk][j];
+                    const ivec4 bh = sb_hi[kk][j];
+                    const vec2 ds = sb_ds[kk][j];
+                    [[unroll]] for (uint r = 0; r < RT; ++r) {
+                        int32_t sm = dotPacked4x8EXT(a[r][0], bl.x);
+                        sm += dotPacked4x8EXT(a[r][1], bl.y);
+                        sm += dotPacked4x8EXT(a[r][2], bl.z);
+                        sm += dotPacked4x8EXT(a[r][3], bl.w);
+                        sm += dotPacked4x8EXT(a[r][4], bh.x);
+                        sm += dotPacked4x8EXT(a[r][5], bh.y);
+                        sm += dotPacked4x8EXT(a[r][6], bh.z);
+                        sm += dotPacked4x8EXT(a[r][7], bh.w);
+                        acc[r][c] = fma(float(sm), ds.x * cf[r].x, fma(cf[r].z, ds.y, acc[r][c]));
+                    }
                 }
             }
         }
