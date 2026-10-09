@@ -479,6 +479,17 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
 
     const uint b_qs_idx = tid % (32 / K_PER_ITER);
     uint col = tid * K_PER_ITER;
+    // b65 [vcliff]: 4+ columns unroll by 2 only: four iterations of every column's q8_1 registers in flight spill
+    // (Q4_1R / Q5_KR 4-column verify +66% / +14% over 3 columns on the B65, VCLIFF-1). Same summation order.
+    if (NUM_COLS >= 4) {
+        while (num_iters >= 2) {
+            iter(temp, first_row, num_rows, col, b_qs_idx);
+            col += col_stride;
+            iter(temp, first_row, num_rows, col, b_qs_idx);
+            col += col_stride;
+            num_iters -= 2;
+        }
+    }
     while (num_iters >= 4) {
         // Manually partially unroll the loop
         [[unroll]] for (uint k = 0; k < 4; ++k) {
