@@ -8302,9 +8302,11 @@ static void ggml_vk_mul_mat_vec_gqa_f16_f32(ggml_backend_vk_context * ctx, vk_co
                                            : ctx->device->pipeline_mul_mat_vec_gqa_split_f16_f32[gqa - 1][ntok - 1])
                                  : (rows2 ? ctx->device->pipeline_mul_mat_vec_gqa_rows2_f16_f32[gqa - 1][ntok - 1]
                                           : ctx->device->pipeline_mul_mat_vec_gqa_rows_f16_f32[gqa - 1][ntok - 1]);
-    // b65 kv4: 4-bit K, head dim 256, 16-byte aligned rows: one row per invocation. GGML_VK_KQ_ROWS3=0: rows2 for
-    // every type; 2: q8_0 too (slower than rows2 on the 3060)
-    static const int rows3_env = getenv("GGML_VK_KQ_ROWS3") == nullptr ? 1 : atoi(getenv("GGML_VK_KQ_ROWS3"));
+    // b65 kv4: quantized K, head dim 256, 16-byte aligned rows: one row per invocation. GGML_VK_KQ_ROWS3=0: rows2 for
+    // every type; 1: 4-bit only; 2: q8_0 too. Default 2 on Intel (B65 at 32K: q8_0 K x Q 3804 -> 1785 us per token,
+    // KV4-3), 1 elsewhere (q8_0 is slower than rows2 on the 3060)
+    static const int rows3_env = getenv("GGML_VK_KQ_ROWS3") != nullptr ? atoi(getenv("GGML_VK_KQ_ROWS3"))
+                                                                         : (ctx->device->vendor_id == VK_VENDOR_ID_INTEL ? 2 : 1);
     if (rows3_env > 0 && !split && !mask_skip_env && ggml_vk_kv_deq_type_idx(src0->type) >= 0 && k == 256 &&
         (src0->type != GGML_TYPE_Q8_0 || rows3_env >= 2)) {
         const size_t ts = ggml_type_size(src0->type);
