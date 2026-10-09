@@ -3693,9 +3693,9 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         if (sg != 0 && (!device->subgroup_size_control || sg < device->subgroup_min_size || sg > device->subgroup_max_size)) sg = 0;
         uint32_t kc = 64;
         if (const char * e = getenv("GGML_VK_VXQ_KC")) kc = std::max(4u, (uint32_t)atoi(e) / 4 * 4);
-        // elements per lane: as many as fit GGML_VK_VXQ_ACC (64) accumulators (EPL x GQA x tokens), 2..8;
+        // elements per lane: as many as fit GGML_VK_VXQ_ACC (96) accumulators (EPL x GQA x tokens), 2..8;
         // GGML_VK_VXQ_EPL forces one value; batch-invariant mode sizes every token count like 4 tokens
-        uint32_t acc_max = 64;
+        uint32_t acc_max = 96;
         if (const char * e = getenv("GGML_VK_VXQ_ACC")) acc_max = std::max(2u, (uint32_t)atoi(e));
         const uint32_t epl_env = getenv("GGML_VK_VXQ_EPL") ? (uint32_t)atoi(getenv("GGML_VK_VXQ_EPL")) : 0u;
         const bool bi = getenv("GGML_VK_BATCH_INVARIANT") != nullptr && atoi(getenv("GGML_VK_BATCH_INVARIANT")) != 0;
@@ -3709,6 +3709,12 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 ggml_vk_create_pipeline2(device, device->pipeline_mul_mat_vec_gqa_vxq_q8_0_f32[g][t], "mul_mat_vec_gqa_vxq_q8_0_f32" + sfx, mul_mat_vec_gqa_vxq_q8_0_f32_len, mul_mat_vec_gqa_vxq_q8_0_f32_data, "main", 3, sizeof(vk_mat_vec_vxp_push_constants), {1, 1, 1}, {epl, g + 1, t + 1, kc}, 1, true, false, sg);
                 ggml_vk_create_pipeline2(device, device->pipeline_mul_mat_vec_gqa_vxq_q4_0_f32[g][t], "mul_mat_vec_gqa_vxq_q4_0_f32" + sfx, mul_mat_vec_gqa_vxq_q4_0_f32_len, mul_mat_vec_gqa_vxq_q4_0_f32_data, "main", 3, sizeof(vk_mat_vec_vxp_push_constants), {1, 1, 1}, {epl, g + 1, t + 1, kc}, 1, true, false, sg);
                 ggml_vk_create_pipeline2(device, device->pipeline_mul_mat_vec_gqa_vxq_iq4_nl_f32[g][t], "mul_mat_vec_gqa_vxq_iq4_nl_f32" + sfx, mul_mat_vec_gqa_vxq_iq4_nl_f32_len, mul_mat_vec_gqa_vxq_iq4_nl_f32_data, "main", 3, sizeof(vk_mat_vec_vxp_push_constants), {1, 1, 1}, {epl, g + 1, t + 1, kc}, 1, true, false, sg);
+                ggml_vk_create_pipeline2(device, device->pipeline_mul_mat_vec_gqa_rows3_f32[0][g][t], "mul_mat_vec_gqa_rows3_q8_0_f32" + sfx, mul_mat_vec_gqa_rows3_q8_0_f32_len, mul_mat_vec_gqa_rows3_q8_0_f32_data, "main", 3, sizeof(vk_mat_vec_gqa_push_constants), {1, 1, 1}, {g + 1, t + 1}, 1);
+                ggml_vk_create_pipeline2(device, device->pipeline_mul_mat_vec_gqa_rows3_f32[1][g][t], "mul_mat_vec_gqa_rows3_q4_0_f32" + sfx, mul_mat_vec_gqa_rows3_q4_0_f32_len, mul_mat_vec_gqa_rows3_q4_0_f32_data, "main", 3, sizeof(vk_mat_vec_gqa_push_constants), {1, 1, 1}, {g + 1, t + 1}, 1);
+                ggml_vk_create_pipeline2(device, device->pipeline_mul_mat_vec_gqa_rows3_f32[2][g][t], "mul_mat_vec_gqa_rows3_iq4_nl_f32" + sfx, mul_mat_vec_gqa_rows3_iq4_nl_f32_len, mul_mat_vec_gqa_rows3_iq4_nl_f32_data, "main", 3, sizeof(vk_mat_vec_gqa_push_constants), {1, 1, 1}, {g + 1, t + 1}, 1);
+                ggml_vk_create_pipeline2(device, device->pipeline_mul_mat_vec_gqa_vxq3_f32[0][g][t], "mul_mat_vec_gqa_vxq3_q8_0_f32" + sfx, mul_mat_vec_gqa_vxq3_q8_0_f32_len, mul_mat_vec_gqa_vxq3_q8_0_f32_data, "main", 3, sizeof(vk_mat_vec_vxp_push_constants), {1, 1, 1}, {epl, g + 1, t + 1, kc}, 1, true, false, sg);
+                ggml_vk_create_pipeline2(device, device->pipeline_mul_mat_vec_gqa_vxq3_f32[1][g][t], "mul_mat_vec_gqa_vxq3_q4_0_f32" + sfx, mul_mat_vec_gqa_vxq3_q4_0_f32_len, mul_mat_vec_gqa_vxq3_q4_0_f32_data, "main", 3, sizeof(vk_mat_vec_vxp_push_constants), {1, 1, 1}, {epl, g + 1, t + 1, kc}, 1, true, false, sg);
+                ggml_vk_create_pipeline2(device, device->pipeline_mul_mat_vec_gqa_vxq3_f32[2][g][t], "mul_mat_vec_gqa_vxq3_iq4_nl_f32" + sfx, mul_mat_vec_gqa_vxq3_iq4_nl_f32_len, mul_mat_vec_gqa_vxq3_iq4_nl_f32_data, "main", 3, sizeof(vk_mat_vec_vxp_push_constants), {1, 1, 1}, {epl, g + 1, t + 1, kc}, 1, true, false, sg);
             }
         }
     }
@@ -8073,6 +8079,8 @@ static bool ggml_vk_vxq_ok(const ggml_backend_vk_context * ctx, const ggml_tenso
     return true;
 }
 
+static int ggml_vk_kv_deq_type_idx(ggml_type t);
+
 static void ggml_vk_vxq(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     const uint32_t ntok  = (uint32_t)src1->ne[0];
     const uint32_t k     = (uint32_t)src0->ne[1];
@@ -8094,6 +8102,11 @@ static void ggml_vk_vxq(ggml_backend_vk_context * ctx, vk_context& subctx, const
                          : src0->type == GGML_TYPE_Q4_0 ? ctx->device->pipeline_mul_mat_vec_gqa_vxq_q4_0_f32[gqa - 1][ntok - 1]
                                                          : ctx->device->pipeline_mul_mat_vec_gqa_vxq_iq4_nl_f32[gqa - 1][ntok - 1];
     vk_pipeline pipeline2 = ctx->device->pipeline_mul_mat_vec_gqa_vxp_reduce;
+    // b65 kv4: staged kernel (16-byte loads through shared memory) for head dim 256 with 16-byte aligned rows
+    static const bool v3_env = getenv("GGML_VK_VXQ_V3") == nullptr || atoi(getenv("GGML_VK_VXQ_V3")) != 0;
+    if (v3_env && d == 256 && (src0->nb[1] % 16) == 0 && (src0->nb[2] % 16) == 0 && (get_misalign_bytes(ctx, src0) % 16) == 0) {
+        pipeline = ctx->device->pipeline_mul_mat_vec_gqa_vxq3_f32[ggml_vk_kv_deq_type_idx(src0->type)][gqa - 1][ntok - 1];
+    }
     if (ggml_nbytes(src0) > ctx->device->properties.limits.maxStorageBufferRange) {
         pipeline = ggml_vk_get_64b_indexing_pipeline(ctx, pipeline);
     }
@@ -8289,6 +8302,34 @@ static void ggml_vk_mul_mat_vec_gqa_f16_f32(ggml_backend_vk_context * ctx, vk_co
                                            : ctx->device->pipeline_mul_mat_vec_gqa_split_f16_f32[gqa - 1][ntok - 1])
                                  : (rows2 ? ctx->device->pipeline_mul_mat_vec_gqa_rows2_f16_f32[gqa - 1][ntok - 1]
                                           : ctx->device->pipeline_mul_mat_vec_gqa_rows_f16_f32[gqa - 1][ntok - 1]);
+    // b65 kv4: 4-bit K, head dim 256, 16-byte aligned rows: one row per invocation. GGML_VK_KQ_ROWS3=0: rows2 for
+    // every type; 2: q8_0 too (slower than rows2 on the 3060)
+    static const int rows3_env = getenv("GGML_VK_KQ_ROWS3") == nullptr ? 1 : atoi(getenv("GGML_VK_KQ_ROWS3"));
+    if (rows3_env > 0 && !split && !mask_skip_env && ggml_vk_kv_deq_type_idx(src0->type) >= 0 && k == 256 &&
+        (src0->type != GGML_TYPE_Q8_0 || rows3_env >= 2)) {
+        const size_t ts = ggml_type_size(src0->type);
+        const size_t a_off = get_misalign_bytes(ctx, src0);
+        if ((src0->nb[1] % 16) == 0 && (src0->nb[2] % 16) == 0 && (a_off % 16) == 0 && (a_off % ts) == 0) {
+            vk_pipeline p3 = ctx->device->pipeline_mul_mat_vec_gqa_rows3_f32[ggml_vk_kv_deq_type_idx(src0->type)][gqa - 1][ntok - 1];
+            if (ggml_nbytes(src0) > ctx->device->properties.limits.maxStorageBufferRange) {
+                p3 = ggml_vk_get_64b_indexing_pipeline(ctx, p3);
+            }
+            ggml_pipeline_request_descriptor_sets(ctx, p3, 1);
+            vk_subbuffer d_D3  = ggml_vk_tensor_subbuffer(ctx, dst, true);
+            vk_subbuffer d_Qx3 = ggml_vk_tensor_subbuffer(ctx, src0, true);
+            vk_subbuffer d_Qy3 = ggml_vk_tensor_subbuffer(ctx, src1, true);
+            vk_mat_vec_gqa_push_constants pc3 = {
+                k, rows,
+                (uint32_t)(src0->nb[1] / ts), (uint32_t)(src0->nb[2] / ts),
+                (uint32_t)(src1->nb[2] / sizeof(float)), (uint32_t)(src1->nb[1] / sizeof(float)),
+                (uint32_t)(dst->nb[2] / sizeof(float)), (uint32_t)(dst->nb[1] / sizeof(float)),
+                0, 0, 0,
+            };
+            init_pushconst_tensor_offsets(ctx, pc3, src0, src1, nullptr, nullptr, dst);
+            ggml_vk_dispatch_pipeline(ctx, subctx, p3, { d_Qx3, d_Qy3, d_D3 }, pc3, { CEIL_DIV(rows, 128u), (uint32_t)src0->ne[2], 1 });
+            return;
+        }
+    }
     if (src0->type == GGML_TYPE_Q8_0) {   // b65: gqa_ok only lets q8_0 through for short k with rows2 on
         pipeline = ctx->device->pipeline_mul_mat_vec_gqa_rows2_q8_0_f32[gqa - 1][ntok - 1];
     } else if (src0->type == GGML_TYPE_Q4_0) {   // b65 kv4

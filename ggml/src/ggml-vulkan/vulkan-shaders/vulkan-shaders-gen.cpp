@@ -920,6 +920,12 @@ void process_shaders() {
     string_to_spv("mul_mat_vec_gqa_vxq_q8_0_f32", "mul_mat_vec_gqa_vxq.comp", {{"DATA_A_Q8_0", "1"}});   // b65 kv4: V x P, quantized V (untransposed)
     string_to_spv("mul_mat_vec_gqa_vxq_q4_0_f32", "mul_mat_vec_gqa_vxq.comp", {{"DATA_A_Q4_0", "1"}});   // b65 kv4
     string_to_spv("mul_mat_vec_gqa_vxq_iq4_nl_f32", "mul_mat_vec_gqa_vxq.comp", {{"DATA_A_IQ4_NL", "1"}});   // b65 kv4
+    for (const std::string t : {"q8_0", "q4_0", "iq4_nl"}) {   // b65 kv4: K x Q, one row per invocation, head dim 256
+        string_to_spv("mul_mat_vec_gqa_rows3_" + t + "_f32", "mul_mat_vec_gqa_rows3.comp", {{"DATA_A_" + to_uppercase(t), "1"}});
+    }
+    for (const std::string t : {"q8_0", "q4_0", "iq4_nl"}) {   // b65 kv4: staged V x P, head dim 256
+        string_to_spv("mul_mat_vec_gqa_vxq3_" + t + "_f32", "mul_mat_vec_gqa_vxq3.comp", {{"DATA_A_" + to_uppercase(t), "1"}});
+    }
     for (const std::string t : {"q8_0", "q4_0", "iq4_nl"}) {   // b65 kv4: quantized KV view -> f16 (prompt batches)
         string_to_spv("kv_deq_f16_" + t, "kv_deq_f16.comp", {{"DATA_A_" + to_uppercase(t), "1"}});
         string_to_spv("kv_deq_f16_t_" + t, "kv_deq_f16.comp", {{"DATA_A_" + to_uppercase(t), "1"}, {"TRANSPOSED", "1"}});

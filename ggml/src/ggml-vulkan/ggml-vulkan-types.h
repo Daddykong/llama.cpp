@@ -879,6 +879,8 @@ struct vk_device_struct {
     vk_pipeline pipeline_mul_mat_vec_gqa_vxq_q8_0_f32[8][4]; // b65 kv4: V x P with a q8_0 V cache (out_prod form)
     vk_pipeline pipeline_mul_mat_vec_gqa_vxq_q4_0_f32[8][4]; // b65 kv4: q4_0 V cache
     vk_pipeline pipeline_mul_mat_vec_gqa_vxq_iq4_nl_f32[8][4]; // b65 kv4: iq4_nl V cache
+    vk_pipeline pipeline_mul_mat_vec_gqa_rows3_f32[3][8][4]; // b65 kv4: K x Q on a quantized K cache (head dim 256)
+    vk_pipeline pipeline_mul_mat_vec_gqa_vxq3_f32[3][8][4]; // b65 kv4: staged V x P (head dim 256) [q8_0, q4_0, iq4_nl]
     uint32_t mul_mat_vec_gqa_vxq_epl[8][4]; // b65 kv4: elements per lane of each vxq pipeline
     vk_pipeline pipeline_kv_deq_f16[3][2]; // b65 kv4: quantized KV view -> f16 [q8_0, q4_0, iq4_nl][plain, transposed]
     uint32_t mul_mat_vec_gqa_vxp_block; // b65 rows per workgroup

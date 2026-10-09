@@ -11992,6 +11992,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+    // b65 kv4: decode attention on a quantized KV cache at 32K (Qwen3.8-27B: d 256, 24 heads on 4 KV heads)
+    for (ggml_type t : { GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, GGML_TYPE_IQ4_NL }) {
+        for (int n : {1, 3}) {
+            test_cases.emplace_back(new test_b65_vxq(t, 256, 24, 4, 33024, n));
+            test_cases.emplace_back(new test_b65_kq_quant(t, 256, 24, 4, 33024, n));
+        }
+    }
     for (int ctx : {3904, 27904, 32768}) {   // b65 attention shapes
         for (int n : {1, 2, 3, 4}) {
             test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, ctx, n, 256, {4, 1}, {6, 1}, {0, 2, 1, 3}));

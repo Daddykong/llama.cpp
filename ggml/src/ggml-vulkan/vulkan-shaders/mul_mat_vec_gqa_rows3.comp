@@ -1,0 +1,143 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+
+// b65 kv4: K x Q for decode attention on a quantized K cache (q8_0 / q4_0 / iq4_nl), head dim 256
+// (GGML_VK_KQ_ROWS3, default on):  dst[row, t, h*GQA + c] = sum_k K[k, row, h] * Q[k, t, h*GQA + c]
+// One invocation per K row (one token of one KV head): the row is read with 16-byte loads straight into registers
+// (q4: 9 x 16 bytes; q8_0 in two halves of 9) and dotted with the workgroup's queries, which are staged once in shared
+// memory (uniform reads). q4_0: the -8 offset is applied per block from the staged query block sums. Each output is a
+// fixed-order sum, independent of the token count, the subgroup size and the workgroup size.
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(constant_id = 0) const uint GQA = 1;
+layout(constant_id = 1) const uint NTOK = 1;
+
+#define D 256u
+#define NB 8u                  // blocks per row
+#define CT (GQA * NTOK)
+
+#if defined(DATA_A_Q8_0)
+#define BS 34u
+#else
+#define BS 18u
+#endif
+
+layout (binding = 0) readonly buffer A {uvec4 data_a[];};
+layout (binding = 1) readonly buffer B {float data_b[];};
+layout (binding = 2) writeonly buffer Dst {float data_d[];};
+
+layout (push_constant) uniform parameter
+{
+    uint ncols; uint nrows; uint a_row_stride; uint a_chan_stride;
+    uint b_chan_stride; uint b_tok_stride; uint d_chan_stride; uint d_tok_stride;
+    uint a_offset; uint b_offset; uint d_offset;
+    uint mask_offset; uint mask_tok_stride; uint mask_head_stride; uint flags;
+} p;
+
+shared vec4 qs4[CT * D / 4];
+#if defined(DATA_A_Q4_0)
+shared float qsum[CT * NB];
+#endif
+#if defined(DATA_A_IQ4_NL)
+shared float kvalues[16];
+const float kvalues_const[16] = float[16](-127.0, -104.0, -83.0, -65.0, -49.0, -35.0, -22.0, -10.0,
+                                          1.0, 13.0, 25.0, 38.0, 53.0, 69.0, 89.0, 113.0);
+#endif
+
+uint w[36];   // 144 bytes of the row (all of a q4 row, half of a q8_0 row)
+#define BYTE(o) ((w[(o) >> 2] >> (((o) & 3u) * 8u)) & 0xFFu)
+#define HALF(o) unpackHalf2x16(w[(o) >> 2] >> (((o) & 2u) * 8u)).x
+
+float acc[CT];
+
+// one block whose first byte is at offset o of w[], block index b of the row
+void block(const uint o, const uint b) {
+    const float d = HALF(o);
+    float s[CT];
+    [[unroll]] for (uint i = 0; i < CT; ++i) s[i] = 0.0;
+#if defined(DATA_A_Q8_0)
+    [[unroll]] for (uint i = 0; i < 32; i += 4) {
+        const vec4 a = vec4(float(int(BYTE(o + 2 + i) << 24) >> 24), float(int(BYTE(o + 3 + i) << 24) >> 24),
+                            float(int(BYTE(o + 4 + i) << 24) >> 24), float(int(BYTE(o + 5 + i) << 24) >> 24));
+        [[unroll]] for (uint c = 0; c < CT; ++c) s[c] += dot(a, qs4[(c * D + b * 32 + i) / 4]);
+    }
+#else
+    [[unroll]] for (uint i = 0; i < 16; i += 4) {
+        const uint b0 = BYTE(o + 2 + i), b1 = BYTE(o + 3 + i), b2 = BYTE(o + 4 + i), b3 = BYTE(o + 5 + i);
+#if defined(DATA_A_IQ4_NL)
+        const vec4 lo = vec4(kvalues[b0 & 15u], kvalues[b1 & 15u], kvalues[b2 & 15u], kvalues[b3 & 15u]);
+        const vec4 hi = vec4(kvalues[b0 >> 4], kvalues[b1 >> 4], kvalues[b2 >> 4], kvalues[b3 >> 4]);
+#else
+        const vec4 lo = vec4(b0 & 15u, b1 & 15u, b2 & 15u, b3 & 15u);
+        const vec4 hi = vec4(b0 >> 4, b1 >> 4, b2 >> 4, b3 >> 4);
+#endif
+        [[unroll]] for (uint c = 0; c < CT; ++c) {
+            s[c] += dot(lo, qs4[(c * D + b * 32 + i) / 4]) + dot(hi, qs4[(c * D + b * 32 + 16 + i) / 4]);
+        }
+    }
+#endif
+    [[unroll]] for (uint c = 0; c < CT; ++c) {
+#if defined(DATA_A_Q4_0)
+        acc[c] = fma(d, s[c] - 8.0 * qsum[c * NB + b], acc[c]);
+#else
+        acc[c] = fma(d, s[c], acc[c]);
+#endif
+    }
+}
+
+void load(const uint base, const uint n4) {
+    [[unroll]] for (uint j = 0; j < 9; ++j) {
+        const uvec4 v = data_a[base + j];
+        w[4 * j] = v.x; w[4 * j + 1] = v.y; w[4 * j + 2] = v.z; w[4 * j + 3] = v.w;
+    }
+}
+
+void main() {
+    const uint l = gl_LocalInvocationID.x;
+    const uint h = gl_WorkGroupID.y;
+    const uint row_l = gl_WorkGroupID.x * 128 + l;
+    const uint row = min(row_l, p.nrows - 1);
+
+#if defined(DATA_A_IQ4_NL)
+    if (l < 16) {
+        kvalues[l] = kvalues_const[l];
+    }
+#endif
+    // queries of this KV head's GQA heads and NTOK tokens -> shared memory
+    for (uint e = l; e < CT * D; e += 128) {
+        const uint c = e / (NTOK * D), t = (e / D) % NTOK, k = e % D;
+        const float v = data_b[p.b_offset + (h * GQA + c) * p.b_chan_stride + t * p.b_tok_stride + k];
+        qs4[(c * NTOK + t) * D / 4 + k / 4][k % 4] = v;
+    }
+    barrier();
+#if defined(DATA_A_Q4_0)
+    for (uint e = l; e < CT * NB; e += 128) {
+        float s = 0.0;
+        [[unroll]] for (uint i = 0; i < 8; ++i) s += dot(qs4[(e / NB) * D / 4 + (e % NB) * 8 + i], vec4(1.0));
+        qsum[e] = s;
+    }
+    barrier();
+#endif
+
+    [[unroll]] for (uint i = 0; i < CT; ++i) acc[i] = 0.0;
+    const uint base = (p.a_offset + h * p.a_chan_stride + row * p.a_row_stride) * BS / 16;   // in uvec4
+#if defined(DATA_A_Q8_0)
+    load(base, 9);                  // bytes 0..143: blocks 0..3 (0..135)
+    [[unroll]] for (uint b = 0; b < 4; ++b) block(b * BS, b);
+    load(base + 8, 9);              // bytes 128..271: blocks 4..7 (136..271)
+    [[unroll]] for (uint b = 4; b < 8; ++b) block(b * BS - 128, b);
+#else
+    load(base, 9);
+    [[unroll]] for (uint b = 0; b < NB; ++b) block(b * BS, b);
+#endif
+
+    if (row_l < p.nrows) {
+        [[unroll]] for (uint c = 0; c < GQA; ++c) {
+            [[unroll]] for (uint t = 0; t < NTOK; ++t) {
+                data_d[p.d_offset + (h * GQA + c) * p.d_chan_stride + t * p.d_tok_stride + row] = acc[c * NTOK + t];
+            }
+        }
+    }
+}

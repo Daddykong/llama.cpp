@@ -1,0 +1,195 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+
+// b65 kv4: V x P with a quantized V cache (flash attention off), pass 1 of 2, staged version (GGML_VK_VXQ_V3, default).
+//   part[s, h*GQA + c, t, i] = sum_{k in slice s} V[i, k, h] * P[t, k, h*GQA + c]
+// Head dim 256 only. One token's head row is RW x 16 bytes (q8_0: 8 blocks x 34 = 272 = 17 x 16; q4_0 / iq4_nl:
+// 8 x 18 = 144 = 9 x 16), so the workgroup copies KC rows at a time into shared memory with coalesced 16-byte loads
+// (the next tile's loads are in flight while this one is used, as in the f16 VXP mode 4 kernel), with the tile's
+// probabilities. Lanes then read their EPL elements (and the block scale) of each row from shared memory: 128 lanes =
+// R = EPL/2 row groups of 256/EPL lanes, row group rg takes tile rows rg, rg+R, ... The block scale is folded into
+// the probability (acc += q * (p*d)); for q4_0 the -8 offset is applied once at the end from the sum of p*d.
+// Row groups are added in a fixed order at the end and pass 2 (mul_mat_vec_gqa_vxp_reduce.comp) adds the slices in
+// order; with EPL fixed for every NTOK (batch-invariant mode) 1-4 token steps give bit-identical results.
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(constant_id = 0) const uint EPL = 8;     // elements per lane: 4 or 8
+layout(constant_id = 1) const uint GQA = 1;     // B channels per A channel, 1..8
+layout(constant_id = 2) const uint NTOK = 1;    // columns of B, 1..4
+layout(constant_id = 3) const uint KC = 64;     // tokens per tile
+
+#define WG 128u
+#define D 256u
+const uint LPR = D / EPL;      // lanes per row
+const uint R = WG / LPR;       // row groups
+
+#if defined(DATA_A_Q8_0)
+#define BS 34u
+#define RW 17u
+#else
+#define BS 18u
+#define RW 9u
+#endif
+#define RWW (RW * 4u)          // u32 words per row
+const uint NPRE = (KC * RW + WG - 1) / WG;   // 16-byte loads per lane per tile
+
+layout (binding = 0) readonly buffer A {uvec4 data_a[];};
+layout (binding = 1) readonly buffer B {float data_b[];};
+layout (binding = 2) writeonly buffer D_ {float data_d[];};
+
+layout (push_constant) uniform parameter
+{
+    uint ncols;          // k (tokens of the cache)
+    uint nrows;          // d = 256
+    uint a_row_stride;   // in blocks: one token row of the cache (row bytes a multiple of 16)
+    uint a_chan_stride;  // in blocks: one KV head (8 blocks)
+    uint b_chan_stride;  // in f32: one query head of P
+    uint b_tok_stride;   // in f32: one query token of P (P is contiguous along k)
+    uint a_offset;       // in blocks (a_offset * BS a multiple of 16)
+    uint b_offset;       // in f32
+    uint slice;          // k per slice, multiple of KC
+    uint nchan_b;        // B channels (= A channels * GQA)
+} p;
+
+shared uint tile[KC * RWW + 4];   // +4: bytes8 reads one word past a row end
+shared float btile[GQA * NTOK * KC];
+shared float red[WG * EPL];
+
+#if defined(DATA_A_IQ4_NL)
+shared float kvalues[16];
+const float kvalues_const[16] = float[16](-127.0, -104.0, -83.0, -65.0, -49.0, -35.0, -22.0, -10.0,
+                                          1.0, 13.0, 25.0, 38.0, 53.0, 69.0, 89.0, 113.0);
+#endif
+
+// 8 bytes of the tile from byte offset o (o even)
+uvec2 bytes8(const uint o) {
+    const uint w = o >> 2;
+    const uint w0 = tile[w], w1 = tile[w + 1], w2 = tile[w + 2];
+    return (o & 2u) == 0u ? uvec2(w0, w1) : uvec2((w0 >> 16) | (w1 << 16), (w1 >> 16) | (w2 << 16));
+}
+
+float scale(const uint o) {   // f16 at byte offset o (even)
+    const uint w = tile[o >> 2];
+    return unpackHalf2x16((o & 2u) == 0u ? w : (w >> 16)).x;
+}
+
+void main() {
+    const uint l  = gl_LocalInvocationID.x;
+    const uint rg = l / LPR;
+    const uint li = l % LPR;
+    const uint s  = gl_WorkGroupID.x;
+    const uint h  = gl_WorkGroupID.y;
+    const uint k0 = s * p.slice;
+    const uint k1 = min(k0 + p.slice, p.ncols);
+    const uint e0 = EPL * li;              // first head-dim element of this lane
+    const uint bi = e0 / 32;               // its block in the row
+    const uint eb = e0 % 32;               // its first element in the block
+#if defined(DATA_A_Q8_0)
+    const uint qoff = bi * BS + 2 + eb;            // byte of its first quant in a row
+#else
+    const uint qoff = bi * BS + 2 + (eb % 16);
+    const uint qsh  = eb < 16 ? 0u : 4u;           // low or high nibbles
+#endif
+    const uint doff = bi * BS;
+
+#if defined(DATA_A_IQ4_NL)
+    if (l < 16) {
+        kvalues[l] = kvalues_const[l];
+    }
+#endif
+
+    float acc[EPL * GQA * NTOK];
+    [[unroll]] for (uint i = 0; i < EPL * GQA * NTOK; ++i) acc[i] = 0.0;
+#if defined(DATA_A_Q4_0)
+    float spd[GQA * NTOK];
+    [[unroll]] for (uint i = 0; i < GQA * NTOK; ++i) spd[i] = 0.0;
+#endif
+
+    // A rows in uvec4: row k of head h starts at ((a_offset + h*chan + k*row_stride) * BS) / 16
+    const uint a_head = (p.a_offset + h * p.a_chan_stride) * BS / 16;
+    const uint a_rs   = p.a_row_stride * BS / 16;
+    const uint b_base = p.b_offset + h * GQA * p.b_chan_stride;
+
+    uvec4 pre[NPRE];
+    [[unroll]] for (uint j = 0; j < NPRE; ++j) {
+        const uint e = j * WG + l;               // tile entry: row e / RW, uvec4 e % RW
+        const uint kr = k0 + e / RW;
+        pre[j] = (e < KC * RW && kr < k1) ? data_a[a_head + kr * a_rs + e % RW] : uvec4(0);
+    }
+
+    for (uint kt = k0; kt < k1; kt += KC) {
+        const uint kn = min(KC, k1 - kt);
+        barrier();
+        [[unroll]] for (uint j = 0; j < NPRE; ++j) {
+            const uint e = j * WG + l;
+            if (e < KC * RW) {
+                tile[e * 4 + 0] = pre[j].x; tile[e * 4 + 1] = pre[j].y; tile[e * 4 + 2] = pre[j].z; tile[e * 4 + 3] = pre[j].w;
+            }
+        }
+        for (uint x = l; x < GQA * NTOK * KC; x += WG) {
+            const uint kk = x % KC;
+            const uint ct = x / KC;          // c * NTOK + t
+            const uint c = ct / NTOK, t = ct % NTOK;
+            btile[x] = kk < kn ? data_b[b_base + c * p.b_chan_stride + t * p.b_tok_stride + kt + kk] : 0.0;
+        }
+        barrier();
+        if (kt + KC < k1) {   // next tile's loads in flight while this one is used
+            [[unroll]] for (uint j = 0; j < NPRE; ++j) {
+                const uint e = j * WG + l;
+                const uint kr = kt + KC + e / RW;
+                pre[j] = (e < KC * RW && kr < k1) ? data_a[a_head + kr * a_rs + e % RW] : uvec4(0);
+            }
+        }
+        for (uint kk = rg; kk < kn; kk += R) {
+            const uint ro = kk * RWW * 4;         // row byte offset in the tile
+            const float d = scale(ro + doff);
+            const uvec2 qb = bytes8(ro + qoff);
+            float v[EPL];
+#if defined(DATA_A_Q8_0)
+            [[unroll]] for (uint j = 0; j < EPL; ++j) {
+                v[j] = float(bitfieldExtract(int(j < 4 ? qb.x : qb.y), int(8 * (j % 4)), 8));
+            }
+#else
+            [[unroll]] for (uint j = 0; j < EPL; ++j) {
+                const uint n = ((j < 4 ? qb.x : qb.y) >> (8 * (j % 4) + qsh)) & 0xFu;
+#if defined(DATA_A_IQ4_NL)
+                v[j] = kvalues[n];
+#else
+                v[j] = float(n);
+#endif
+            }
+#endif
+            [[unroll]] for (uint ct = 0; ct < GQA * NTOK; ++ct) {
+                const float pd = btile[ct * KC + kk] * d;
+#if defined(DATA_A_Q4_0)
+                spd[ct] += pd;
+#endif
+                [[unroll]] for (uint j = 0; j < EPL; ++j) acc[ct * EPL + j] = fma(v[j], pd, acc[ct * EPL + j]);
+            }
+        }
+    }
+
+#if defined(DATA_A_Q4_0)
+    [[unroll]] for (uint ct = 0; ct < GQA * NTOK; ++ct) {
+        [[unroll]] for (uint j = 0; j < EPL; ++j) acc[ct * EPL + j] = fma(-8.0, spd[ct], acc[ct * EPL + j]);
+    }
+#endif
+
+    // part layout [slice][hq][t][i], as mul_mat_vec_gqa_vxp_reduce.comp reads it; row groups added in order 0..R-1
+    [[unroll]] for (uint c = 0; c < GQA; ++c) {
+        [[unroll]] for (uint t = 0; t < NTOK; ++t) {
+            const uint ct = c * NTOK + t;
+            const uint o = ((s * p.nchan_b + h * GQA + c) * NTOK + t) * D;
+            barrier();
+            [[unroll]] for (uint j = 0; j < EPL; ++j) red[rg * D + e0 + j] = acc[ct * EPL + j];
+            barrier();
+            for (uint i = l; i < D; i += WG) {
+                float sum = red[i];
+                for (uint r = 1; r < R; ++r) sum += red[r * D + i];
+                data_d[o + i] = sum;
+            }
+        }
+    }
+}
