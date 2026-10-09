@@ -27,6 +27,7 @@ layout(constant_id = 1) const uint NTOK = 1;
 layout (binding = 0) readonly buffer A {uvec4 data_a[];};
 layout (binding = 1) readonly buffer B {float data_b[];};
 layout (binding = 2) writeonly buffer Dst {float data_d[];};
+layout (binding = 3) readonly buffer M {uint data_m[];};   // b65 Quest: selection bitmap (flags & 4)
 
 layout (push_constant) uniform parameter
 {
@@ -34,6 +35,7 @@ layout (push_constant) uniform parameter
     uint b_chan_stride; uint b_tok_stride; uint d_chan_stride; uint d_tok_stride;
     uint a_offset; uint b_offset; uint d_offset;
     uint mask_offset; uint mask_tok_stride; uint mask_head_stride; uint flags;
+    uint qblock;   // b65 Quest: cells per bitmap bit
 } p;
 
 shared vec4 qs4[CT * D / 4];
@@ -100,6 +102,34 @@ void main() {
     const uint row_l = gl_WorkGroupID.x * 128 + l;
     const uint row = min(row_l, p.nrows - 1);
 
+    // b65 Quest: bit t of tsel = this row's block is selected for token t (KV head h). A workgroup with no selected
+    // block for any token only writes -inf (uniform exit before any barrier); unselected rows skip their K reads.
+    uint tsel = (1u << NTOK) - 1u;
+    if ((p.flags & 4u) != 0u) {
+        const uint r0 = gl_WorkGroupID.x * 128u, r1 = min(r0 + 128u, p.nrows) - 1u;
+        bool any = false;
+        [[unroll]] for (uint t = 0; t < NTOK; ++t) {
+            const uint mb = p.mask_offset + t * p.mask_tok_stride + h * p.mask_head_stride;
+            for (uint b = r0 / p.qblock; b <= r1 / p.qblock; ++b) {
+                any = any || ((data_m[mb + b / 32u] >> (b % 32u)) & 1u) != 0u;
+            }
+        }
+        if (!any) {
+            if (row_l < p.nrows) {
+                [[unroll]] for (uint c = 0; c < GQA; ++c) {
+                    [[unroll]] for (uint t = 0; t < NTOK; ++t) {
+                        data_d[p.d_offset + (h * GQA + c) * p.d_chan_stride + t * p.d_tok_stride + row] = uintBitsToFloat(0xFF800000u);
+                    }
+                }
+            }
+            return;
+        }
+        tsel = 0u;
+        const uint b = row / p.qblock;
+        [[unroll]] for (uint t = 0; t < NTOK; ++t) {
+            tsel |= ((data_m[p.mask_offset + t * p.mask_tok_stride + h * p.mask_head_stride + b / 32u] >> (b % 32u)) & 1u) << t;
+        }
+    }
 #if defined(DATA_A_IQ4_NL)
     if (l < 16) {
         kvalues[l] = kvalues_const[l];
@@ -123,6 +153,7 @@ void main() {
 
     [[unroll]] for (uint i = 0; i < CT; ++i) acc[i] = 0.0;
     const uint base = (p.a_offset + h * p.a_chan_stride + row * p.a_row_stride) * BS / 16;   // in uvec4
+    if (tsel != 0u) {
 #if defined(DATA_A_Q8_0)
     load(base, 9);                  // bytes 0..143: blocks 0..3 (0..135)
     [[unroll]] for (uint b = 0; b < 4; ++b) block(b * BS, b);
@@ -132,11 +163,13 @@ void main() {
     load(base, 9);
     [[unroll]] for (uint b = 0; b < NB; ++b) block(b * BS, b);
 #endif
+    }
 
     if (row_l < p.nrows) {
         [[unroll]] for (uint c = 0; c < GQA; ++c) {
             [[unroll]] for (uint t = 0; t < NTOK; ++t) {
-                data_d[p.d_offset + (h * GQA + c) * p.d_chan_stride + t * p.d_tok_stride + row] = acc[c * NTOK + t];
+                data_d[p.d_offset + (h * GQA + c) * p.d_chan_stride + t * p.d_tok_stride + row] =
+                    ((tsel >> t) & 1u) != 0u ? acc[c * NTOK + t] : uintBitsToFloat(0xFF800000u);
             }
         }
     }

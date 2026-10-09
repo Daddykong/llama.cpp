@@ -5547,6 +5547,28 @@ struct ggml_tensor * ggml_kv_block_minmax(
     return ggml_kv_block_minmax_ext(ctx, kmm, k, idx, after, block, 0);
 }
 
+struct ggml_tensor * ggml_kv_block_mean(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * kmm,
+        struct ggml_tensor  * kc,
+        struct ggml_tensor  * idx,
+        struct ggml_tensor  * after,
+        int                   block) {
+    GGML_ASSERT(kmm->type == GGML_TYPE_F32 && idx->type == GGML_TYPE_I64 && block > 0);
+    GGML_ASSERT(kc->type == GGML_TYPE_F32 || kc->type == GGML_TYPE_F16 || kc->type == GGML_TYPE_Q8_0);
+    GGML_ASSERT(kmm->ne[0] == kc->ne[0] && kc->nb[0] == ggml_type_size(kc->type));
+    struct ggml_tensor * result = ggml_view_tensor(ctx, kmm);
+    ggml_set_op_params_i32(result, 0, block);
+    ggml_set_op_params_i32(result, 1, 1);
+    ggml_set_op_params_i32(result, 2, 1);   // mode 1: mean of the stored keys
+    result->op     = GGML_OP_KV_BLOCK_MINMAX;
+    result->src[0] = kmm;
+    result->src[1] = kc;
+    result->src[2] = idx;
+    result->src[3] = after;
+    return result;
+}
+
 struct ggml_tensor * ggml_kv_quest_mask(
         struct ggml_context * ctx,
         struct ggml_tensor  * q,
@@ -5558,7 +5580,8 @@ struct ggml_tensor * ggml_kv_quest_mask(
         int                   sink,
         int                   recent) {
     GGML_ASSERT(q->type == GGML_TYPE_F32 && kmm->type == GGML_TYPE_F32 && mask->type == GGML_TYPE_F32);
-    GGML_ASSERT(kmm->ne[0] == 2*q->ne[0]*n_head_kv && q->ne[1] % n_head_kv == 0 && mask->ne[1] >= q->ne[2] && block > 0);
+    GGML_ASSERT((kmm->ne[0] == 2*q->ne[0]*n_head_kv || kmm->ne[0] == q->ne[0]*n_head_kv) && q->ne[1] % n_head_kv == 0 &&
+                mask->ne[1] >= q->ne[2] && block > 0);
     const int64_t nb = (mask->ne[0] + block - 1) / block;
     const int64_t nw = (nb + 31) / 32;
     GGML_ASSERT(kmm->ne[1] >= nb);

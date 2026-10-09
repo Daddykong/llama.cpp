@@ -19,6 +19,7 @@ layout(binding = 3) writeonly buffer DST { uint data_d[]; };
 layout(push_constant) uniform PC {
     uint D; uint NB; uint NKV; uint B; uint NHKV; uint NW; uint ROW;
     uint q_head; uint q_tok; uint kmm_row; uint m_row; uint q_off; uint kmm_off; uint m_off; uint d_off;
+    uint mean;   // b65 Quest v3: kmm row = block mean keys [E] (bound = q . mean) instead of min [E] | max [E]
 } p;
 shared vec4 s_q[T * G * DMAX / 4];
 #define NEG_INF uintBitsToFloat(0xFF800000u)
@@ -51,10 +52,11 @@ void main() {
         const uint mn4 = (p.kmm_off + b * p.kmm_row + g * p.D) / 4;
         const uint mx4 = mn4 + p.NHKV * D4;
         for (uint d4 = lane; d4 < D4; d4 += SG) {
-            const vec4 mn = data_kmm4[mn4 + d4], mx = data_kmm4[mx4 + d4];
+            const vec4 mn = data_kmm4[mn4 + d4];
+            const vec4 mx = p.mean != 0u ? mn : data_kmm4[mx4 + d4];
             [[unroll]] for (uint i = 0; i < T * G; ++i) {
                 const vec4 qv = s_q[i * D4 + d4];
-                const vec4 m = max(qv * mn, qv * mx);
+                const vec4 m = p.mean != 0u ? qv * mn : max(qv * mn, qv * mx);
                 acc[i] += (m.x + m.y) + (m.z + m.w);
             }
         }

@@ -822,6 +822,10 @@ struct vk_op_kv_minmax_push_constants {   // b65 Quest
 struct vk_op_kv_quest_bound_push_constants {    // b65 Quest v2
     uint32_t D; uint32_t NB; uint32_t NKV; uint32_t B; uint32_t NHKV; uint32_t NW; uint32_t ROW;
     uint32_t q_head; uint32_t q_tok; uint32_t kmm_row; uint32_t m_row; uint32_t q_off; uint32_t kmm_off; uint32_t m_off; uint32_t d_off;
+    uint32_t mean;   // b65 Quest v3: mean-key rule
+};
+struct vk_op_kv_mean_push_constants {   // b65 Quest v3 (kv_block_mean.comp); kc_row / kc_off in bytes
+    uint32_t E; uint32_t T; uint32_t B; uint32_t kmm_row; uint32_t kc_row; uint32_t kmm_off; uint32_t kc_off; uint32_t idx_off;
 };
 struct vk_op_kv_quest_select_push_constants {   // b65 Quest v2
     uint32_t NB; uint32_t NW; uint32_t ROW; uint32_t NHKV; uint32_t B; uint32_t budget; uint32_t sink; uint32_t recent; uint32_t d_off;

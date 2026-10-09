@@ -8866,6 +8866,27 @@ void ggml_compute_forward_kv_block_minmax(const ggml_compute_params * params, gg
     const ggml_tensor * idx = dst->src[2];
     const int B = ggml_get_op_params_i32(dst, 0);
     const bool reset = ggml_get_op_params_i32(dst, 1) != 0;
+    if (ggml_get_op_params_i32(dst, 2) == 1) {   // b65 Quest v3: block mean of the stored keys (k = the K cache)
+        const int64_t E = k->ne[0], T = idx->ne[0];
+        const int64_t * cells = (const int64_t *) idx->data;
+        const auto * tt = ggml_get_type_traits(k->type);
+        std::vector<float> row(E), acc(E);
+        for (int64_t t = 0; t < T; ++t) {
+            const int64_t cell = cells[t], b = cell / B;
+            if (t + 1 < T && cells[t + 1] / B == b) continue;   // the block's last token in the batch writes
+            std::fill(acc.begin(), acc.end(), 0.0f);
+            for (int64_t c = b * B; c <= cell; ++c) {
+                const char * kr = (const char *) k->data + c * k->nb[1];
+                if (k->type == GGML_TYPE_F32) memcpy(row.data(), kr, E * sizeof(float));
+                else tt->to_float(kr, row.data(), E);
+                for (int64_t d = 0; d < E; ++d) acc[d] += row[d];
+            }
+            const float inv = 1.0f / (float) (cell - b * B + 1);
+            float * mo = (float *) ((char *) kmm->data + b * kmm->nb[1]);
+            for (int64_t d = 0; d < E; ++d) mo[d] = acc[d] * inv;
+        }
+        return;
+    }
     const int64_t E = k->ne[0], T = k->ne[1];
     for (int64_t t = 0; t < T; ++t) {
         const int64_t cell = ((const int64_t *) idx->data)[t];
@@ -8898,6 +8919,7 @@ void ggml_compute_forward_kv_quest_mask(const ggml_compute_params * params, ggml
     const int budget = ggml_get_op_params_i32(dst, 2), sink = ggml_get_op_params_i32(dst, 3), recent = ggml_get_op_params_i32(dst, 4);
     const int64_t D = q->ne[0], NH = q->ne[1], T = q->ne[2], NKV = mask->ne[0];
     const int64_t G = NH / NHKV, E = D * NHKV;
+    const bool mean = kmm->ne[0] == E;   // b65 Quest v3: mean-key rule
     const int64_t NB = (NKV + B - 1) / B, NW = (NB + 31) / 32;
     std::vector<char> live(NB), sel(NB);
     std::vector<int> order;
@@ -8922,7 +8944,8 @@ void ggml_compute_forward_kv_quest_mask(const ggml_compute_params * params, ggml
             for (int64_t h = g * G; h < (g + 1) * G; ++h) {
                 const float * qr = (const float *) ((const char *) q->data + h * q->nb[1] + t * q->nb[2]);
                 float s = 0.0f;
-                for (int64_t d = 0; d < D; ++d) s += std::max(qr[d] * mn[d], qr[d] * mx[d]);
+                if (mean) { for (int64_t d = 0; d < D; ++d) s += qr[d] * mn[d]; }
+                else      { for (int64_t d = 0; d < D; ++d) s += std::max(qr[d] * mn[d], qr[d] * mx[d]); }
                 best = std::max(best, s);
             }
             bnd[b] = best;

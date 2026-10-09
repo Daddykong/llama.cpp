@@ -280,7 +280,11 @@ llama_kv_cache::llama_kv_cache(
         ggml_tensor * kmm = nullptr;   // b65 Quest
         if (const char * qb = getenv("LLAMA_KV_QUEST_BLOCK"); qb && atoi(qb) > 0 && has_k) {
             const uint32_t B = (uint32_t) atoi(qb);
-            kmm = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2*n_embd_k_gqa, (kv_size + B - 1) / B, n_stream);
+            // b65 Quest v3: LLAMA_KV_QUEST_RULE=minmax keeps per-block key min | max (2 x E floats); the default mean-key
+            // rule keeps one mean key per block (E floats)
+            const char * rule = getenv("LLAMA_KV_QUEST_RULE");
+            const bool minmax = rule && std::string(rule) == "minmax";
+            kmm = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, (minmax ? 2 : 1)*n_embd_k_gqa, (kv_size + B - 1) / B, n_stream);
             ggml_format_name(kmm, "cache_%skmm_l%d", name_tag, il);
         }
 

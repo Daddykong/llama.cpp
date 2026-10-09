@@ -2500,12 +2500,24 @@ extern "C" {
             int                   block,
             int                   reset);
 
+    // b65 Quest v3 (mean-key rule): kmm [E, n_blocks] f32 = per-block mean of the stored keys, recomputed from the K
+    // cache kc [E, n_cells] (f32 / f16 / q8_0 rows, one per cell) for every block the batch writes: block b of cell c
+    // = mean of cells b*block .. c (cells fill a block in order; later cells of the block are stale or empty).
+    // idx: the batch's cells (I64 [T]); only the last token of each block in the batch writes.
+    GGML_API struct ggml_tensor * ggml_kv_block_mean(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * kmm,
+            struct ggml_tensor  * kc,
+            struct ggml_tensor  * idx,
+            struct ggml_tensor  * after,
+            int                   block);
+
     // selected-block bitmap, one per (token, KV head): I32 [n_words + n_blocks, n_head_kv, n_tokens], n_blocks =
     // ceil(mask->ne[0] / block), n_words = ceil(n_blocks / 32); bit b of word w = block 32*w + b is kept. The
     // n_blocks words after the bitmap are scratch (the per-block bounds). Kept: live blocks (any cell of the mask row
     // not -inf) that are sink blocks (start < sink), one of the last `recent` live blocks, or among the best
     // floor(budget/block) - n_forced others by bound = max over the KV head's query heads of sum_d max(q*min, q*max)
-    // (ties: lower block first)
+    // (ties: lower block first). kmm [2*E, n_blocks] = min/max rule; kmm [E, n_blocks] = mean-key rule (bound = q . mean)
     GGML_API struct ggml_tensor * ggml_kv_quest_mask(
             struct ggml_context * ctx,
             struct ggml_tensor  * q,

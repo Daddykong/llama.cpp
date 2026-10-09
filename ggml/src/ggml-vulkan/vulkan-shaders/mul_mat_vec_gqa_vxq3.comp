@@ -38,6 +38,7 @@ const uint NPRE = (KC * RW + WG - 1) / WG;   // 16-byte loads per lane per tile
 layout (binding = 0) readonly buffer A {uvec4 data_a[];};
 layout (binding = 1) readonly buffer B {float data_b[];};
 layout (binding = 2) writeonly buffer D_ {float data_d[];};
+layout (binding = 3) readonly buffer SEL {uint data_s[];};   // b65 Quest: selection bitmap (qblock != 0)
 
 layout (push_constant) uniform parameter
 {
@@ -51,6 +52,10 @@ layout (push_constant) uniform parameter
     uint b_offset;       // in f32
     uint slice;          // k per slice, multiple of KC
     uint nchan_b;        // B channels (= A channels * GQA)
+    uint bm_offset;      // b65 Quest: bitmap word offset, token / KV-head strides (words), cells per bit (0 = off)
+    uint bm_tok;
+    uint bm_head;
+    uint qblock;
 } p;
 
 shared uint tile[KC * RWW + 4];   // +4: bytes8 reads one word past a row end
@@ -73,6 +78,25 @@ uvec2 bytes8(const uint o) {
 float scale(const uint o) {   // f16 at byte offset o (even)
     const uint w = tile[o >> 2];
     return unpackHalf2x16((o & 2u) == 0u ? w : (w >> 16)).x;
+}
+
+// b65 Quest: a KC tile is used when any of its blocks is selected for any token of KV head h (P is exactly 0 on
+// unselected blocks, so skipping the rest is exact)
+bool tile_live(const uint kt, const uint h) {
+    if (p.qblock == 0u) return true;
+    const uint b0 = kt / p.qblock, b1 = (min(kt + KC, p.ncols) - 1u) / p.qblock;
+    [[unroll]] for (uint t = 0; t < NTOK; ++t) {
+        const uint mb = p.bm_offset + t * p.bm_tok + h * p.bm_head;
+        for (uint b = b0; b <= b1; ++b) {
+            if (((data_s[mb + b / 32u] >> (b % 32u)) & 1u) != 0u) return true;
+        }
+    }
+    return false;
+}
+
+uint next_live(uint kt, const uint k1, const uint h) {
+    while (kt < k1 && !tile_live(kt, h)) kt += KC;
+    return kt;
 }
 
 void main() {
@@ -112,14 +136,15 @@ void main() {
     const uint a_rs   = p.a_row_stride * BS / 16;
     const uint b_base = p.b_offset + h * GQA * p.b_chan_stride;
 
+    uint kt = next_live(k0, k1, h);
     uvec4 pre[NPRE];
     [[unroll]] for (uint j = 0; j < NPRE; ++j) {
         const uint e = j * WG + l;               // tile entry: row e / RW, uvec4 e % RW
-        const uint kr = k0 + e / RW;
+        const uint kr = kt + e / RW;
         pre[j] = (e < KC * RW && kr < k1) ? data_a[a_head + kr * a_rs + e % RW] : uvec4(0);
     }
 
-    for (uint kt = k0; kt < k1; kt += KC) {
+    while (kt < k1) {
         const uint kn = min(KC, k1 - kt);
         barrier();
         [[unroll]] for (uint j = 0; j < NPRE; ++j) {
@@ -135,10 +160,11 @@ void main() {
             btile[x] = kk < kn ? data_b[b_base + c * p.b_chan_stride + t * p.b_tok_stride + kt + kk] : 0.0;
         }
         barrier();
-        if (kt + KC < k1) {   // next tile's loads in flight while this one is used
+        const uint ktn = next_live(kt + KC, k1, h);
+        if (ktn < k1) {   // next (used) tile's loads in flight while this one is used
             [[unroll]] for (uint j = 0; j < NPRE; ++j) {
                 const uint e = j * WG + l;
-                const uint kr = kt + KC + e / RW;
+                const uint kr = ktn + e / RW;
                 pre[j] = (e < KC * RW && kr < k1) ? data_a[a_head + kr * a_rs + e % RW] : uvec4(0);
             }
         }
@@ -169,6 +195,7 @@ void main() {
                 [[unroll]] for (uint j = 0; j < EPL; ++j) acc[ct * EPL + j] = fma(v[j], pd, acc[ct * EPL + j]);
             }
         }
+        kt = ktn;
     }
 
 #if defined(DATA_A_Q4_0)

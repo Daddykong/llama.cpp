@@ -2714,10 +2714,13 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             static const int q_rec  = getenv("LLAMA_KV_QUEST_RECENT")  ? atoi(getenv("LLAMA_KV_QUEST_RECENT"))  : 2;
             static const int qb     = atoi(getenv("LLAMA_KV_QUEST_BLOCK"));
             static const int q_from = getenv("LLAMA_KV_QUEST_FROM") ? atoi(getenv("LLAMA_KV_QUEST_FROM")) : 0;
+            // b65 Quest v3: LLAMA_KV_QUEST_SHARE=n: budget = max(LLAMA_KV_QUEST_BUDGET, n_kv / n) (a share of the context)
+            static const int q_share = getenv("LLAMA_KV_QUEST_SHARE") ? atoi(getenv("LLAMA_KV_QUEST_SHARE")) : 0;
+            const int bud = q_share > 0 ? std::max<int>(q_bud, (int) (kq_mask->ne[0] / q_share)) : q_bud;
             llama_pos q_pmax = 0;
             for (uint32_t i = 0; i < ubatch.n_tokens; ++i) q_pmax = std::max(q_pmax, ubatch.pos[i]);
-            if (quest_q->ne[2] <= q_max && kq_mask->ne[0] > q_bud && q_pmax >= q_from) {
-                quest_sel = ggml_kv_quest_mask(ctx0, quest_q, quest_kmm, kq_mask, (int) k->ne[2], qb, q_bud, q_sink, q_rec);
+            if (quest_q->ne[2] <= q_max && kq_mask->ne[0] > bud && q_pmax >= q_from) {
+                quest_sel = ggml_kv_quest_mask(ctx0, quest_q, quest_kmm, kq_mask, (int) k->ne[2], qb, bud, q_sink, q_rec);
                 cb(quest_sel, "kq_quest_sel", il);
                 quest_blk = qb;
             }
@@ -3007,9 +3010,18 @@ ggml_tensor * llm_graph_context::build_attn(
             if (ggml_tensor * kmm = mctx_cur->get_kmm(il); kmm && kmm->ne[2] == 1 && k_cur->type == GGML_TYPE_F32) {
                 static const int qb = atoi(getenv("LLAMA_KV_QUEST_BLOCK"));
                 ggml_tensor * kmm2 = ggml_view_2d(ctx0, kmm, kmm->ne[0], kmm->ne[1], kmm->nb[1], 0);
-                ggml_tensor * k2   = ggml_view_2d(ctx0, k_cur, k_cur->ne[0]*k_cur->ne[1], k_cur->ne[2], k_cur->nb[2], 0);
-                static const int reset = getenv("LLAMA_KV_QUEST_NORESET") ? 0 : 1;   // b65 Quest v2: tight block summaries
-                ggml_tensor * upd  = ggml_kv_block_minmax_ext(ctx0, kmm2, k2, k_idxs, k_set, qb, reset);
+                ggml_tensor * upd  = nullptr;
+                if (kmm->ne[0] == k_cur->ne[0]*k_cur->ne[1]) {
+                    // b65 Quest v3 (mean-key rule): the block means are recomputed from the stored keys (any cache
+                    // type, after this batch's write), so rejected draft keys never stay in a block's summary
+                    ggml_tensor * kall = mctx_cur->get_k(ctx0, il);   // [head_dim, n_head_kv, n_kv, 1]
+                    ggml_tensor * kc   = ggml_view_2d(ctx0, kall, kall->ne[0]*kall->ne[1], kall->ne[2], kall->nb[2], 0);
+                    upd = ggml_kv_block_mean(ctx0, kmm2, kc, k_idxs, k_set, qb);
+                } else {
+                    ggml_tensor * k2 = ggml_view_2d(ctx0, k_cur, k_cur->ne[0]*k_cur->ne[1], k_cur->ne[2], k_cur->nb[2], 0);
+                    static const int reset = getenv("LLAMA_KV_QUEST_NORESET") ? 0 : 1;   // b65 Quest v2: tight block summaries
+                    upd = ggml_kv_block_minmax_ext(ctx0, kmm2, k2, k_idxs, k_set, qb, reset);
+                }
                 ggml_build_forward_expand(gf, upd);
                 quest_kmm = upd;
                 quest_q   = q_cur;

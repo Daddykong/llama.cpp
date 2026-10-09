@@ -6931,17 +6931,17 @@ static void quest_init_mask(ggml_tensor * t, int64_t NKV, int64_t T) {
 // b65 Quest v2: GGML_OP_KV_QUEST_MASK, compared through KV_QUEST_APPLY on a random kq (the -inf pattern and the
 // kept values); exact = integer inputs (no tolerance), else near-ties at the threshold may flip a block (0.2%)
 struct test_kv_quest_mask : public test_case {
-    const int64_t D, NH, NHKV, T, NKV; const int B, budget, sink, recent, exact;
+    const int64_t D, NH, NHKV, T, NKV; const int B, budget, sink, recent, exact, mean;
     std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "KV_QUEST_MASK"; }
     std::string vars() override {
-        return VARS_TO_STR10(D, NH, NHKV, T, NKV, B, budget, sink, recent, exact);
+        return VARS_TO_STR10(D, NH, NHKV, T, NKV, B, budget, sink, recent, exact) + ",mean=" + std::to_string(mean);
     }
     test_kv_quest_mask(int64_t D = 256, int64_t NH = 24, int64_t NHKV = 4, int64_t T = 3, int64_t NKV = 4096,
-                       int B = 32, int budget = 1024, int sink = 64, int recent = 2, int exact = 1)
-        : D(D), NH(NH), NHKV(NHKV), T(T), NKV(NKV), B(B), budget(budget), sink(sink), recent(recent), exact(exact) {}
+                       int B = 32, int budget = 1024, int sink = 64, int recent = 2, int exact = 1, int mean = 0)
+        : D(D), NH(NH), NHKV(NHKV), T(T), NKV(NKV), B(B), budget(budget), sink(sink), recent(recent), exact(exact), mean(mean) {}
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * q    = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, NH, T);                      ggml_set_name(q, "q");
-        ggml_tensor * kmm  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2*D*NHKV, (NKV + B - 1) / B);   ggml_set_name(kmm, "kmm");
+        ggml_tensor * kmm  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, (mean ? 1 : 2)*D*NHKV, (NKV + B - 1) / B); ggml_set_name(kmm, "kmm");
         ggml_tensor * mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, NKV, GGML_PAD(T, 4));           ggml_set_name(mask, "mask");
         ggml_tensor * kq   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, NKV, T, NH);                    ggml_set_name(kq, "kq");
         ggml_tensor * sel  = ggml_kv_quest_mask(ctx, q, kmm, mask, (int) NHKV, B, budget, sink, recent);
@@ -7005,6 +7005,79 @@ struct test_kv_quest_attn : public test_case {
     }
     void initialize_tensors(ggml_context * ctx) override {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            const std::string n = t->name;
+            if (n == "mask")      quest_init_mask(t, NKV, T);
+            else if (n == "q")    quest_init_q_kmm(t, true, true);
+            else if (n == "kmm")  quest_init_q_kmm(t, true, false);
+            else                  init_tensor_uniform(t);
+        }
+    }
+};
+
+// b65 Quest v3: GGML_OP_KV_BLOCK_MINMAX mode 1 (block mean of the stored keys, recomputed from the K cache rows).
+// idx: a run of consecutive cells starting at c0 (a prompt batch or a draft verify after a rejection)
+struct test_kv_block_mean : public test_case {
+    const ggml_type type; const int64_t E, NB, T, c0; const int B;
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "KV_BLOCK_MEAN"; }
+    std::string vars() override { return VARS_TO_STR6(type, E, NB, T, c0, B); }
+    test_kv_block_mean(ggml_type type = GGML_TYPE_Q8_0, int64_t E = 1024, int64_t NB = 64, int64_t T = 3, int64_t c0 = 37, int B = 16)
+        : type(type), E(E), NB(NB), T(T), c0(c0), B(B) {}
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * kmm = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, E, NB);   ggml_set_name(kmm, "kmm");
+        ggml_tensor * kc  = ggml_new_tensor_2d(ctx, type, E, NB * B);        ggml_set_name(kc, "kc");
+        ggml_tensor * idx = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, T);       ggml_set_name(idx, "idx");
+        ggml_tensor * out = ggml_kv_block_mean(ctx, kmm, kc, idx, nullptr, B);
+        ggml_set_name(out, "out");
+        return out;
+    }
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I64) {
+                std::vector<int64_t> v(t->ne[0]);
+                for (int64_t i = 0; i < t->ne[0]; ++i) v[i] = (c0 + i) % (NB * B);
+                ggml_backend_tensor_set(t, v.data(), 0, v.size() * sizeof(int64_t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
+// b65 Quest v3: decode attention on a q8_0 K / q8_0 V cache as llama builds it with FA off (K x Q on the K view,
+// selection applied to kq, softmax, V x P as out_prod(V, P^T)), mean-key selection, so the Vulkan rows3 K x Q and
+// staged V x P kernels run with the bitmap (needs GGML_VK_GQA_ROWS2=1, and GGML_VK_KQ_ROWS3=2 off Intel)
+struct test_kv_quest_attn_q : public test_case {
+    const ggml_type type;
+    const int64_t D, NH, NHKV, T, NKV; const int B, budget;
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "KV_QUEST_MASK"; }
+    std::string vars() override { return "attn_q," + VARS_TO_STR8(type, D, NH, NHKV, T, NKV, B, budget); }
+    bool run_whole_graph() override { return true; }
+    test_kv_quest_attn_q(ggml_type type = GGML_TYPE_Q8_0, int64_t D = 256, int64_t NH = 24, int64_t NHKV = 4, int64_t T = 1,
+                         int64_t NKV = 8192, int B = 16, int budget = 1024)
+        : type(type), D(D), NH(NH), NHKV(NHKV), T(T), NKV(NKV), B(B), budget(budget) {}
+    double max_nmse_err() override { return 5e-4; }
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * q    = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, NH, T);                  ggml_set_name(q, "q");
+        ggml_tensor * kmm  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D*NHKV, (NKV + B - 1) / B); ggml_set_name(kmm, "kmm");
+        ggml_tensor * mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, NKV, GGML_PAD(T, 4));       ggml_set_name(mask, "mask");
+        ggml_tensor * kc   = ggml_new_tensor_2d(ctx, type, D*NHKV, NKV);                        ggml_set_name(kc, "kc");
+        ggml_tensor * vc   = ggml_new_tensor_2d(ctx, type, D*NHKV, NKV);                        ggml_set_name(vc, "vc");
+        ggml_tensor * sel  = ggml_kv_quest_mask(ctx, q, kmm, mask, (int) NHKV, B, budget, 64, 4);
+        ggml_set_name(sel, "sel");
+        ggml_tensor * k  = ggml_view_3d(ctx, kc, D, NKV, NHKV, kc->nb[1], ggml_row_size(type, D), 0);
+        ggml_tensor * qp = ggml_permute(ctx, q, 0, 2, 1, 3);
+        ggml_tensor * kq = ggml_mul_mat(ctx, k, qp);
+        kq->src[2] = sel;
+        kq = ggml_kv_quest_apply(ctx, kq, sel, B);
+        kq = ggml_soft_max_ext(ctx, kq, mask, 1.0f / sqrtf((float) D), 0.0f);
+        ggml_tensor * v  = ggml_view_3d(ctx, vc, D, NKV, NHKV, vc->nb[1], ggml_row_size(type, D), 0);
+        ggml_tensor * out = ggml_out_prod(ctx, v, ggml_transpose(ctx, kq));
+        ggml_set_name(out, "out");
+        return out;
+    }
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->view_src != nullptr) continue;
             const std::string n = t->name;
             if (n == "mask")      quest_init_mask(t, NKV, T);
             else if (n == "q")    quest_init_q_kmm(t, true, true);
@@ -9775,6 +9848,22 @@ static void add_b65_sparse_t_cases(std::vector<std::unique_ptr<test_case>> & tes
         }
         test_cases.emplace_back(new test_kv_quest_mask(128, 16, 2, T, 5000, 16, 640, 0, 1, 1));   // odd sizes, no sinks
         test_cases.emplace_back(new test_kv_quest_mask(256, 24, 4, T, 4096, 32, 8192, 64, 2, 1)); // budget > context
+        for (int64_t nkv : {4096, 32768, 65536}) {   // b65 Quest v3: mean-key rule, 16-token blocks
+            for (int budget : {512, 1024, 2048}) {
+                test_cases.emplace_back(new test_kv_quest_mask(256, 24, 4, T, nkv, 16, budget, 64, 4, 1, 1));
+            }
+            test_cases.emplace_back(new test_kv_quest_mask(256, 24, 4, T, nkv, 16, 1024, 64, 4, 0, 1));
+        }
+        for (ggml_type kt : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
+            for (int64_t c0 : {0, 37, 250}) {
+                test_cases.emplace_back(new test_kv_block_mean(kt, 1024, 64, T, c0, 16));
+            }
+        }
+        for (int64_t nkv : {4096, 32768}) {
+            for (int budget : {1024, 2048}) {
+                test_cases.emplace_back(new test_kv_quest_attn_q(GGML_TYPE_Q8_0, 256, 24, 4, T, nkv, 16, budget));
+            }
+        }
         for (int64_t nkv : {4096, 32768}) {
             for (int budget : {1024, 2048}) {
                 test_cases.emplace_back(new test_kv_quest_attn(256, 24, 4, T, nkv, 32, budget));
@@ -9782,6 +9871,8 @@ static void add_b65_sparse_t_cases(std::vector<std::unique_ptr<test_case>> & tes
         }
     }
     test_cases.emplace_back(new test_kv_block_minmax(1024, 1024, 512, 32, 1));
+    test_cases.emplace_back(new test_kv_block_mean(GGML_TYPE_Q8_0, 1024, 64, 512, 16, 16));   // b65 Quest v3: prompt batch
+    test_cases.emplace_back(new test_kv_block_mean(GGML_TYPE_F16, 1024, 64, 512, 5, 16));
     test_cases.emplace_back(new test_kv_block_minmax(1024, 1024, 512, 32));
     for (ggml_type t : {GGML_TYPE_Q4_0, GGML_TYPE_Q4_1}) {
         for (int64_t n_tok : {1, 3}) {

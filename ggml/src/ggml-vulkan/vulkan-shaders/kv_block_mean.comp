@@ -1,0 +1,39 @@
+#version 450
+// b65 Quest v3 (mean-key rule): kmm[b] = mean of the stored keys of block b's cells b*B .. c, recomputed from the K
+// cache for the block of every cell c the batch writes (only the block's last token in the batch writes). Cells fill
+// a block in order, so cells after c in the block are stale (rejected drafts) or empty and are left out. One
+// invocation per key element d (all KV heads), one workgroup row per token. K cache rows f32 / f16 / q8_0.
+#extension GL_EXT_control_flow_attributes : require
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+layout(binding = 0) readonly buffer KC { uint data_kc[]; };
+layout(binding = 1) readonly buffer I { uvec2 data_idx[]; };
+layout(binding = 2) buffer D { float data_d[]; };
+layout(push_constant) uniform PC { uint E; uint T; uint B; uint kmm_row; uint kc_row; uint kmm_off; uint kc_off; uint idx_off; } p;
+
+float load_k(const uint ro, const uint d) {   // ro: byte offset of the cell's row
+#if defined(KC_F32)
+    return uintBitsToFloat(data_kc[(ro >> 2) + d]);
+#elif defined(KC_F16)
+    const uint o = ro + 2u * d;
+    const uint w = data_kc[o >> 2];
+    return unpackHalf2x16((o & 2u) != 0u ? (w >> 16) : w).x;
+#else   // q8_0: 34-byte blocks of 32 (f16 scale, 32 x int8)
+    const uint bo = ro + (d >> 5) * 34u;
+    const uint w = data_kc[bo >> 2];
+    const float sc = unpackHalf2x16((bo & 2u) != 0u ? (w >> 16) : w).x;
+    const uint qo = bo + 2u + (d & 31u);
+    return sc * float(bitfieldExtract(int(data_kc[qo >> 2]), int((qo & 3u) * 8u), 8));
+#endif
+}
+
+void main() {
+    const uint d = gl_GlobalInvocationID.x;
+    const uint t = gl_WorkGroupID.y;
+    if (d >= p.E) return;
+    const uint cell = data_idx[p.idx_off + t].x;
+    const uint b = cell / p.B;
+    if (t + 1u < p.T && data_idx[p.idx_off + t + 1u].x / p.B == b) return;
+    float s = 0.0;
+    for (uint c = b * p.B; c <= cell; ++c) s += load_k(p.kc_off + c * p.kc_row, d);
+    data_d[p.kmm_off + b * p.kmm_row + d] = s * (1.0 / float(cell - b * p.B + 1u));
+}

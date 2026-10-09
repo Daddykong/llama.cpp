@@ -1338,6 +1338,9 @@ void process_shaders() {
     string_to_spv("ssm_conv_f32", "ssm_conv.comp", {{"A_TYPE", "float"}});
     string_to_spv("mul_mat_sparse_t_q4_0", "mul_mat_sparse_t.comp", {{"DATA_A_Q4_0", "1"}});
     string_to_spv("kv_block_minmax", "kv_block_minmax.comp", {});
+    string_to_spv("kv_block_mean_f32", "kv_block_mean.comp", {{"KC_F32", "1"}});   // b65 Quest v3
+    string_to_spv("kv_block_mean_f16", "kv_block_mean.comp", {{"KC_F16", "1"}});
+    string_to_spv("kv_block_mean_q8_0", "kv_block_mean.comp", {{"KC_Q8_0", "1"}});
     string_to_spv("sign_score", "sign_score.comp", {});
     string_to_spv("gdn_gates_f16", "gdn_gates.comp", {{"W_F16", "1"}});
     string_to_spv("gdn_gates_f32", "gdn_gates.comp", {});
