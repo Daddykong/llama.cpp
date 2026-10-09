@@ -9790,7 +9790,8 @@ static void add_b65_sparse_t_cases(std::vector<std::unique_ptr<test_case>> & tes
     }
     // b65 [mtp]: 9-65 column batches (mul_mmvq_wide for the reordered types incl. its k-split, chunked mat-vec for f16)
     for (ggml_type t : {GGML_TYPE_Q4_0, GGML_TYPE_Q5_K, GGML_TYPE_Q4_1, GGML_TYPE_Q8_0}) {
-        for (int64_t n : {9, 16, 17, 32, 33, 42, 64, 65}) {
+        // b65 [vcliff]: 5-8 (8-column tile) and every 8-column tile up to 64, partial and full
+        for (int64_t n : {5, 6, 7, 8, 9, 16, 17, 23, 24, 32, 33, 40, 42, 48, 49, 56, 57, 64, 65}) {
             test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 256, n, 1024, {1, 1}, {1, 1}));
         }
         test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 1000, 40, 5120, {1, 1}, {1, 1}));
@@ -9798,6 +9799,11 @@ static void add_b65_sparse_t_cases(std::vector<std::unique_ptr<test_case>> & tes
     }
     for (int64_t n : {9, 33, 64}) {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 48, n, 1024, {1, 1}, {1, 1}));
+    }
+    // b65 [vcliff]: 5-8 token attention matmuls on the dequantized f16 cache (24 query heads over 4 KV heads): Xe2 large tile
+    for (int64_t n : {5, 8}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 256, n, 1024, {4, 1}, {6, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 1000, n, 256, {4, 1}, {6, 1}));
     }
     test_cases.emplace_back(new test_b65_mm_add(GGML_TYPE_Q4_0, 5120, 3, 17408, 1));
     test_cases.emplace_back(new test_b65_mm_add(GGML_TYPE_Q5_K, 5120, 3, 6144, 1));

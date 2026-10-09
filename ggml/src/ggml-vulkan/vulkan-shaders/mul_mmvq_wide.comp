@@ -17,7 +17,7 @@
 
 layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
 
-layout(constant_id = 0) const uint NC = 64;   // column tile (16, 32 or 64)
+layout(constant_id = 0) const uint NC = 64;   // column tile (multiple of 8, <= 64)
 layout(constant_id = 1) const uint RT = 4;    // rows per invocation
 layout(constant_id = 2) const uint CT = 8;    // columns per invocation (divides NC)
 layout(constant_id = 3) const uint KCB = 8;   // q8_1 blocks (32 values each) per staged k-chunk
@@ -115,7 +115,10 @@ void main() {
     const uint ncg = NC / CT;                    // column groups
     const uint cg  = tid % ncg;
     const uint rg  = tid / ncg;
+    // b65 [vcliff]: NC / CT need not divide BLOCK_SIZE (24-, 40-, 48-, 56-column tiles): the last BLOCK_SIZE % ncg
+    // invocations stage B and take part in the barriers but own no rows
     const uint rows_per_wg = (BLOCK_SIZE / ncg) * RT;
+    const bool owns_rows = rg < BLOCK_SIZE / ncg;
     const uint row0 = gl_WorkGroupID.x * rows_per_wg + rg * RT;
     const uint col0 = gl_WorkGroupID.y * NC;
     const uint kb0  = gl_WorkGroupID.z * p.k_blocks;
@@ -179,6 +182,9 @@ void main() {
         }
     }
 
+    if (!owns_rows) {
+        return;
+    }
     [[unroll]] for (uint r = 0; r < RT; ++r) {
         const uint row = row0 + r;
         if (row >= p.nrows) {

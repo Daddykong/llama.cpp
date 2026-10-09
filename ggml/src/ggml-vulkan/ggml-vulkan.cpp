@@ -3564,29 +3564,35 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         const void * const wd[4] = { mul_mmvq_wide_q4_0r_data, mul_mmvq_wide_q4_1r_data, mul_mmvq_wide_q5_kr_data, mul_mmvq_wide_q8_0r_data };
         const uint64_t     wl[4] = { mul_mmvq_wide_q4_0r_len,  mul_mmvq_wide_q4_1r_len,  mul_mmvq_wide_q5_kr_len,  mul_mmvq_wide_q8_0r_len };
         const char *       wn[4] = { "mul_mmvq_wide_q4_0r", "mul_mmvq_wide_q4_1r", "mul_mmvq_wide_q5_kr", "mul_mmvq_wide_q8_0r" };
-        const uint32_t nc[4] = { 8, 16, 32, 64 };
-        // per column tile "ct:rt_mul:kcb" (columns per invocation, factor on the base RT of 128 rows per workgroup at
-        // 8 columns per invocation, k-chunk blocks). Defaults from the B65 sweeps (MTP-w3/w4, 2026-10-08), verify graph at
-        // 4.4K: 16 columns 4:2:16 (9-16 tokens 96-101 ms), 32 columns 8:2:8 (17-32: 146-154 ms), 64 columns 8:1:8
-        // (33-64: 244-258 ms). b65 [vcliff]: 8-column tile for 5-8 tokens (the 16-column tile computed 8-11 empty
-        // columns there: 5-8 tokens cost as much as 16, VCLIFF-1). GGML_VK_MMVQ_WIDE_CFG (all tiles) /
-        // GGML_VK_MMVQ_WIDE_CFG8|16|32|64 override.
-        uint32_t w_ct[4] = { 4, 4, 8, 8 }, w_rtm[4] = { 2, 2, 2, 1 }, w_kcb[4] = { 16, 16, 8, 8 };
-        for (uint32_t c = 0; c < 4; ++c) {
-            static const char * const cfg_env[4] = { "GGML_VK_MMVQ_WIDE_CFG8", "GGML_VK_MMVQ_WIDE_CFG16", "GGML_VK_MMVQ_WIDE_CFG32", "GGML_VK_MMVQ_WIDE_CFG64" };
+        // b65 [vcliff]: one column tile per multiple of 8 (8..64): the kernel's cost grows with the tile, not with the
+        // columns present, so 5-8 tokens on the 16-column tile cost as much as 16 (VCLIFF-1: 111 vs 105 ms per 4.4K
+        // graph) and 33-48 on the 64-column tile as much as 64 (248 vs 259 ms).
+        // per tile "ct:rt:kcb" = columns per invocation, rows per invocation, k-chunk blocks. Defaults: the MTP-w3/w4
+        // sweep shapes (16: 4 x 4 x 16, 32 and 64: 8 x 4 x 8), 8 columns 4 x 2 x 16, 24-56 columns 8 x 4 x 8.
+        // GGML_VK_MMVQ_WIDE_CFG (all tiles) / GGML_VK_MMVQ_WIDE_CFG<nc> (one tile) override.
+        uint32_t w_ct[8], w_rt[8], w_kcb[8];
+        for (uint32_t c = 0; c < 8; ++c) {
+            const uint32_t nc = 8 * (c + 1);
+            w_ct[c] = nc <= 16 ? 4 : 8;
+            w_rt[c] = nc == 8 ? 2 : 4;
+            w_kcb[c] = nc <= 16 ? 16 : 8;
             const char * all = getenv("GGML_VK_MMVQ_WIDE_CFG");
-            const char * one = getenv(cfg_env[c]);
+            const char * one = getenv(("GGML_VK_MMVQ_WIDE_CFG" + std::to_string(nc)).c_str());
             if (const char * cfg = one ? one : all) {
-                sscanf(cfg, "%u:%u:%u", &w_ct[c], &w_rtm[c], &w_kcb[c]);
+                sscanf(cfg, "%u:%u:%u", &w_ct[c], &w_rt[c], &w_kcb[c]);
             }
+            w_ct[c] = std::max(1u, std::min(w_ct[c], nc));
+            while (nc % w_ct[c] != 0) {
+                --w_ct[c];
+            }
+            w_rt[c] = std::max(1u, w_rt[c]);
+            device->mmvq_wide_rows[c] = (256u / (nc / w_ct[c])) * w_rt[c];
         }
         for (uint32_t t = 0; t < 4; ++t) {
-            for (uint32_t c = 0; c < 4; ++c) {
-                const uint32_t ct = std::min(w_ct[c], nc[c]);
-                const uint32_t rt = std::max(1u, (128u * nc[c]) / (256u * ct)) * w_rtm[c];   // same meaning as the MTP-w2 sweep
-                device->mmvq_wide_rows[c] = (256u * ct / nc[c]) * rt;
-                ggml_vk_create_pipeline2(device, device->pipeline_mmvq_wide[t][c], std::string(wn[t]) + "_" + std::to_string(nc[c]), wl[t], wd[t], "main", 3,
-                                        7 * sizeof(uint32_t), {1, 1, 1}, {nc[c], rt, ct, w_kcb[c]}, 1);
+            for (uint32_t c = 0; c < 8; ++c) {
+                const uint32_t nc = 8 * (c + 1);
+                ggml_vk_create_pipeline2(device, device->pipeline_mmvq_wide[t][c], std::string(wn[t]) + "_" + std::to_string(nc), wl[t], wd[t], "main", 3,
+                                        7 * sizeof(uint32_t), {1, 1, 1}, {nc, w_rt[c], w_ct[c], w_kcb[c]}, 1);
             }
         }
     }
@@ -8761,9 +8767,10 @@ static bool ggml_vk_mmvq_wide(ggml_backend_vk_context * ctx, vk_context& subctx,
         default: return false;
     }
     const int64_t n = dst->ne[1];
-    // b65 [vcliff]: GGML_VK_MMVQ_WIDE_NO8=1 sends 5-8 columns to the 16-column tile as before
-    static const bool no8 = getenv("GGML_VK_MMVQ_WIDE_NO8") != nullptr && atoi(getenv("GGML_VK_MMVQ_WIDE_NO8")) != 0;
-    const uint32_t ci = (n <= 8 && !no8) ? 0 : (n <= 16 ? 1 : (n <= 32 ? 2 : 3));
+    // b65 [vcliff]: the tile of the next multiple of 8 columns; GGML_VK_MMVQ_WIDE_TILES=16_32_64 keeps the old three
+    // tiles (16 / 32 / 64)
+    static const bool old_tiles = getenv("GGML_VK_MMVQ_WIDE_TILES") != nullptr;
+    const uint32_t ci = old_tiles ? (n <= 16 ? 1 : (n <= 32 ? 3 : 7)) : (uint32_t) ((n + 7) / 8 - 1);
     if (!ctx->device->pipeline_mmvq_wide[ti][ci] || src1->type != GGML_TYPE_F32 || !ggml_is_contiguous(src1) ||
         !ggml_is_contiguous(dst) || dst->type != GGML_TYPE_F32 || src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[2] != 1 ||
         src1->ne[3] != 1 || src0->ne[0] % (ti == 2 ? 256 : 32) != 0 || src1->ne[0] != src0->ne[0] ||
@@ -8781,7 +8788,7 @@ static bool ggml_vk_mmvq_wide(ggml_backend_vk_context * ctx, vk_context& subctx,
     }
     vk_pipeline to_q8_1 = ggml_vk_get_quantize_pipeline(ctx, GGML_TYPE_Q8_1);
     vk_pipeline pw = ctx->device->pipeline_mmvq_wide[ti][ci];
-    const uint32_t nc = 8u << ci;
+    const uint32_t nc = 8u * (ci + 1);
 
     // k-split when the row x column tiles would not fill the GPU (GGML_VK_MMVQ_WIDE_WG: target workgroups)
     static const uint32_t target_wg = getenv("GGML_VK_MMVQ_WIDE_WG") ? (uint32_t) atoi(getenv("GGML_VK_MMVQ_WIDE_WG")) : 320u;
