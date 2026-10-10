@@ -7948,6 +7948,35 @@ static void ggml_vk_mul_mat_vec_p021_f16_f32(ggml_backend_vk_context * ctx, vk_c
 // f16 A x f32 B for decode attention (K x Q and V x softmax(KQ)) with up to 4 tokens: B channels are
 // grouped GQA per A channel, so each row of A is read once for all of them. Any A/B row and channel
 // strides (multiples of 4 elements); dst contiguous.
+static int ggml_vk_kv_deq_type_idx(ggml_type t);
+
+// b65 vcliff2: largest token count of the quantized-cache decode attention kernels (K x Q rows3, V x P vxq/vxq3).
+// Past 4 tokens they run as token chunks of <= 4 (each output is the same fixed-order sum as for its chunk alone), so
+// 5-8 token verify steps keep the quantized cache instead of a per-graph f16 copy. GGML_VK_ATTN_Q_MAX_TOK=4: old limit.
+static int64_t ggml_vk_attn_q_max_tok() {
+    static const int64_t v = getenv("GGML_VK_ATTN_Q_MAX_TOK") ? std::max<int64_t>(1, std::min<int64_t>(8, atoll(getenv("GGML_VK_ATTN_Q_MAX_TOK")))) : 8;
+    return v;
+}
+
+// b65 vcliff2: K x Q on the rows3 kernel (quantized K, head dim 256, 16-byte aligned rows); same conditions as the
+// rows3 branch of ggml_vk_mul_mat_vec_gqa_f16_f32
+static int ggml_vk_kq_rows3_env(const ggml_backend_vk_context * ctx) {
+    static const int v = getenv("GGML_VK_KQ_ROWS3") != nullptr ? atoi(getenv("GGML_VK_KQ_ROWS3"))
+                                                              : (ctx->device->vendor_id == VK_VENDOR_ID_INTEL ? 2 : 1);
+    return v;
+}
+static bool ggml_vk_kq_rows3_ok(const ggml_backend_vk_context * ctx, const ggml_tensor * src0) {
+    static const bool mask_skip_env = getenv("GGML_VK_ATTN_MASK_SKIP") != nullptr && atoi(getenv("GGML_VK_ATTN_MASK_SKIP")) != 0;
+    const int rows3_env = ggml_vk_kq_rows3_env(ctx);
+    if (rows3_env <= 0 || mask_skip_env || ggml_vk_kv_deq_type_idx(src0->type) < 0 || src0->ne[0] != 256 ||
+        (src0->type == GGML_TYPE_Q8_0 && rows3_env < 2)) {
+        return false;
+    }
+    const size_t ts = ggml_type_size(src0->type);
+    const size_t a_off = get_misalign_bytes(ctx, src0);
+    return (src0->nb[1] % 16) == 0 && (src0->nb[2] % 16) == 0 && (a_off % 16) == 0 && (a_off % ts) == 0;
+}
+
 static bool ggml_vk_mul_mat_vec_gqa_ok(const ggml_backend_vk_context * ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
     // b65: a q8_0 (kv4: q4_0 / iq4_nl) K cache runs on the rows2 kernel (short k only)
     const bool q8 = src0->type == GGML_TYPE_Q8_0 || src0->type == GGML_TYPE_Q4_0 || src0->type == GGML_TYPE_IQ4_NL;
@@ -7961,10 +7990,13 @@ static bool ggml_vk_mul_mat_vec_gqa_ok(const ggml_backend_vk_context * ctx, cons
         if (!rows2 || src0->ne[0] > 1024 || src0->ne[0] % (src0->type == GGML_TYPE_Q8_0 ? 32 : 64) != 0 ||
             src0->nb[0] != bs || src0->nb[1] % bs != 0 || src0->nb[2] % bs != 0 ||
             get_misalign_bytes(ctx, src0) % bs != 0 || src0->ne[3] != 1 || src1->ne[3] != 1 || dst->ne[3] != 1 ||
-            src1->ne[1] < 1 || src1->ne[1] > 4 || src0->ne[2] == 0 || src1->ne[2] % src0->ne[2] != 0 ||
+            src1->ne[1] < 1 || src1->ne[1] > ggml_vk_attn_q_max_tok() || src0->ne[2] == 0 || src1->ne[2] % src0->ne[2] != 0 ||
             src1->ne[2] / src0->ne[2] > 8 || !ggml_is_contiguous(dst) || src1->nb[0] != sizeof(float) ||
             src1->nb[1] % (4 * sizeof(float)) != 0 || src1->nb[2] % (4 * sizeof(float)) != 0 ||
             (get_misalign_bytes(ctx, src1) / sizeof(float)) % 4 != 0) {
+            return false;
+        }
+        if (src1->ne[1] > 4 && (ctx == nullptr || !ggml_vk_kq_rows3_ok(ctx, src0))) {   // b65 vcliff2: 5-8 tokens on rows3 only
             return false;
         }
         static const bool batch_inv_q8 = getenv("GGML_VK_BATCH_INVARIANT") != nullptr && atoi(getenv("GGML_VK_BATCH_INVARIANT")) != 0;
@@ -8113,7 +8145,7 @@ static bool ggml_vk_vxq_ok(const ggml_backend_vk_context * ctx, const ggml_tenso
     if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || src0->nb[0] != ts ||
         src0->ne[0] % 32 != 0 || src0->ne[0] > 256 || src0->nb[1] % ts != 0 || src0->nb[2] % ts != 0 ||
         src0->ne[3] != 1 || src1->ne[3] != 1 || dst->ne[3] != 1 ||
-        src1->ne[0] < 1 || src1->ne[0] > 4 || src1->ne[1] != src0->ne[1] || src0->ne[2] == 0 ||
+        src1->ne[0] < 1 || src1->ne[0] > ggml_vk_attn_q_max_tok() || src1->ne[1] != src0->ne[1] || src0->ne[2] == 0 ||
         src1->ne[2] % src0->ne[2] != 0 || src1->ne[2] / src0->ne[2] > 8 ||
         src1->nb[1] != sizeof(float) || src1->nb[0] % sizeof(float) != 0 || src1->nb[2] % sizeof(float) != 0 ||
         !ggml_is_contiguous(dst)) {
@@ -8127,9 +8159,9 @@ static bool ggml_vk_vxq_ok(const ggml_backend_vk_context * ctx, const ggml_tenso
 
 static int ggml_vk_kv_deq_type_idx(ggml_type t);
 
-static void ggml_vk_vxq(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
-                        const ggml_tensor * qsel = nullptr, uint32_t qblock = 0) {
-    const uint32_t ntok  = (uint32_t)src1->ne[0];
+// b65 vcliff2: tokens t0 .. t0+ntok-1 (ntok <= 4) of the step; ggml_vk_vxq runs 5-8 token steps as chunks of <= 4
+static void ggml_vk_vxq_chunk(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
+                              const ggml_tensor * qsel, uint32_t qblock, const uint32_t t0, const uint32_t ntok) {
     const uint32_t k     = (uint32_t)src0->ne[1];
     const uint32_t d     = (uint32_t)src0->ne[0];
     const uint32_t nch_a = (uint32_t)src0->ne[2];
@@ -8177,7 +8209,7 @@ static void ggml_vk_vxq(ggml_backend_vk_context * ctx, vk_context& subctx, const
         k, d,
         (uint32_t)(src0->nb[1] / ts), (uint32_t)(src0->nb[2] / ts),
         (uint32_t)(src1->nb[2] / sizeof(float)), (uint32_t)(src1->nb[0] / sizeof(float)),
-        (uint32_t)(get_misalign_bytes(ctx, src0) / ts), (uint32_t)(get_misalign_bytes(ctx, src1) / sizeof(float)),
+        (uint32_t)(get_misalign_bytes(ctx, src0) / ts), (uint32_t)(get_misalign_bytes(ctx, src1) / sizeof(float) + t0 * (src1->nb[0] / sizeof(float))),
         slice, nch_b,
         0, 0, 0, 0,
     };
@@ -8185,7 +8217,7 @@ static void ggml_vk_vxq(ggml_backend_vk_context * ctx, vk_context& subctx, const
     vk_subbuffer d_S = d_P;
     if (v3 && qsel && qblock) {
         d_S = ggml_vk_tensor_subbuffer(ctx, qsel, true);
-        pc.bm_offset = (uint32_t)(get_misalign_bytes(ctx, qsel) / 4);
+        pc.bm_offset = (uint32_t)(get_misalign_bytes(ctx, qsel) / 4 + t0 * (qsel->nb[2] / 4));
         pc.bm_tok    = (uint32_t)(qsel->nb[2] / 4);
         pc.bm_head   = (uint32_t)(qsel->nb[1] / 4);
         pc.qblock    = qblock;
@@ -8198,7 +8230,7 @@ static void ggml_vk_vxq(ggml_backend_vk_context * ctx, vk_context& subctx, const
     const vk_mat_vec_vxp_reduce_push_constants pc2 = {
         d, ntok, nch_b, nslices,
         (uint32_t)(dst->nb[2] / sizeof(float)), (uint32_t)(dst->nb[1] / sizeof(float)),
-        (uint32_t)(get_misalign_bytes(ctx, dst) / sizeof(float)),
+        (uint32_t)(get_misalign_bytes(ctx, dst) / sizeof(float) + t0 * (dst->nb[1] / sizeof(float))),
     };
 
     if (ctx->prealloc_split_k_need_sync) {
@@ -8218,6 +8250,14 @@ static void ggml_vk_vxq(ggml_backend_vk_context * ctx, vk_context& subctx, const
     ggml_vk_sync_buffers(ctx, subctx);
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline2, { d_P, d_D }, pc2, { nch_b * ntok * d, 1, 1 });
     ctx->prealloc_split_k_need_sync = true;
+}
+
+static void ggml_vk_vxq(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
+                        const ggml_tensor * qsel = nullptr, uint32_t qblock = 0) {
+    const uint32_t ntok = (uint32_t)src1->ne[0];
+    for (uint32_t t0 = 0; t0 < ntok; t0 += 4) {
+        ggml_vk_vxq_chunk(ctx, subctx, src0, src1, dst, qsel, qblock, t0, std::min(4u, ntok - t0));
+    }
 }
 
 // b65 kv4: CPY of a quantized KV-cache view (q8_0 / q4_0 / iq4_nl) to a contiguous f16 tensor of the same shape, for
@@ -8367,25 +8407,28 @@ static void ggml_vk_mul_mat_vec_gqa_f16_f32(ggml_backend_vk_context * ctx, vk_co
     }
     static const bool split2 = getenv("GGML_VK_GQA_SPLIT2") != nullptr && atoi(getenv("GGML_VK_GQA_SPLIT2")) != 0;  // b65
     const bool rows2 = ctx->device->subgroup_clustered && getenv("GGML_VK_GQA_ROWS2") != nullptr && atoi(getenv("GGML_VK_GQA_ROWS2")) != 0;  // b65
-    vk_pipeline pipeline = split ? (split2 ? ctx->device->pipeline_mul_mat_vec_gqa_split2_f16_f32[gqa - 1][ntok - 1]
-                                           : ctx->device->pipeline_mul_mat_vec_gqa_split_f16_f32[gqa - 1][ntok - 1])
-                                 : (rows2 ? ctx->device->pipeline_mul_mat_vec_gqa_rows2_f16_f32[gqa - 1][ntok - 1]
-                                          : ctx->device->pipeline_mul_mat_vec_gqa_rows_f16_f32[gqa - 1][ntok - 1]);
+    const uint32_t nt4 = std::min(ntok, 4u);   // b65 vcliff2: 5-8 tokens take the rows3 branch below
+    vk_pipeline pipeline = split ? (split2 ? ctx->device->pipeline_mul_mat_vec_gqa_split2_f16_f32[gqa - 1][nt4 - 1]
+                                           : ctx->device->pipeline_mul_mat_vec_gqa_split_f16_f32[gqa - 1][nt4 - 1])
+                                 : (rows2 ? ctx->device->pipeline_mul_mat_vec_gqa_rows2_f16_f32[gqa - 1][nt4 - 1]
+                                          : ctx->device->pipeline_mul_mat_vec_gqa_rows_f16_f32[gqa - 1][nt4 - 1]);
     // b65 kv4: quantized K, head dim 256, 16-byte aligned rows: one row per invocation. GGML_VK_KQ_ROWS3=0: rows2 for
     // every type; 1: 4-bit only; 2: q8_0 too. Default 2 on Intel (B65 at 32K: q8_0 K x Q 3804 -> 1785 us per token,
     // KV4-3), 1 elsewhere (q8_0 is slower than rows2 on the 3060)
-    static const int rows3_env = getenv("GGML_VK_KQ_ROWS3") != nullptr ? atoi(getenv("GGML_VK_KQ_ROWS3"))
-                                                                         : (ctx->device->vendor_id == VK_VENDOR_ID_INTEL ? 2 : 1);
-    if (rows3_env > 0 && !split && !mask_skip_env && ggml_vk_kv_deq_type_idx(src0->type) >= 0 && k == 256 &&
-        (src0->type != GGML_TYPE_Q8_0 || rows3_env >= 2)) {
+    if (!split && ggml_vk_kq_rows3_ok(ctx, src0)) {
         const size_t ts = ggml_type_size(src0->type);
-        const size_t a_off = get_misalign_bytes(ctx, src0);
-        if ((src0->nb[1] % 16) == 0 && (src0->nb[2] % 16) == 0 && (a_off % 16) == 0 && (a_off % ts) == 0) {
-            vk_pipeline p3 = ctx->device->pipeline_mul_mat_vec_gqa_rows3_f32[ggml_vk_kv_deq_type_idx(src0->type)][gqa - 1][ntok - 1];
-            if (ggml_nbytes(src0) > ctx->device->properties.limits.maxStorageBufferRange) {
-                p3 = ggml_vk_get_64b_indexing_pipeline(ctx, p3);
+        {
+            // b65 vcliff2: 5-8 tokens as chunks of <= 4 (4 + rest), one dispatch each
+            const uint32_t nchunk = CEIL_DIV(ntok, 4u);
+            vk_pipeline p3c[2] = {};
+            for (uint32_t ci = 0; ci < nchunk; ++ci) {
+                const uint32_t nt = std::min(4u, ntok - 4u * ci);
+                p3c[ci] = ctx->device->pipeline_mul_mat_vec_gqa_rows3_f32[ggml_vk_kv_deq_type_idx(src0->type)][gqa - 1][nt - 1];
+                if (ggml_nbytes(src0) > ctx->device->properties.limits.maxStorageBufferRange) {
+                    p3c[ci] = ggml_vk_get_64b_indexing_pipeline(ctx, p3c[ci]);
+                }
+                ggml_pipeline_request_descriptor_sets(ctx, p3c[ci], 1);
             }
-            ggml_pipeline_request_descriptor_sets(ctx, p3, 1);
             vk_subbuffer d_D3  = ggml_vk_tensor_subbuffer(ctx, dst, true);
             vk_subbuffer d_Qx3 = ggml_vk_tensor_subbuffer(ctx, src0, true);
             vk_subbuffer d_Qy3 = ggml_vk_tensor_subbuffer(ctx, src1, true);
@@ -8415,10 +8458,17 @@ static void ggml_vk_mul_mat_vec_gqa_f16_f32(ggml_backend_vk_context * ctx, vk_co
                                   ggml_type_name(src0->type), pc3.qblock);
                 }
             }
-            ggml_vk_dispatch_pipeline(ctx, subctx, p3, { d_Qx3, d_Qy3, d_D3, d_M3 }, pc3, { CEIL_DIV(rows, 128u), (uint32_t)src0->ne[2], 1 });
+            for (uint32_t ci = 0; ci < nchunk; ++ci) {
+                vk_mat_vec_gqa_push_constants pcc = pc3;
+                pcc.b_offset    += 4u * ci * pc3.b_tok_stride;
+                pcc.d_offset    += 4u * ci * pc3.d_tok_stride;
+                pcc.mask_offset += 4u * ci * pc3.mask_tok_stride;
+                ggml_vk_dispatch_pipeline(ctx, subctx, p3c[ci], { d_Qx3, d_Qy3, d_D3, d_M3 }, pcc, { CEIL_DIV(rows, 128u), (uint32_t)src0->ne[2], 1 });
+            }
             return;
         }
     }
+    GGML_ASSERT(ntok <= 4);   // b65 vcliff2: 5-8 tokens only reach here on the rows3 path (gqa_ok)
     if (src0->type == GGML_TYPE_Q8_0) {   // b65: gqa_ok only lets q8_0 through for short k with rows2 on
         pipeline = ctx->device->pipeline_mul_mat_vec_gqa_rows2_q8_0_f32[gqa - 1][ntok - 1];
     } else if (src0->type == GGML_TYPE_Q4_0) {   // b65 kv4
@@ -12176,9 +12226,13 @@ static void ggml_vk_kv_quest_mask(ggml_backend_vk_context * ctx, vk_context& sub
     const uint32_t G = (uint32_t)(q->ne[1] / NHKV), T = (uint32_t) q->ne[2];
     const uint32_t NKV = (uint32_t) mask->ne[0];
     const uint32_t NB = CEIL_DIV(NKV, B), NW = CEIL_DIV(NB, 32u);
-    vk_pipeline pb = ctx->device->pipeline_kv_quest_bound[G - 1][T - 1];
+    // b65 vcliff2: 5-8 tokens: the bound pass runs per chunk of <= 4 tokens (its queries sit in shared memory)
+    vk_pipeline pbc[2] = {};
+    for (uint32_t t0 = 0, ci = 0; t0 < T; t0 += 4, ++ci) {
+        pbc[ci] = ctx->device->pipeline_kv_quest_bound[G - 1][std::min(4u, T - t0) - 1];
+        ggml_pipeline_request_descriptor_sets(ctx, pbc[ci], 1);
+    }
     vk_pipeline ps = ctx->device->pipeline_kv_quest_select;
-    ggml_pipeline_request_descriptor_sets(ctx, pb, 1);
     ggml_pipeline_request_descriptor_sets(ctx, ps, 1);
     vk_subbuffer s_q   = ggml_vk_tensor_subbuffer(ctx, q, true);
     vk_subbuffer s_kmm = ggml_vk_tensor_subbuffer(ctx, kmm, true);
@@ -12194,7 +12248,13 @@ static void ggml_vk_kv_quest_mask(ggml_backend_vk_context * ctx, vk_context& sub
         (uint32_t)(get_misalign_bytes(ctx, mask) / 4), d_off,
         kmm->ne[0] == q->ne[0] * (int64_t) NHKV ? 1u : 0u,   // b65 Quest v3: mean-key rule
     };
-    ggml_vk_dispatch_pipeline(ctx, subctx, pb, { s_q, s_kmm, s_m, s_d }, pc, { CEIL_DIV(NB, 32u), NHKV, 1 });
+    for (uint32_t t0 = 0, ci = 0; t0 < T; t0 += 4, ++ci) {
+        vk_op_kv_quest_bound_push_constants pcc = pc;
+        pcc.q_off += t0 * pc.q_tok;
+        pcc.m_off += t0 * pc.m_row;
+        pcc.d_off += t0 * NHKV * ROW;
+        ggml_vk_dispatch_pipeline(ctx, subctx, pbc[ci], { s_q, s_kmm, s_m, s_d }, pcc, { CEIL_DIV(NB, 32u), NHKV, 1 });
+    }
     ggml_vk_sync_buffers(ctx, subctx);
     const vk_op_kv_quest_select_push_constants pc2 = {
         NB, NW, ROW, NHKV, B, (uint32_t) op[2], (uint32_t) op[3], (uint32_t) op[4], d_off,
@@ -18605,7 +18665,7 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
             const int64_t nhkv = ggml_get_op_params_i32(op, 0);
             const ggml_tensor * q = op->src[0], * kmm = op->src[1], * m = op->src[2];
             return device->subgroup_arithmetic && device->subgroup_vote && nhkv > 0 && q->ne[1] % nhkv == 0 && q->ne[1] / nhkv <= 8 &&
-                   q->ne[2] >= 1 && q->ne[2] <= 4 && q->ne[0] % 4 == 0 && q->ne[0] <= 256 &&
+                   q->ne[2] >= 1 && q->ne[2] <= 8 && q->ne[0] % 4 == 0 && q->ne[0] <= 256 &&   // b65 vcliff2: T 5-8 as chunks of <= 4
                    q->type == GGML_TYPE_F32 && q->nb[0] == sizeof(float) && kmm->type == GGML_TYPE_F32 && kmm->nb[0] == sizeof(float) &&
                    kmm->nb[1] % 16 == 0 && m->type == GGML_TYPE_F32 && m->nb[0] == sizeof(float) && ggml_is_contiguous(op);
         }

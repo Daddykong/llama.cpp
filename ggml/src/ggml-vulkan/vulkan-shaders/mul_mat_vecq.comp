@@ -50,7 +50,71 @@ void r5_scale_min(const uvec4 hdr, const uint j, out float sc, out float m) {
 // b65 [mtp]: multi-column (MTP verify) Q4_0R: the q8_1 blocks of every column are loaded first, then each weight
 // block is loaded and unpacked once and used for all columns. Per-block arithmetic is the single-column formula in
 // the same order, so the result per column equals the n=1 kernel's (batch invariance kept).
+// b65 vcliff2: 5-8 columns: the weight blocks of the rows are loaded once, the columns are done in chunks of
+// MC_CHUNK (q8_1 registers of 8 columns spill); same per-column arithmetic and order as below
+#define MC_CHUNK 4
+void iter_chunked(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const uint num_rows, const uint col) {
+    const uint nbpr = p.ncols / QUANT_K;
+    const uint jb = col / QUANT_K;
+    uvec4 qr[NUM_ROWS];
+    float dr[NUM_ROWS];
+    uint rsb = first_row * nbpr + a_offset;
+    [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+        if (n < num_rows) {
+            qr[n] = data_a_r128[(rsb * 9) / 8 + jb];
+            dr[n] = float(data_a_r16[rsb * 9 + nbpr * 8 + jb]);
+        }
+        rsb += nbpr;
+    }
+    [[unroll]] for (uint c0 = 0; c0 < NUM_COLS; c0 += MC_CHUNK) {
+        ivec4 b0[MC_CHUNK], b1[MC_CHUNK];
+        vec2 bds[MC_CHUNK];
+        [[unroll]] for (uint jj = 0; jj < MC_CHUNK; ++jj) {
+            if (c0 + jj < NUM_COLS) {
+                const uint b_block_idx = ((c0 + jj)*p.batch_stride_b + col) / QUANT_K_Q8_1 + b_offset;
+                const uint bo = b_block_idx / 4;
+                const uint bi = b_block_idx % 4;
+                bds[jj] = vec2(data_b[bo].ds[bi]);
+                const uint bv = bo * 9 + 1 + bi * 2;
+                b0[jj] = data_b_r128[bv];
+                b1[jj] = data_b_r128[bv + 1];
+            }
+        }
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+            if (n < num_rows) {
+                const uvec4 q = qr[n];
+                const float da = dr[n];
+                const int32_t a0 = int32_t( q.x       & 0x0F0F0F0F);
+                const int32_t a1 = int32_t( q.y       & 0x0F0F0F0F);
+                const int32_t a2 = int32_t( q.z       & 0x0F0F0F0F);
+                const int32_t a3 = int32_t( q.w       & 0x0F0F0F0F);
+                const int32_t a4 = int32_t((q.x >> 4) & 0x0F0F0F0F);
+                const int32_t a5 = int32_t((q.y >> 4) & 0x0F0F0F0F);
+                const int32_t a6 = int32_t((q.z >> 4) & 0x0F0F0F0F);
+                const int32_t a7 = int32_t((q.w >> 4) & 0x0F0F0F0F);
+                [[unroll]] for (uint jj = 0; jj < MC_CHUNK; ++jj) {
+                    if (c0 + jj < NUM_COLS) {
+                        int32_t q_sum = dotPacked4x8EXT(a0, b0[jj].x);
+                        q_sum += dotPacked4x8EXT(a1, b0[jj].y);
+                        q_sum += dotPacked4x8EXT(a2, b0[jj].z);
+                        q_sum += dotPacked4x8EXT(a3, b0[jj].w);
+                        q_sum += dotPacked4x8EXT(a4, b1[jj].x);
+                        q_sum += dotPacked4x8EXT(a5, b1[jj].y);
+                        q_sum += dotPacked4x8EXT(a6, b1[jj].z);
+                        q_sum += dotPacked4x8EXT(a7, b1[jj].w);
+                        temp[c0 + jj][n] += FLOAT_TYPE(da * (float(q_sum) * bds[jj].x - 8.0 * bds[jj].y));
+                    }
+                }
+            }
+        }
+    }
+}
+
 void iter(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const uint num_rows, const uint col, const uint b_qs_idx) {
+    if (NUM_COLS > MC_CHUNK) {
+        iter_chunked(temp, first_row, num_rows, col);
+        return;
+    }
     ivec4 b0[NUM_COLS], b1[NUM_COLS];
     vec2 bds[NUM_COLS];
     [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
@@ -182,7 +246,56 @@ void rk_decode(const uint row, const uint col, out int32_t a[8], out vec3 c) {
 #endif
 }
 
+// b65 vcliff2: 5-8 columns: each row's weight block is decoded once, the columns are done in chunks of RK_CHUNK
+// (q8_1 registers of 8 columns spill); same per-column arithmetic and order as below
+#define RK_CHUNK 4
+void iter_chunked(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const uint num_rows, const uint col) {
+    int32_t ar[NUM_ROWS][8];
+    vec3 cr[NUM_ROWS];
+    [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+        if (n < num_rows) {
+            rk_decode(first_row + n, col, ar[n], cr[n]);
+        }
+    }
+    [[unroll]] for (uint c0 = 0; c0 < NUM_COLS; c0 += RK_CHUNK) {
+        ivec4 b0[RK_CHUNK], b1[RK_CHUNK];
+        vec2 bds[RK_CHUNK];
+        [[unroll]] for (uint jj = 0; jj < RK_CHUNK; ++jj) {
+            if (c0 + jj < NUM_COLS) {
+                const uint b_block_idx = ((c0 + jj)*p.batch_stride_b + col) / QUANT_K_Q8_1 + b_offset;
+                const uint bo = b_block_idx / 4;
+                const uint bi = b_block_idx % 4;
+                bds[jj] = vec2(data_b[bo].ds[bi]);
+                const uint bv = bo * 9 + 1 + bi * 2;
+                b0[jj] = data_b_r128[bv];
+                b1[jj] = data_b_r128[bv + 1];
+            }
+        }
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+            if (n < num_rows) {
+                [[unroll]] for (uint jj = 0; jj < RK_CHUNK; ++jj) {
+                    if (c0 + jj < NUM_COLS) {
+                        int32_t s_lo = dotPacked4x8EXT(ar[n][0], b0[jj].x);
+                        s_lo += dotPacked4x8EXT(ar[n][1], b0[jj].y);
+                        s_lo += dotPacked4x8EXT(ar[n][2], b0[jj].z);
+                        s_lo += dotPacked4x8EXT(ar[n][3], b0[jj].w);
+                        int32_t s_hi = dotPacked4x8EXT(ar[n][4], b1[jj].x);
+                        s_hi += dotPacked4x8EXT(ar[n][5], b1[jj].y);
+                        s_hi += dotPacked4x8EXT(ar[n][6], b1[jj].z);
+                        s_hi += dotPacked4x8EXT(ar[n][7], b1[jj].w);
+                        temp[c0 + jj][n] += FLOAT_TYPE(bds[jj].x * (cr[n].x * float(s_lo) + cr[n].y * float(s_hi)) + cr[n].z * bds[jj].y);
+                    }
+                }
+            }
+        }
+    }
+}
+
 void iter(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const uint num_rows, const uint col, const uint b_qs_idx) {
+    if (NUM_COLS > RK_CHUNK) {
+        iter_chunked(temp, first_row, num_rows, col);
+        return;
+    }
     // q8_1 blocks of every column first (two 16-byte loads + ds each)
     ivec4 b0[NUM_COLS], b1[NUM_COLS];
     vec2 bds[NUM_COLS];
@@ -481,6 +594,16 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
     uint col = tid * K_PER_ITER;
     // b65 [vcliff]: 4+ columns unroll by 2 only: four iterations of every column's q8_1 registers in flight spill
     // (Q4_1R / Q5_KR 4-column verify +66% / +14% over 3 columns on the B65, VCLIFF-1). Same summation order.
+    // b65 vcliff2: 5-8 columns (reordered types: two column chunks per iter) one iteration at a time
+#if (defined(DATA_A_Q4_0R) && defined(Q4_0R_K32) && defined(Q4_0R_MC)) || defined(DATA_A_Q5_KR) || defined(DATA_A_Q8_0R) || defined(DATA_A_IQ4_XSR) || defined(DATA_A_IQ4_NLR) || defined(DATA_A_Q6_KR) || defined(DATA_A_Q4_1R)
+    if (NUM_COLS > 4) {
+        [[dont_unroll]] while (num_iters >= 1) {
+            iter(temp, first_row, num_rows, col, b_qs_idx);
+            col += col_stride;
+            num_iters -= 1;
+        }
+    }
+#endif
     if (NUM_COLS >= 4) {
         while (num_iters >= 2) {
             iter(temp, first_row, num_rows, col, b_qs_idx);

@@ -2708,7 +2708,8 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         ggml_tensor * quest_sel = nullptr;
         int quest_blk = 0;
         if (quest_kmm && quest_q && kq_mask && kq_mask->type == GGML_TYPE_F32 && kq_mask->ne[2] == 1 && kq_mask->ne[3] == 1) {
-            static const int q_max  = getenv("LLAMA_KV_QUEST_MAX_TOK") ? atoi(getenv("LLAMA_KV_QUEST_MAX_TOK")) : 4;
+            // b65 vcliff2: default 8 (was 4): 5-8 token verify steps keep Quest (the Vulkan kernels take up to 8 tokens)
+            static const int q_max  = getenv("LLAMA_KV_QUEST_MAX_TOK") ? atoi(getenv("LLAMA_KV_QUEST_MAX_TOK")) : 8;
             static const int q_bud  = getenv("LLAMA_KV_QUEST_BUDGET")  ? atoi(getenv("LLAMA_KV_QUEST_BUDGET"))  : 2048;
             static const int q_sink = getenv("LLAMA_KV_QUEST_SINK")    ? atoi(getenv("LLAMA_KV_QUEST_SINK"))    : 64;
             static const int q_rec  = getenv("LLAMA_KV_QUEST_RECENT")  ? atoi(getenv("LLAMA_KV_QUEST_RECENT"))  : 2;
@@ -2731,7 +2732,8 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         // batch whose f32 scores pass that (24 heads x 512 tokens x n_kv > 87381) had K x Q, softmax and V x P sent to the
         // CPU backend by supports_op: ~45 s per 512-token batch past ~87K (LCHK). Heads are independent, so the scores are
         // computed per KV-head group and the outputs concatenated over heads: same kernels, same values.
-        static const int kv_deq_min = getenv("LLAMA_B65_KV_DEQ_MIN_TOK") ? atoi(getenv("LLAMA_B65_KV_DEQ_MIN_TOK")) : 5;
+        // b65 vcliff2: default 9 (was 5): 5-8 token verify steps read the quantized K in place (rows3 in token chunks)
+        static const int kv_deq_min = getenv("LLAMA_B65_KV_DEQ_MIN_TOK") ? atoi(getenv("LLAMA_B65_KV_DEQ_MIN_TOK")) : 9;
         auto attn_core = [&](ggml_tensor * q, ggml_tensor * k, ggml_tensor * v, bool v_ready, ggml_tensor * dep) -> ggml_tensor * {
             // b65 kv4: prompt batches (> LLAMA_B65_KV_DEQ_MIN_TOK - 1 tokens, default 5+) on a quantized K cache: dequantize
             // the K view to f16 first (one pass, an op output freed after use), so K x Q is the same f16 matmul as on a 16-bit
@@ -2810,7 +2812,8 @@ ggml_tensor * llm_graph_context::build_attn_mha(
                 // b65 kv4: quantized V cache with FA off (stored untransposed). Up to LLAMA_B65_VXQ_MAX_TOK (4) tokens:
                 // V x P as out_prod(V, P^T), read in place by the backend; longer batches: V dequantized and transposed
                 // to f16, then the normal matmul.
-                static const int vxq_max = getenv("LLAMA_B65_VXQ_MAX_TOK") ? atoi(getenv("LLAMA_B65_VXQ_MAX_TOK")) : 4;
+                // b65 vcliff2: default 8 (was 4), see kv_deq_min
+                static const int vxq_max = getenv("LLAMA_B65_VXQ_MAX_TOK") ? atoi(getenv("LLAMA_B65_VXQ_MAX_TOK")) : 8;
                 const int64_t gqa = v->ne[2] > 0 ? kq->ne[2] / v->ne[2] : 0;
                 if (kq->ne[1] <= vxq_max && kq->type == GGML_TYPE_F32 && gqa >= 1 && gqa <= 8 && kq->ne[2] % v->ne[2] == 0) {
                     kqv = ggml_out_prod(ctx0, v, ggml_transpose(ctx0, kq));

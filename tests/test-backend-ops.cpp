@@ -9651,8 +9651,8 @@ struct test_b65_kq_quant : public test_case {
         ggml_tensor * cache = ggml_new_tensor_2d(ctx, type, d * heads_kv, n_kv);
         ggml_tensor * k = ggml_view_3d(ctx, cache, d, n_kv, heads_kv, cache->nb[1], ggml_row_size(type, d), 0);
         ggml_tensor * q = ggml_permute(ctx, ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d, heads, n_tok), 0, 2, 1, 3);
-        if (n_tok >= 5) {
-            k = ggml_cast(ctx, k, GGML_TYPE_F16);   // b65 kv4: the graph's prompt path (LLAMA_B65_KV_DEQ_MIN_TOK 5)
+        if (n_tok >= 9) {
+            k = ggml_cast(ctx, k, GGML_TYPE_F16);   // b65 kv4: the graph's prompt path (LLAMA_B65_KV_DEQ_MIN_TOK 9, vcliff2)
         }
         return ggml_mul_mat(ctx, k, q);
     }
@@ -9757,7 +9757,7 @@ static void add_b65_sparse_t_cases(std::vector<std::unique_ptr<test_case>> & tes
             test_cases.emplace_back(new test_b65_kv_deq(vt, 128, 2, 77, tr));
         }
         for (int64_t n_kv : { 64, 1000, 4096, 33024 }) {
-            for (int64_t n_tok : { 1, 2, 3, 4 }) {
+            for (int64_t n_tok : { 1, 2, 3, 4, 5, 6, 7, 8 }) {   // b65 vcliff2: 5-8 as token chunks
                 test_cases.emplace_back(new test_b65_vxq(vt, 256, 24, 4, n_kv, n_tok));
             }
         }
@@ -9768,9 +9768,10 @@ static void add_b65_sparse_t_cases(std::vector<std::unique_ptr<test_case>> & tes
     }
     // b65: quantized K cache, FA off (Qwen3.8-27B: d 256, 24 heads on 4 KV heads)
     for (ggml_type kt : { GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_IQ4_NL }) {
-        for (int64_t n_tok : { 1, 2, 4, 7, 32, 512 }) {
+        for (int64_t n_tok : { 1, 2, 4, 5, 6, 7, 8, 9, 32, 512 }) {   // b65 vcliff2: 5-8 on rows3 in token chunks
             test_cases.emplace_back(new test_b65_kq_quant(kt, 256, 24, 4, 4096, n_tok));
         }
+        test_cases.emplace_back(new test_b65_kq_quant(kt, 256, 24, 4, 33024, 8));
         test_cases.emplace_back(new test_b65_kq_quant(kt, 128, 8, 2, 1000, 3));
     }
     // f32 mask: flash attention off, as the live model runs
@@ -9874,6 +9875,13 @@ static void add_b65_sparse_t_cases(std::vector<std::unique_ptr<test_case>> & tes
             for (int budget : {1024, 2048}) {
                 test_cases.emplace_back(new test_kv_quest_attn(256, 24, 4, T, nkv, 32, budget));
             }
+        }
+    }
+    for (int64_t T : {5, 6, 8}) {   // b65 vcliff2: 5-8 token verify steps with Quest (bound pass in token chunks)
+        for (int64_t nkv : {4096, 32768}) {
+            test_cases.emplace_back(new test_kv_quest_mask(256, 24, 4, T, nkv, 16, 1024, 64, 4, 1, 1));
+            test_cases.emplace_back(new test_kv_quest_mask(256, 24, 4, T, nkv, 32, 2048, 64, 2, 1));
+            test_cases.emplace_back(new test_kv_quest_attn_q(GGML_TYPE_Q8_0, 256, 24, 4, T, nkv, 16, 1024));
         }
     }
     test_cases.emplace_back(new test_kv_block_minmax(1024, 1024, 512, 32, 1));
