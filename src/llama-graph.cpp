@@ -2845,12 +2845,15 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             return kqv;
         };
 
-        // LLAMA_KQ_CHUNK_MB=<n>: split when the f32 scores of one batch exceed n MiB (default 4095, just under the 4 GiB
-        // Vulkan buffer limit); 0 = old path (one K x Q over all heads). Only prompt batches deep in the context reach it
-        // (ub 512: n_kv > 87381 on Qwen3.8-27B), so decode, MTP verify and shorter prompts build the same graph as before.
+        // LLAMA_KQ_CHUNK_MB=<n>: split when the f32 scores of one batch exceed n MiB; 0 = old path (one K x Q over all
+        // heads). PPCLIFF used 4095 (just under the 4 GiB Vulkan buffer limit). b65 vram: default 2048, and the groups are
+        // sized by bytes (below), so no group's scores pass 2 GiB: the compute buffer of each context (target and MTP
+        // draft) peaks at ~2 GiB of scores instead of ~4 GiB (unsplit just below 87K) / 3 GiB (2 groups at 128K).
+        // On Qwen3.8-27B with ub 512 that splits prompt batches from n_kv > 43690 on, so decode, MTP / ngram verify
+        // and prompts under ~43K build the same graph as before.
         // LLAMA_KQ_CHUNK_MIN_TOK (default 65): batches of fewer tokens are never split (decode, MTP and ngram verify keep
-        // their own kernels; at 64 tokens the scores pass 4 GiB only beyond 699K context).
-        static const int64_t kq_chunk_mb  = getenv("LLAMA_KQ_CHUNK_MB") ? atoll(getenv("LLAMA_KQ_CHUNK_MB")) : 4095;
+        // their own kernels; at 64 tokens the scores pass 2 GiB only beyond 349K context).
+        static const int64_t kq_chunk_mb  = getenv("LLAMA_KQ_CHUNK_MB") ? atoll(getenv("LLAMA_KQ_CHUNK_MB")) : 2048;
         static const int64_t kq_chunk_min = getenv("LLAMA_KQ_CHUNK_MIN_TOK") ? atoll(getenv("LLAMA_KQ_CHUNK_MIN_TOK")) : 65;
         const int64_t n_head_q  = q->ne[2];
         const int64_t n_head_kv = k->ne[2];
@@ -2859,7 +2862,18 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         if (kq_chunk_mb > 0 && q->ne[1] >= kq_chunk_min && kq_bytes > (double) kq_chunk_mb * 1048576.0 && quest_sel == nullptr && kq_b == nullptr &&
             sinks == nullptr && v_mla == nullptr && hparams.f_max_alibi_bias == 0.0f && n_head_kv > 1 &&
             n_head_q % n_head_kv == 0 && v->ne[2] == n_head_kv) {
-            n_grp = std::min<int64_t>(n_head_kv, (int64_t) std::ceil(kq_bytes / ((double) kq_chunk_mb * 1048576.0)));
+            // b65 vram: the smallest even split whose groups fit the cap: whole KV heads while the group count divides
+            // n_head_kv (1, 2, 4 on 4 KV heads), then each KV head's query heads split evenly (8, 12, 24 groups at 6
+            // query heads per KV head). PPCLIFF split only over whole KV heads, as evenly as possible.
+            const int64_t r    = n_head_q / n_head_kv;
+            const int64_t need = (int64_t) std::ceil(kq_bytes / ((double) kq_chunk_mb * 1048576.0));
+            auto grp_ok = [&](int64_t g) {
+                return g <= n_head_kv ? n_head_kv % g == 0 : (g % n_head_kv == 0 && r % (g / n_head_kv) == 0);
+            };
+            n_grp = std::min<int64_t>(need, n_head_q);
+            while (n_grp < n_head_q && !grp_ok(n_grp)) {
+                ++n_grp;
+            }
         }
 
         ggml_tensor * kqv = nullptr;
@@ -2879,15 +2893,21 @@ ggml_tensor * llm_graph_context::build_attn_mha(
                 v_ready = true;
             }
             const int64_t r = n_head_q / n_head_kv;
-            int64_t kh0 = 0;
             for (int64_t g = 0; g < n_grp; ++g) {
-                const int64_t nkh = n_head_kv / n_grp + (g < n_head_kv % n_grp ? 1 : 0);
-                ggml_tensor * q_g = ggml_view_4d(ctx0, q, q->ne[0], q->ne[1], nkh*r, q->ne[3], q->nb[1], q->nb[2], q->nb[3], kh0*r*q->nb[2]);
-                ggml_tensor * k_g = ggml_view_4d(ctx0, k, k->ne[0], k->ne[1], nkh,   k->ne[3], k->nb[1], k->nb[2], k->nb[3], kh0*k->nb[2]);
-                ggml_tensor * v_g = ggml_view_4d(ctx0, v, v->ne[0], v->ne[1], nkh,   v->ne[3], v->nb[1], v->nb[2], v->nb[3], kh0*v->nb[2]);
+                // group g: KV heads [kh0, kh0 + nkh) with query heads [qh0, qh0 + nqh); groups run in query-head order,
+                // so the concatenated output has the heads in their original order
+                int64_t kh0, nkh, qh0, nqh;
+                if (n_grp <= n_head_kv) {
+                    nkh = n_head_kv / n_grp; kh0 = g*nkh; nqh = nkh*r; qh0 = kh0*r;
+                } else {
+                    const int64_t s = n_grp / n_head_kv;   // splits per KV head
+                    nkh = 1; kh0 = g / s; nqh = r / s; qh0 = kh0*r + (g % s)*nqh;
+                }
+                ggml_tensor * q_g = ggml_view_4d(ctx0, q, q->ne[0], q->ne[1], nqh, q->ne[3], q->nb[1], q->nb[2], q->nb[3], qh0*q->nb[2]);
+                ggml_tensor * k_g = ggml_view_4d(ctx0, k, k->ne[0], k->ne[1], nkh, k->ne[3], k->nb[1], k->nb[2], k->nb[3], kh0*k->nb[2]);
+                ggml_tensor * v_g = ggml_view_4d(ctx0, v, v->ne[0], v->ne[1], nkh, v->ne[3], v->nb[1], v->nb[2], v->nb[3], kh0*v->nb[2]);
                 ggml_tensor * o_g = attn_core(q_g, k_g, v_g, v_ready, kqv);
                 kqv = kqv ? ggml_concat(ctx0, kqv, o_g, 2) : o_g;
-                kh0 += nkh;
             }
             cb(kqv, "kqv_grp", il);
         }
