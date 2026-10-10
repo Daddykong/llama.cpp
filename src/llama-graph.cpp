@@ -2726,105 +2726,148 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             }
         }
 
-        // b65 kv4: prompt batches (> LLAMA_B65_KV_DEQ_MIN_TOK - 1 tokens, default 5+) on a quantized K cache: dequantize
-        // the K view to f16 first (one pass, an op output freed after use), so K x Q is the same f16 matmul as on a 16-bit
-        // cache; the strided int8 matmul cost 7-10% prompt speed at 32-64K (K8PP). 0 = off.
-        static const int kv_deq_min = getenv("LLAMA_B65_KV_DEQ_MIN_TOK") ? atoi(getenv("LLAMA_B65_KV_DEQ_MIN_TOK")) : 5;
-        if (kv_deq_min > 0 && q->ne[1] >= kv_deq_min && ggml_is_quantized(k->type) && k->ne[3] == 1) {
-            k = ggml_cast(ctx0, k, GGML_TYPE_F16);
-            cb(k, "k_deq", il);
-        }
-        ggml_tensor * kq = ggml_mul_mat(ctx0, k, q);
-        if (quest_sel) {
-            kq->src[2] = quest_sel;   // b65 Quest v2: ordering only (MUL_MAT ignores src[2]); the Vulkan K x Q reads it
-        }
-        cb(kq, "kq", il);
-
-        // note: this op tends to require high floating point range
-        //       while for some models F16 is enough, for others it is not, so we default to F32 here
-        ggml_prec_set_acc(kq, GGML_PREC_F32);
-
-        if (arch == LLM_ARCH_GROK) {
-            // need to do the following:
-            // multiply by attn_output_multiplier
-            // and then :
-            // kq = 30 * tanh(kq / 30)
-            // before the softmax below
-
-            kq = ggml_tanh(ctx0, ggml_scale(ctx0, kq, hparams.f_attn_out_scale / hparams.f_attn_logit_softcapping));
-            cb(kq, "kq_tanh", il);
-            kq = ggml_scale(ctx0, kq, hparams.f_attn_logit_softcapping);
-            cb(kq, "kq_scaled", il);
-        }
-
-        if (hparams.attn_soft_cap) {
-            kq = ggml_scale(ctx0, kq, 1.0f / hparams.f_attn_logit_softcapping);
-            cb(kq, "kq_scaled_1", il);
-            kq = ggml_tanh (ctx0, kq);
-            cb(kq, "kq_tanh", il);
-            kq = ggml_scale(ctx0, kq, hparams.f_attn_logit_softcapping);
-            cb(kq, "kq_scaled_2", il);
-        }
-
-        if (kq_b) {
-            kq = ggml_add(ctx0, kq, kq_b);
-            cb(kq, "kq_plus_kq_b", il);
-        }
-
-        // b65 Quest v2: small steps attend only to the selected blocks (bitmap computed before kq, see above)
-        if (quest_sel && kq->type == GGML_TYPE_F32) {
-            kq = ggml_kv_quest_apply(ctx0, kq, quest_sel, quest_blk);
-            cb(kq, "kq_quest", il);
-        }
-
-        kq = ggml_soft_max_ext(ctx0, kq, kq_mask, kq_scale, hparams.f_max_alibi_bias);
-        ggml_soft_max_add_sinks(kq, sinks);
-        {   // b65: f16 attention probabilities for prompt batches (LLAMA_KQ_SM_F16=1); decode stays f32
-            static const bool sm_f16 = getenv("LLAMA_KQ_SM_F16") != nullptr && atoi(getenv("LLAMA_KQ_SM_F16")) != 0;
-            static const int  sm_min = getenv("LLAMA_KQ_SM_F16_MIN_TOK") ? atoi(getenv("LLAMA_KQ_SM_F16_MIN_TOK")) : 8;
-            // only while the f32 scores stay under 4 GiB: above that this op can land on the CPU backend, whose softmax
-            // writes f32
-            if (sm_f16 && kq->ne[1] > sm_min && !sinks && ggml_is_contiguous(kq) && ggml_nelements(kq) * 4.0 < 4294967296.0) {
-                kq->type  = GGML_TYPE_F16;
-                kq->nb[0] = ggml_type_size(GGML_TYPE_F16);
-                for (int d = 1; d < GGML_MAX_DIMS; ++d) kq->nb[d] = kq->nb[d-1] * kq->ne[d-1];
+        // b65 ppcliff: K x Q -> softmax -> V x P for one group of KV heads (and their query heads). The Vulkan backend
+        // cannot hold a tensor over 4 GiB on the B65 (maxBufferSize 4 GiB, maxStorageBufferRange 4 GiB - 1), so a prompt
+        // batch whose f32 scores pass that (24 heads x 512 tokens x n_kv > 87381) had K x Q, softmax and V x P sent to the
+        // CPU backend by supports_op: ~45 s per 512-token batch past ~87K (LCHK). Heads are independent, so the scores are
+        // computed per KV-head group and the outputs concatenated over heads: same kernels, same values.
+        auto attn_core = [&](ggml_tensor * q, ggml_tensor * k, ggml_tensor * v) -> ggml_tensor * {
+            // b65 kv4: prompt batches (> LLAMA_B65_KV_DEQ_MIN_TOK - 1 tokens, default 5+) on a quantized K cache: dequantize
+            // the K view to f16 first (one pass, an op output freed after use), so K x Q is the same f16 matmul as on a 16-bit
+            // cache; the strided int8 matmul cost 7-10% prompt speed at 32-64K (K8PP). 0 = off.
+            static const int kv_deq_min = getenv("LLAMA_B65_KV_DEQ_MIN_TOK") ? atoi(getenv("LLAMA_B65_KV_DEQ_MIN_TOK")) : 5;
+            if (kv_deq_min > 0 && q->ne[1] >= kv_deq_min && ggml_is_quantized(k->type) && k->ne[3] == 1) {
+                k = ggml_cast(ctx0, k, GGML_TYPE_F16);
+                cb(k, "k_deq", il);
             }
-        }
-        cb(kq, "kq_soft_max", il);
+            ggml_tensor * kq = ggml_mul_mat(ctx0, k, q);
+            if (quest_sel) {
+                kq->src[2] = quest_sel;   // b65 Quest v2: ordering only (MUL_MAT ignores src[2]); the Vulkan K x Q reads it
+            }
+            cb(kq, "kq", il);
 
-        ggml_tensor * kqv = nullptr;
-        if (!v_trans && ggml_is_quantized(v->type)) {
-            // b65 kv4: quantized V cache with FA off (stored untransposed). Up to LLAMA_B65_VXQ_MAX_TOK (4) tokens:
-            // V x P as out_prod(V, P^T), read in place by the backend; longer batches: V dequantized and transposed
-            // to f16, then the normal matmul.
-            static const int vxq_max = getenv("LLAMA_B65_VXQ_MAX_TOK") ? atoi(getenv("LLAMA_B65_VXQ_MAX_TOK")) : 4;
-            const int64_t gqa = v->ne[2] > 0 ? kq->ne[2] / v->ne[2] : 0;
-            if (kq->ne[1] <= vxq_max && kq->type == GGML_TYPE_F32 && gqa >= 1 && gqa <= 8 && kq->ne[2] % v->ne[2] == 0) {
-                kqv = ggml_out_prod(ctx0, v, ggml_transpose(ctx0, kq));
-            } else {
-                // one pass to a transposed f16 V (an op output, freed after the matmul; KV4-1's ggml_cpy into new
-                // tensors kept every layer's f32 + f16 copies alive: a 13 GB compute buffer at 128K)
-                v = ggml_cast(ctx0, ggml_transpose(ctx0, v), GGML_TYPE_F16);
-                cb(v, "v_deq", il);
-                if (kq->type != GGML_TYPE_F32 && kq->type != GGML_TYPE_F16) {
-                    kq = ggml_cast(ctx0, kq, GGML_TYPE_F32);
+            // note: this op tends to require high floating point range
+            //       while for some models F16 is enough, for others it is not, so we default to F32 here
+            ggml_prec_set_acc(kq, GGML_PREC_F32);
+
+            if (arch == LLM_ARCH_GROK) {
+                // need to do the following:
+                // multiply by attn_output_multiplier
+                // and then :
+                // kq = 30 * tanh(kq / 30)
+                // before the softmax below
+
+                kq = ggml_tanh(ctx0, ggml_scale(ctx0, kq, hparams.f_attn_out_scale / hparams.f_attn_logit_softcapping));
+                cb(kq, "kq_tanh", il);
+                kq = ggml_scale(ctx0, kq, hparams.f_attn_logit_softcapping);
+                cb(kq, "kq_scaled", il);
+            }
+
+            if (hparams.attn_soft_cap) {
+                kq = ggml_scale(ctx0, kq, 1.0f / hparams.f_attn_logit_softcapping);
+                cb(kq, "kq_scaled_1", il);
+                kq = ggml_tanh (ctx0, kq);
+                cb(kq, "kq_tanh", il);
+                kq = ggml_scale(ctx0, kq, hparams.f_attn_logit_softcapping);
+                cb(kq, "kq_scaled_2", il);
+            }
+
+            if (kq_b) {
+                kq = ggml_add(ctx0, kq, kq_b);
+                cb(kq, "kq_plus_kq_b", il);
+            }
+
+            // b65 Quest v2: small steps attend only to the selected blocks (bitmap computed before kq, see above)
+            if (quest_sel && kq->type == GGML_TYPE_F32) {
+                kq = ggml_kv_quest_apply(ctx0, kq, quest_sel, quest_blk);
+                cb(kq, "kq_quest", il);
+            }
+
+            kq = ggml_soft_max_ext(ctx0, kq, kq_mask, kq_scale, hparams.f_max_alibi_bias);
+            ggml_soft_max_add_sinks(kq, sinks);
+            {   // b65: f16 attention probabilities for prompt batches (LLAMA_KQ_SM_F16=1); decode stays f32
+                static const bool sm_f16 = getenv("LLAMA_KQ_SM_F16") != nullptr && atoi(getenv("LLAMA_KQ_SM_F16")) != 0;
+                static const int  sm_min = getenv("LLAMA_KQ_SM_F16_MIN_TOK") ? atoi(getenv("LLAMA_KQ_SM_F16_MIN_TOK")) : 8;
+                // only while the f32 scores stay under 4 GiB: above that this op can land on the CPU backend, whose softmax
+                // writes f32
+                if (sm_f16 && kq->ne[1] > sm_min && !sinks && ggml_is_contiguous(kq) && ggml_nelements(kq) * 4.0 < 4294967296.0) {
+                    kq->type  = GGML_TYPE_F16;
+                    kq->nb[0] = ggml_type_size(GGML_TYPE_F16);
+                    for (int d = 1; d < GGML_MAX_DIMS; ++d) kq->nb[d] = kq->nb[d-1] * kq->ne[d-1];
                 }
             }
-        } else if (!v_trans) {
-            // note: avoid this branch
-            v = ggml_cont(ctx0, ggml_transpose(ctx0, v));
-            cb(v, "v_cont", il);
+            cb(kq, "kq_soft_max", il);
+
+            ggml_tensor * kqv = nullptr;
+            if (!v_trans && ggml_is_quantized(v->type)) {
+                // b65 kv4: quantized V cache with FA off (stored untransposed). Up to LLAMA_B65_VXQ_MAX_TOK (4) tokens:
+                // V x P as out_prod(V, P^T), read in place by the backend; longer batches: V dequantized and transposed
+                // to f16, then the normal matmul.
+                static const int vxq_max = getenv("LLAMA_B65_VXQ_MAX_TOK") ? atoi(getenv("LLAMA_B65_VXQ_MAX_TOK")) : 4;
+                const int64_t gqa = v->ne[2] > 0 ? kq->ne[2] / v->ne[2] : 0;
+                if (kq->ne[1] <= vxq_max && kq->type == GGML_TYPE_F32 && gqa >= 1 && gqa <= 8 && kq->ne[2] % v->ne[2] == 0) {
+                    kqv = ggml_out_prod(ctx0, v, ggml_transpose(ctx0, kq));
+                } else {
+                    // one pass to a transposed f16 V (an op output, freed after the matmul; KV4-1's ggml_cpy into new
+                    // tensors kept every layer's f32 + f16 copies alive: a 13 GB compute buffer at 128K)
+                    v = ggml_cast(ctx0, ggml_transpose(ctx0, v), GGML_TYPE_F16);
+                    cb(v, "v_deq", il);
+                    if (kq->type != GGML_TYPE_F32 && kq->type != GGML_TYPE_F16) {
+                        kq = ggml_cast(ctx0, kq, GGML_TYPE_F32);
+                    }
+                }
+            } else if (!v_trans) {
+                // note: avoid this branch
+                v = ggml_cont(ctx0, ggml_transpose(ctx0, v));
+                cb(v, "v_cont", il);
+            }
+
+            if (kqv == nullptr) {
+                kqv = ggml_mul_mat(ctx0, v, kq);
+            }
+            cb(kqv, "kqv", il);
+
+            // for MLA with the absorption optimization, we need to "decompress" from MQA back to MHA
+            if (v_mla) {
+                kqv = ggml_mul_mat(ctx0, v_mla, kqv);
+                cb(kqv, "kqv_mla", il);
+            }
+            return kqv;
+        };
+
+        // LLAMA_KQ_CHUNK_MB=<n>: split when the f32 scores of one batch exceed n MiB (default 4095, just under the 4 GiB
+        // Vulkan buffer limit); 0 = old path (one K x Q over all heads). Only prompt batches deep in the context reach it
+        // (ub 512: n_kv > 87381 on Qwen3.8-27B), so decode, MTP verify and shorter prompts build the same graph as before.
+        // LLAMA_KQ_CHUNK_MIN_TOK (default 65): batches of fewer tokens are never split (decode, MTP and ngram verify keep
+        // their own kernels; at 64 tokens the scores pass 4 GiB only beyond 699K context).
+        static const int64_t kq_chunk_mb  = getenv("LLAMA_KQ_CHUNK_MB") ? atoll(getenv("LLAMA_KQ_CHUNK_MB")) : 4095;
+        static const int64_t kq_chunk_min = getenv("LLAMA_KQ_CHUNK_MIN_TOK") ? atoll(getenv("LLAMA_KQ_CHUNK_MIN_TOK")) : 65;
+        const int64_t n_head_q  = q->ne[2];
+        const int64_t n_head_kv = k->ne[2];
+        const double  kq_bytes  = 4.0 * (double) k->ne[1] * (double) q->ne[1] * (double) n_head_q * (double) q->ne[3];
+        int64_t n_grp = 1;
+        if (kq_chunk_mb > 0 && q->ne[1] >= kq_chunk_min && kq_bytes > (double) kq_chunk_mb * 1048576.0 && quest_sel == nullptr && kq_b == nullptr &&
+            sinks == nullptr && v_mla == nullptr && hparams.f_max_alibi_bias == 0.0f && n_head_kv > 1 &&
+            n_head_q % n_head_kv == 0 && v->ne[2] == n_head_kv) {
+            n_grp = std::min<int64_t>(n_head_kv, (int64_t) std::ceil(kq_bytes / ((double) kq_chunk_mb * 1048576.0)));
         }
 
-        if (kqv == nullptr) {
-            kqv = ggml_mul_mat(ctx0, v, kq);
-        }
-        cb(kqv, "kqv", il);
-
-        // for MLA with the absorption optimization, we need to "decompress" from MQA back to MHA
-        if (v_mla) {
-            kqv = ggml_mul_mat(ctx0, v_mla, kqv);
-            cb(kqv, "kqv_mla", il);
+        ggml_tensor * kqv = nullptr;
+        if (n_grp <= 1) {
+            kqv = attn_core(q, k, v);
+        } else {
+            const int64_t r = n_head_q / n_head_kv;
+            int64_t kh0 = 0;
+            for (int64_t g = 0; g < n_grp; ++g) {
+                const int64_t nkh = n_head_kv / n_grp + (g < n_head_kv % n_grp ? 1 : 0);
+                ggml_tensor * q_g = ggml_view_4d(ctx0, q, q->ne[0], q->ne[1], nkh*r, q->ne[3], q->nb[1], q->nb[2], q->nb[3], kh0*r*q->nb[2]);
+                ggml_tensor * k_g = ggml_view_4d(ctx0, k, k->ne[0], k->ne[1], nkh,   k->ne[3], k->nb[1], k->nb[2], k->nb[3], kh0*k->nb[2]);
+                ggml_tensor * v_g = ggml_view_4d(ctx0, v, v->ne[0], v->ne[1], nkh,   v->ne[3], v->nb[1], v->nb[2], v->nb[3], kh0*v->nb[2]);
+                ggml_tensor * o_g = attn_core(q_g, k_g, v_g);
+                kqv = kqv ? ggml_concat(ctx0, kqv, o_g, 2) : o_g;
+                kh0 += nkh;
+            }
+            cb(kqv, "kqv_grp", il);
         }
 
         cur = ggml_permute(ctx0, kqv, 0, 2, 1, 3);
