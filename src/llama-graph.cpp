@@ -2732,7 +2732,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         // CPU backend by supports_op: ~45 s per 512-token batch past ~87K (LCHK). Heads are independent, so the scores are
         // computed per KV-head group and the outputs concatenated over heads: same kernels, same values.
         static const int kv_deq_min = getenv("LLAMA_B65_KV_DEQ_MIN_TOK") ? atoi(getenv("LLAMA_B65_KV_DEQ_MIN_TOK")) : 5;
-        auto attn_core = [&](ggml_tensor * q, ggml_tensor * k, ggml_tensor * v, bool v_ready) -> ggml_tensor * {
+        auto attn_core = [&](ggml_tensor * q, ggml_tensor * k, ggml_tensor * v, bool v_ready, ggml_tensor * dep) -> ggml_tensor * {
             // b65 kv4: prompt batches (> LLAMA_B65_KV_DEQ_MIN_TOK - 1 tokens, default 5+) on a quantized K cache: dequantize
             // the K view to f16 first (one pass, an op output freed after use), so K x Q is the same f16 matmul as on a 16-bit
             // cache; the strided int8 matmul cost 7-10% prompt speed at 32-64K (K8PP). 0 = off.
@@ -2743,6 +2743,11 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             ggml_tensor * kq = ggml_mul_mat(ctx0, k, q);
             if (quest_sel) {
                 kq->src[2] = quest_sel;   // b65 Quest v2: ordering only (MUL_MAT ignores src[2]); the Vulkan K x Q reads it
+            } else if (dep) {
+                // b65 ppcliff: ordering only (MUL_MAT ignores a src[2] that is not a KV_QUEST_MASK): this group's scores
+                // start after the previous group's V x P, so the Vulkan graph reorder cannot run the groups' K x Q side
+                // by side (all groups' scores alive at once = the full score size again: 6.8 GB per context at 128K)
+                kq->src[2] = dep;
             }
             cb(kq, "kq", il);
 
@@ -2856,11 +2861,10 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
         ggml_tensor * kqv = nullptr;
         if (n_grp <= 1) {
-            kqv = attn_core(q, k, v, false);
+            kqv = attn_core(q, k, v, false, nullptr);
         } else {
-            // dequantize K and V for all heads once, before the groups: per-group casts allocated between one group's
-            // scores and the next split the freed score block, so each group took a new one (6.8 GB compute buffer per
-            // context at 128K instead of ~3.6)
+            // dequantize K and V for all heads once, before the groups, so no small allocation lands between one
+            // group's freed scores and the next group's
             bool v_ready = false;
             if (kv_deq_min > 0 && q->ne[1] >= kv_deq_min && ggml_is_quantized(k->type) && k->ne[3] == 1) {
                 k = ggml_cast(ctx0, k, GGML_TYPE_F16);
@@ -2878,7 +2882,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
                 ggml_tensor * q_g = ggml_view_4d(ctx0, q, q->ne[0], q->ne[1], nkh*r, q->ne[3], q->nb[1], q->nb[2], q->nb[3], kh0*r*q->nb[2]);
                 ggml_tensor * k_g = ggml_view_4d(ctx0, k, k->ne[0], k->ne[1], nkh,   k->ne[3], k->nb[1], k->nb[2], k->nb[3], kh0*k->nb[2]);
                 ggml_tensor * v_g = ggml_view_4d(ctx0, v, v->ne[0], v->ne[1], nkh,   v->ne[3], v->nb[1], v->nb[2], v->nb[3], kh0*v->nb[2]);
-                ggml_tensor * o_g = attn_core(q_g, k_g, v_g, v_ready);
+                ggml_tensor * o_g = attn_core(q_g, k_g, v_g, v_ready, kqv);
                 kqv = kqv ? ggml_concat(ctx0, kqv, o_g, 2) : o_g;
                 kh0 += nkh;
             }
