@@ -2731,11 +2731,11 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         // batch whose f32 scores pass that (24 heads x 512 tokens x n_kv > 87381) had K x Q, softmax and V x P sent to the
         // CPU backend by supports_op: ~45 s per 512-token batch past ~87K (LCHK). Heads are independent, so the scores are
         // computed per KV-head group and the outputs concatenated over heads: same kernels, same values.
-        auto attn_core = [&](ggml_tensor * q, ggml_tensor * k, ggml_tensor * v) -> ggml_tensor * {
+        static const int kv_deq_min = getenv("LLAMA_B65_KV_DEQ_MIN_TOK") ? atoi(getenv("LLAMA_B65_KV_DEQ_MIN_TOK")) : 5;
+        auto attn_core = [&](ggml_tensor * q, ggml_tensor * k, ggml_tensor * v, bool v_ready) -> ggml_tensor * {
             // b65 kv4: prompt batches (> LLAMA_B65_KV_DEQ_MIN_TOK - 1 tokens, default 5+) on a quantized K cache: dequantize
             // the K view to f16 first (one pass, an op output freed after use), so K x Q is the same f16 matmul as on a 16-bit
             // cache; the strided int8 matmul cost 7-10% prompt speed at 32-64K (K8PP). 0 = off.
-            static const int kv_deq_min = getenv("LLAMA_B65_KV_DEQ_MIN_TOK") ? atoi(getenv("LLAMA_B65_KV_DEQ_MIN_TOK")) : 5;
             if (kv_deq_min > 0 && q->ne[1] >= kv_deq_min && ggml_is_quantized(k->type) && k->ne[3] == 1) {
                 k = ggml_cast(ctx0, k, GGML_TYPE_F16);
                 cb(k, "k_deq", il);
@@ -2799,7 +2799,9 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             cb(kq, "kq_soft_max", il);
 
             ggml_tensor * kqv = nullptr;
-            if (!v_trans && ggml_is_quantized(v->type)) {
+            if (v_ready) {
+                // b65 ppcliff: V already dequantized and transposed to f16 for all heads (split path below)
+            } else if (!v_trans && ggml_is_quantized(v->type)) {
                 // b65 kv4: quantized V cache with FA off (stored untransposed). Up to LLAMA_B65_VXQ_MAX_TOK (4) tokens:
                 // V x P as out_prod(V, P^T), read in place by the backend; longer batches: V dequantized and transposed
                 // to f16, then the normal matmul.
@@ -2854,8 +2856,21 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
         ggml_tensor * kqv = nullptr;
         if (n_grp <= 1) {
-            kqv = attn_core(q, k, v);
+            kqv = attn_core(q, k, v, false);
         } else {
+            // dequantize K and V for all heads once, before the groups: per-group casts allocated between one group's
+            // scores and the next split the freed score block, so each group took a new one (6.8 GB compute buffer per
+            // context at 128K instead of ~3.6)
+            bool v_ready = false;
+            if (kv_deq_min > 0 && q->ne[1] >= kv_deq_min && ggml_is_quantized(k->type) && k->ne[3] == 1) {
+                k = ggml_cast(ctx0, k, GGML_TYPE_F16);
+                cb(k, "k_deq", il);
+            }
+            if (!v_trans && ggml_is_quantized(v->type)) {
+                v = ggml_cast(ctx0, ggml_transpose(ctx0, v), GGML_TYPE_F16);
+                cb(v, "v_deq", il);
+                v_ready = true;
+            }
             const int64_t r = n_head_q / n_head_kv;
             int64_t kh0 = 0;
             for (int64_t g = 0; g < n_grp; ++g) {
@@ -2863,7 +2878,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
                 ggml_tensor * q_g = ggml_view_4d(ctx0, q, q->ne[0], q->ne[1], nkh*r, q->ne[3], q->nb[1], q->nb[2], q->nb[3], kh0*r*q->nb[2]);
                 ggml_tensor * k_g = ggml_view_4d(ctx0, k, k->ne[0], k->ne[1], nkh,   k->ne[3], k->nb[1], k->nb[2], k->nb[3], kh0*k->nb[2]);
                 ggml_tensor * v_g = ggml_view_4d(ctx0, v, v->ne[0], v->ne[1], nkh,   v->ne[3], v->nb[1], v->nb[2], v->nb[3], kh0*v->nb[2]);
-                ggml_tensor * o_g = attn_core(q_g, k_g, v_g);
+                ggml_tensor * o_g = attn_core(q_g, k_g, v_g, v_ready);
                 kqv = kqv ? ggml_concat(ctx0, kqv, o_g, 2) : o_g;
                 kh0 += nkh;
             }
